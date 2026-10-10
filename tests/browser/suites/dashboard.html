@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>dashboard UI harness</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1440" height="900"></iframe>
+<script>
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+let seenToasts = [];
+
+// Resolves when the iframe has loaded its next page (by URL or by a click inside it)
+function nextLoad() {
+  return new Promise((resolve) => {
+    frame.onload = () => {
+      const w = frame.contentWindow;
+      new w.MutationObserver((ms) => { for (const m of ms) for (const n of m.addedNodes)
+        if (n.classList?.contains("toast")) seenToasts.push(n.querySelector(".toast-message").textContent); })
+        .observe(w.document.body, { childList: true, subtree: true });
+      resolve(w);
+    };
+  });
+}
+function loadPage(url, width = 1440) { frame.width = width; const p = nextLoad(); frame.src = url; return p; }
+async function clickAndLoad(element) { const p = nextLoad(); element.click(); return p; }
+async function waitFor(check, timeout = 6000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+const api = async (method, path, body) => {
+  const r = await fetch("/api" + path, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json() };
+};
+const byText = (root, selector, text) => [...root.querySelectorAll(selector)].find((e) => e.textContent.includes(text));
+const val = (d, key) => d.querySelector(`[data-value="${key}"]`).textContent;
+const toSeconds = (t) => { const [h, m, s] = t.split(":").map(Number); return h * 3600 + m * 60 + s; };
+
+async function finished(tableId, seconds) {
+  const s = (await api("POST", "/sessions", { tableId })).body.data;
+  await fetch(`/_backdate/${s.tableNumber}/${seconds}`);
+  return (await api("POST", `/sessions/${s.id}/end`)).body.data;
+}
+
+(async () => {
+  try {
+    await fetch("/_fail/off");
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
+    { const r = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: "ui-admin", password: "Ui-test-pass-123" }) }); if (r.status !== 200) throw new Error("harness login failed: " + r.status); }
+
+    // ===== A. Empty club =====
+    let w = await loadPage("/pages/dashboard.html"); let d = w.document;
+    await waitFor(() => val(d, "tables.total") === "0");
+    ok("empty: real zeros on cards", ["tables.total", "activeSessionCount", "today.billCount"].every((k) => val(d, k) === "0") && val(d, "today.totalBilled") === "Rs 0.00");
+    ok("empty: clear messages in every section",
+       d.querySelector("#revenue-panel .empty-state-title")?.textContent === "No bills today" &&
+       d.querySelector("#active-sessions .empty-state-title")?.textContent === "No active sessions" &&
+       d.querySelector("#table-overview .empty-state-title")?.textContent === "No tables yet" &&
+       d.querySelector("#recent-bills .empty-state-title")?.textContent === "No bills yet" &&
+       d.querySelector("#recent-sessions .empty-state-title")?.textContent === "No finished sessions yet");
+    ok("empty: 'Add Table' offered in table overview", d.querySelector('#table-overview a[href="/pages/tables.html?action=add"]'));
+    ok("business day shown from the server", /^Club overview for \w+day, \d{1,2} \w+ 20\d\d$/.test(d.getElementById("business-day").textContent), d.getElementById("business-day").textContent);
+    ok("no error banner", d.getElementById("dashboard-error").hidden);
+
+    // ===== B. API failure on first load -> no misleading zeros =====
+    await fetch("/_fail/on");
+    w = await loadPage("/pages/dashboard.html"); d = w.document;
+    await waitFor(() => !d.getElementById("dashboard-error").hidden);
+    ok("first-load failure: banner explains", d.getElementById("dashboard-error-text").textContent === "The dashboard couldn't be loaded. The database is not available.", d.getElementById("dashboard-error-text").textContent);
+    ok("first-load failure: cards show '—', never 0", [...d.querySelectorAll("[data-value]")].every((e) => e.textContent === "—"));
+    ok("first-load failure: sections say 'Could not load'", ["revenue-panel", "active-sessions", "table-overview", "recent-bills", "recent-sessions"]
+       .every((id) => d.querySelector(`#${id} .empty-state-title`)?.textContent === "Could not load"));
+    await fetch("/_fail/off");
+    d.getElementById("retry-button").click();
+    await waitFor(() => d.getElementById("dashboard-error").hidden && val(d, "tables.total") === "0");
+    ok("'Try again' recovers", d.getElementById("dashboard-error").hidden && val(d, "tables.total") === "0");
+
+    // ===== C. Real data =====
+    // Phase 11.3: Century is per billed minute. Rs 20/min × the 15 min minimum = Rs 300 per century bill,
+    // the amounts this suite was written with (s2 now lasts 15 min instead of 33m20s for the same reason).
+    await api("PATCH", "/settings", { gameRates: { century: 2000 }, framePrice: 15000 });
+    const ids = {};
+    for (const t of [{ tableNumber: 1, name: "VIP" }, { tableNumber: 2, name: "Corner" }, { tableNumber: 3, status: "reserved" },
+                     { tableNumber: 4, status: "maintenance" }, { tableNumber: 5, name: "Practice" }]) {
+      ids[t.tableNumber] = (await api("POST", "/tables", { hourlyRate: 50000, ...t })).body.data.id;
+    }
+    const s1 = await finished(ids[1], 1100);   // 18m20s -> billed 20m
+    const bill1 = (await api("POST", "/bills", { sessionId: s1.id, gameMode: "frame", quantity: 2, payerRule: "split",
+                    players: [{ name: "Ali" }, { name: "Usman" }, { name: "Bilal" }] })).body.data;          // 30000
+    await api("POST", `/bills/${bill1.id}/payments`, { amount: 10000, method: "cash", payerName: "Ali" });
+    const s2 = await finished(ids[5], 900);    // 15m -> billed 15m
+    const bill2 = (await api("POST", "/bills", { sessionId: s2.id, gameMode: "century", quantity: 1, payerRule: "loser",
+                    players: [{ name: "Kamran", result: "loser" }, { name: "Zubair" }] })).body.data;      // 30000
+    await api("POST", `/bills/${bill2.id}/payments`, { amount: 30000, method: "card", payerName: "Kamran" });
+    const s3 = await finished(ids[1], 600);
+    const bill3 = (await api("POST", "/bills", { sessionId: s3.id, gameMode: "century", quantity: 1, payerRule: "split",
+                    players: [{ name: "Imran" }, { name: "Faisal" }] })).body.data;
+    await api("POST", `/bills/${bill3.id}/cancel`);
+    const s4 = await finished(ids[5], 300);  // finished, not billed
+    const running = (await api("POST", "/sessions", { tableId: ids[2] })).body.data;
+    await fetch("/_backdate/2/3605");
+
+    w = await loadPage("/pages/dashboard.html"); d = w.document;
+    await waitFor(() => val(d, "tables.total") === "5");
+    ok("table cards 5 / 2 / 1 / 1 / 1, active sessions 1",
+       ["tables.total", "tables.available", "tables.occupied", "tables.reserved", "tables.maintenance", "activeSessionCount"].map((k) => val(d, k)).join("/") === "5/2/1/1/1/1");
+    ok("today: 2 bills, Rs 600 billed, Rs 400 paid, Rs 200 outstanding (cancelled Rs 300 not counted)",
+       val(d, "today.billCount") === "2" && val(d, "today.totalBilled") === "Rs 600.00" && val(d, "today.totalPaid") === "Rs 400.00" && val(d, "today.totalOutstanding") === "Rs 200.00",
+       ["today.billCount", "today.totalBilled", "today.totalPaid", "today.totalOutstanding"].map((k) => val(d, k)));
+    ok("bills hint: 1 paid · 1 open · 1 cancelled", d.querySelector('[data-hint="bills"]').textContent === "1 paid · 1 open · 1 cancelled");
+    const revenue = d.getElementById("revenue-panel").textContent;
+    ok("revenue panel: counts, 67% collected, payments received Rs 400 (2)",
+       revenue.includes("Total billedRs 600.00") && revenue.includes("OutstandingRs 200.00") && revenue.includes("67% collected") &&
+       revenue.includes("Cancelled (not counted)1") && revenue.includes("Unpaid / partly paid1") && /Rs 400\.00 \(2\)/.test(revenue), revenue);
+    ok("today's bills link uses the server's business date", /\/pages\/billing\.html\?from=\d{4}-\d{2}-\d{2}&to=\d{4}-\d{2}-\d{2}$/.test(d.getElementById("today-bills-link").href));
+
+    // Active sessions (existing rows + timers)
+    const row = d.querySelector("#active-sessions .session-row");
+    ok("active session row: Table 2 Corner, Active, start time", row?.querySelector(".table-number").textContent === "2" &&
+       row.querySelector(".session-row-name").textContent === "Corner" && row.querySelector(".status-badge").textContent === "Active" &&
+       /^Started \d{1,2}:\d{2} (am|pm)$/.test(row.querySelector(".session-row-meta").textContent));
+    const t0 = toSeconds(row.querySelector("[data-timer-start]").textContent);
+    await sleep(2100);
+    const t1 = toSeconds(row.querySelector("[data-timer-start]").textContent);
+    ok(`live timer ~1h and ticking (${t0}s -> ${t1}s)`, t0 >= 3605 && t0 < 3630 && t1 > t0);
+
+    // Table overview
+    const tiles = [...d.querySelectorAll(".table-tile")];
+    ok("5 table tiles in number order", tiles.map((t) => t.querySelector(".table-number").textContent).join(",") === "1,2,3,4,5");
+    const tile2 = tiles[1];
+    ok("occupied tile shows live timer + start, links to its session",
+       tile2.dataset.status === "occupied" && tile2.querySelector("[data-timer-start]") && tile2.textContent.includes("since") &&
+       tile2.getAttribute("href") === `/pages/sessions.html#session-${running.id}`);
+    ok("other tiles: status text + link to the table", tiles[2].querySelector(".status-badge").textContent === "Reserved" &&
+       tiles[3].querySelector(".status-badge").textContent === "Maintenance" && tiles[0].getAttribute("href") === `/pages/tables.html#table-${ids[1]}`);
+
+    // Recent bills
+    const billRows = [...d.querySelectorAll("#recent-bills tbody tr")];
+    const cells = (r) => [...r.querySelectorAll("td")].map((c) => c.textContent);
+    ok("recent bills: 3, newest first", billRows.length === 3 && cells(billRows[0])[0].startsWith(bill3.billNumber), billRows.map(cells));
+    ok("bill row: players, total, paid, remaining, status", JSON.stringify(cells(billRows[2]).slice(1)) ===
+       JSON.stringify(["1 · VIP", "Ali, Usman, Bilal", "Rs 300.00", "Rs 100.00", "Rs 200.00", "Partially paid"]), cells(billRows[2]));
+    ok("cancelled bill: remaining Rs 0.00, status Cancelled", cells(billRows[0])[5] === "Rs 0.00" && cells(billRows[0])[6] === "Cancelled");
+
+    // Recent sessions
+    const sessionRows = [...d.querySelectorAll("#recent-sessions tbody tr")];
+    ok("recent sessions: 4 finished, newest first", sessionRows.length === 4 && cells(sessionRows[0])[0] === "5 · Practice");
+    const s1Row = sessionRows.find((r) => r.textContent.includes(bill1.billNumber));
+    ok("session row: billed time, game type, bill status", s1Row && cells(s1Row)[3] === "20m" && cells(s1Row)[4] === "Frame × 2" && s1Row.querySelector(".status-badge").textContent === "Partially paid", s1Row && cells(s1Row));
+    const unbilledRow = sessionRows[0];
+    ok("unbilled session: '—' + Create bill button", cells(unbilledRow)[3] === "—" && byText(unbilledRow, "button", "Create bill"));
+    byText(unbilledRow, "button", "Create bill").click();
+    const billDlg = await waitFor(() => d.querySelector("dialog.bill-dialog[open]"));
+    ok("Create bill opens the existing bill window", billDlg?.querySelector(".modal-title").textContent === "Create bill · Table 5");
+    byText(billDlg, "button", "Bill later").click();
+    await waitFor(() => !d.querySelector("dialog.bill-dialog"));
+
+    // ===== D. Refresh failure keeps the last figures =====
+    await fetch("/_fail/on");
+    d.getElementById("refresh-button").click();
+    await waitFor(() => !d.getElementById("dashboard-error").hidden);
+    ok("refresh failure: banner says figures are from earlier", /^Couldn't refresh: The database is not available\. The figures below are from \d{1,2}:\d{2} (am|pm)\.$/.test(d.getElementById("dashboard-error-text").textContent),
+       d.getElementById("dashboard-error-text").textContent);
+    ok("refresh failure: last good numbers stay (not '—' or 0)", val(d, "tables.total") === "5" && val(d, "today.totalBilled") === "Rs 600.00");
+    await fetch("/_fail/off");
+    d.getElementById("retry-button").click();
+    await waitFor(() => d.getElementById("dashboard-error").hidden);
+    ok("retry clears the banner", d.getElementById("dashboard-error").hidden);
+
+    // ===== E. Clicks go to the right existing pages =====
+    w = await clickAndLoad(byText(d, "#recent-bills a", bill1.billNumber)); d = w.document;
+    await waitFor(() => d.getElementById("bill-dialog").open);
+    ok("bill link -> existing bill details open", d.getElementById("bill-detail").textContent.includes(`Bill ${bill1.billNumber}`));
+
+    w = await loadPage("/pages/dashboard.html"); d = w.document;
+    await waitFor(() => d.querySelectorAll(".table-tile").length === 5);
+    w = await clickAndLoad(d.querySelectorAll(".table-tile")[1]); d = w.document;
+    await waitFor(() => d.querySelector(".session-row.is-highlighted"));
+    ok("occupied tile -> Sessions page, that session highlighted", d.querySelector(".session-row.is-highlighted")?.dataset.sessionId === running.id);
+
+    w = await loadPage("/pages/dashboard.html"); d = w.document;
+    await waitFor(() => d.querySelectorAll(".table-tile").length === 5);
+    w = await clickAndLoad(d.querySelectorAll(".table-tile")[2]); d = w.document;
+    await waitFor(() => d.querySelector(".table-card.is-highlighted"));
+    ok("reserved tile -> Tables page, that table highlighted", d.querySelector(".table-card.is-highlighted")?.dataset.id === ids[3]);
+
+    const quick = async (label) => {
+      w = await loadPage("/pages/dashboard.html"); d = w.document;
+      w = await clickAndLoad(byText(d, ".quick-action", label)); d = w.document;
+      return d;
+    };
+    d = await quick("Add Table");
+    await waitFor(() => d.getElementById("table-dialog").open);
+    ok("quick action Add Table -> Add form open (address cleaned)", d.getElementById("table-dialog").open && d.getElementById("dialog-title").textContent === "Add Table" && frame.contentWindow.location.search === "");
+    d = await quick("Start Session");
+    await waitFor(() => d.querySelectorAll(".table-card").length === 2);
+    ok("quick action Start Session -> only available tables, each with Start", d.querySelector('.chip[data-status="available"]').getAttribute("aria-pressed") === "true" &&
+       [...d.querySelectorAll(".table-card")].every((c) => byText(c, "button", "Start Session")));
+    d = await quick("Active Sessions");
+    await waitFor(() => d.querySelector(".session-row"));
+    ok("quick action Active Sessions -> Sessions page", d.body.dataset.page === "sessions" && d.querySelector(".session-row"));
+    d = await quick("Collect Payments");
+    await waitFor(() => d.querySelectorAll("#bills-body tr").length > 0);
+    ok("quick action Collect Payments -> 'To collect' bills only", d.querySelector('.chip[data-status="open"]').getAttribute("aria-pressed") === "true" &&
+       [...d.querySelectorAll("#bills-body tr")].length === 1 && d.querySelector("#bills-body tr").textContent.includes("Partially paid"));
+    d = await quick("Bill History");
+    await waitFor(() => d.querySelectorAll("#bills-body tr").length === 3);
+    ok("quick action Bill History -> all 3 bills", d.querySelectorAll("#bills-body tr").length === 3);
+    d = await quick("Settings");
+    await waitFor(() => !d.getElementById("settings-form").hidden);
+    ok("quick action Settings -> Settings page", d.body.dataset.page === "settings");
+    w = await loadPage("/pages/dashboard.html"); d = w.document;
+    await waitFor(() => !d.getElementById("dashboard-error").hidden || val(d, "tables.total") === "5");
+    w = await clickAndLoad(d.getElementById("today-bills-link")); d = w.document;
+    await waitFor(() => d.querySelectorAll("#bills-body tr").length === 3);
+    ok("'Today's bills' -> Billing with today's dates filled in", d.getElementById("filter-from").value !== "" && d.getElementById("filter-from").value === d.getElementById("filter-to").value);
+
+    // ===== F. End a session from the dashboard (existing flow) =====
+    w = await loadPage("/pages/dashboard.html"); d = w.document;
+    await waitFor(() => d.querySelector("#active-sessions .session-row"));
+    byText(d.querySelector("#active-sessions .session-row"), "button", "End").click();
+    (await waitFor(() => d.querySelector("dialog.modal-small[open]"))).querySelector(".btn-danger").click();
+    const endDlg = await waitFor(() => d.querySelector("dialog.bill-dialog[open]"));
+    ok("End from dashboard -> existing Create Bill window", endDlg?.querySelector(".modal-title").textContent === "Create bill · Table 2");
+    byText(endDlg, "button", "Bill later").click();
+    await waitFor(() => val(d, "activeSessionCount") === "0");
+    ok("dashboard refreshed: 0 active, table 2 available", val(d, "activeSessionCount") === "0" && val(d, "tables.available") === "3" &&
+       d.querySelector("#active-sessions .empty-state-title")?.textContent === "No active sessions");
+
+    // ===== G. Responsive =====
+    await api("POST", "/sessions", { tableId: ids[1] });
+    for (const width of [375, 820, 1440]) {
+      w = await loadPage("/pages/dashboard.html", width); d = w.document;
+      await waitFor(() => d.querySelector("#active-sessions .session-row") && d.querySelectorAll(".table-tile").length === 5);
+      await sleep(300);
+      const el = d.documentElement;
+      ok(`dashboard ${width}px: no horizontal overflow`, el.scrollWidth <= el.clientWidth, [el.scrollWidth, el.clientWidth]);
+    }
+    ok("no localStorage used", w.localStorage.length === 0);
+  } catch (error) {
+    ok("harness crashed: " + error.message + " " + error.stack, false);
+  }
+  await fetch("/_fail/off");
+  document.getElementById("out").textContent = log.join("\n");
+})();
+</script>
+</body></html>

@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>players browser suite</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1280" height="900"></iframe>
+<script>
+// Phase 11.2 browser tests: the Players page - list, add, duplicate names, edit, search,
+// deactivate / reactivate (never delete), roles, phone width.
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+const PASSWORD = "Ui-test-pass-123";
+
+const win = () => frame.contentWindow;
+const doc = () => frame.contentDocument;
+const path = () => { try { return win().location.pathname + win().location.search; } catch { return ""; } };
+async function waitFor(check, timeout = 8000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+async function goto(url, width = 1280, expectPath) {
+  frame.width = width;
+  frame.src = url;
+  await sleep(150);
+  await waitFor(() => doc().readyState === "complete" && (!expectPath || path().startsWith(expectPath)));
+  await sleep(300);
+}
+const api = async (method, p, body) => {
+  const r = await fetch("/api" + p, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json().catch(() => null) };
+};
+const loginAs = async (username) => { await api("POST", "/auth/logout"); return api("POST", "/auth/login", { username, password: PASSWORD }); };
+const text = (el) => (el ? el.textContent.replace(/\s+/g, " ").trim() : "");
+const byText = (root, selector, t) => [...root.querySelectorAll(selector)].find((e) => e.textContent.includes(t));
+const toastHas = (t) => [...doc().querySelectorAll(".toast-message")].some((m) => m.textContent.includes(t));
+const type = (input, value) => { input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); };
+const rows = () => [...doc().querySelectorAll("#players-list tbody tr")];
+const rowFor = (name) => rows().find((tr) => tr.querySelector("strong")?.textContent === name);
+const names = () => rows().map((tr) => tr.querySelector("strong").textContent);
+const noSideScroll = () => doc().documentElement.scrollWidth <= doc().documentElement.clientWidth + 1;
+
+(async () => {
+  try {
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
+    if ((await loginAs("ui-admin")).status !== 200) throw new Error("admin login failed");
+
+    // ================= 1. Page and sidebar =================
+    await goto("/pages/players.html", 1280, "/pages/players.html");
+    let d = doc();
+    await waitFor(() => text(d.getElementById("players-list")).includes("No players yet"));
+    ok("players page: empty state", text(d.getElementById("players-list")).includes("No players yet"));
+    const link = d.querySelector('#sidebar-nav a[href="/pages/players.html"]');
+    ok("sidebar: 'Players' is a real link (no longer 'Soon')", link && text(link) === "Players" && link.classList.contains("active")
+       && !byText(d, "#sidebar-nav .nav-link", "Players & Matches"));
+
+    // ================= 2. Add, duplicate, edit =================
+    const add = async (name, phone = "", notes = "") => {
+      d.getElementById("add-player-button").click(); await sleep(100);
+      const f = d.getElementById("player-form");
+      type(f.elements.name, name); type(f.elements.phone, phone); type(f.elements.notes, notes);
+      f.requestSubmit();
+    };
+    await add("  Ali   Khan ", "0300-1234567", "Plays on Fridays");
+    await waitFor(() => rowFor("Ali Khan"));
+    ok("add: player listed, name tidied, phone and notes shown", text(rowFor("Ali Khan")).includes("0300-1234567") && text(rowFor("Ali Khan")).includes("Plays on Fridays"));
+    ok("add: success message", await waitFor(() => toastHas('Player "Ali Khan" registered')));
+    await add("Bilal");
+    await waitFor(() => rowFor("Bilal"));
+    ok("add: phone and notes are optional", text(rowFor("Bilal").querySelector('[data-label="Phone"]')) === "—");
+    await add("ALI KHAN");
+    const dupError = await waitFor(() => { const e = d.querySelector('#player-form [data-error-for="name"]'); return !e.hidden && e.textContent; });
+    ok("duplicate name (other capitals) refused in the form", dupError === 'A player called "Ali Khan" is already registered', dupError);
+    ok("duplicate: dialog stays open, nothing added", d.getElementById("player-dialog").open && rows().length === 2);
+    type(d.getElementById("player-phone"), "abc");
+    type(d.getElementById("player-name"), "Saad");
+    d.getElementById("player-form").requestSubmit();
+    const phoneError = await waitFor(() => { const e = d.querySelector('#player-form [data-error-for="phone"]'); return !e.hidden && e.textContent; });
+    ok("bad phone refused with a clear message", phoneError === "Phone must be 7 to 20 digits (spaces, - and a leading + are allowed)");
+    d.getElementById("player-cancel").click();
+
+    byText(rowFor("Bilal"), "button", "Edit").click(); await sleep(100);
+    ok("edit: form filled from the player", d.getElementById("player-name").value === "Bilal" && d.getElementById("player-dialog-title").textContent === "Edit Bilal");
+    type(d.getElementById("player-name"), "Bilal Ahmed");
+    type(d.getElementById("player-notes"), "Left-handed");
+    d.getElementById("player-form").requestSubmit();
+    await waitFor(() => rowFor("Bilal Ahmed"));
+    ok("edit: renamed and notes saved", text(rowFor("Bilal Ahmed")).includes("Left-handed") && !rowFor("Bilal"));
+
+    // ================= 3. Search =================
+    await add("Zain", "0321-5550000");
+    await waitFor(() => rowFor("Zain"));
+    type(d.getElementById("player-search"), "khan");
+    await waitFor(() => names().join() === "Ali Khan");
+    ok("search by name", names().join() === "Ali Khan");
+    type(d.getElementById("player-search"), "555 00");
+    await waitFor(() => names().join() === "Zain");
+    ok("search by phone digits (any format)", names().join() === "Zain");
+    type(d.getElementById("player-search"), "nobody here");
+    await waitFor(() => text(d.getElementById("players-list")).includes("No matching players"));
+    ok("search with no result: clear message", text(d.getElementById("players-list")).includes("No matching players"));
+    type(d.getElementById("player-search"), "");
+    await waitFor(() => rows().length === 3);
+
+    // ================= 4. Deactivate / reactivate (no delete) =================
+    ok("no Delete button anywhere", !byText(d, "#players-list button", "Delete"));
+    byText(rowFor("Zain"), "button", "Deactivate").click();
+    (await waitFor(() => d.querySelector("dialog.modal-small[open] .btn-danger"))).click();
+    await waitFor(() => !rowFor("Zain"));
+    ok("deactivate: gone from the Active list", !rowFor("Zain") && toastHas("Zain deactivated"));
+    d.querySelector('#player-status-filter [data-status="inactive"]').click();
+    await waitFor(() => names().join() === "Zain");
+    ok("Inactive filter shows Zain, marked Inactive", names().join() === "Zain" && text(rowFor("Zain").querySelector('[data-label="Status"]')) === "Inactive");
+    byText(rowFor("Zain"), "button", "Reactivate").click();
+    await waitFor(() => !rowFor("Zain"));
+    d.querySelector('#player-status-filter [data-status="all"]').click();
+    await waitFor(() => rows().length === 3);
+    ok("reactivate: Zain active again (All shows 3)", text(rowFor("Zain").querySelector('[data-label="Status"]')) === "Active");
+    ok("still a separate list from customers (no customers created)", (await api("GET", "/customers")).body.data.total === 0);
+
+    // ================= 5. Roles =================
+    await loginAs("ui-staff");
+    await goto("/pages/players.html", 1280, "/pages/players.html");
+    d = doc();
+    await waitFor(() => rowFor("Ali Khan"));
+    ok("staff: can add and edit, can't deactivate", !d.getElementById("add-player-button").hidden && byText(rowFor("Ali Khan"), "button", "Edit") && !byText(rowFor("Ali Khan"), "button", "Deactivate"));
+    ok("staff: server refuses deactivate (403)", (await api("POST", `/players/${(await api("GET", "/players?search=Zain")).body.data.players[0].id}/deactivate`)).status === 403);
+    await loginAs("ui-cashier");
+    await goto("/pages/players.html", 1280, "/pages/players.html");
+    d = doc();
+    await waitFor(() => rowFor("Ali Khan"));
+    ok("cashier: sees the list, no Add/Edit/Deactivate (only History, Phase 11.6)", d.getElementById("add-player-button").hidden
+       && [...rowFor("Ali Khan").querySelectorAll("button")].map((b) => b.textContent).join() === "History");
+    ok("cashier: server refuses adding a player (403)", (await api("POST", "/players", { name: "Sneaky" })).status === 403);
+    await api("POST", "/auth/logout");
+    ok("logged out: players API -> 401", (await api("GET", "/players")).status === 401);
+    await loginAs("ui-admin");
+
+    // ================= 6. Phone width =================
+    for (const width of [375, 820]) {
+      await goto("/pages/players.html", width, "/pages/players.html");
+      await waitFor(() => rowFor("Ali Khan"));
+      ok(`${width}px: players page has no sideways scroll`, noSideScroll(), { scroll: doc().documentElement.scrollWidth });
+    }
+    doc().getElementById("add-player-button").click(); await sleep(150);
+    const box = doc().getElementById("player-dialog").getBoundingClientRect();
+    ok("820px: add-player dialog fits", box.right <= doc().documentElement.clientWidth + 1 && box.left >= -1);
+  } catch (e) {
+    log.push("FAIL suite crashed: " + e.message + " " + e.stack);
+  }
+  const fails = log.filter((l) => l.startsWith("FAIL")).length;
+  document.getElementById("out").textContent = log.join("\n") + `\n\nTOTAL ${log.length - fails} passed, ${fails} failed`;
+})();
+</script>
+</body></html>

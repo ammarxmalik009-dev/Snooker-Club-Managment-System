@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#070908">
+    <title>Log in · Snooker Club Pro</title>
+    <link rel="stylesheet" href="/css/theme.css">
+    <link rel="stylesheet" href="/css/layout.css">
+    <link rel="stylesheet" href="/css/components.css">
+</head>
+<body class="login-body">
+    <main class="login-shell">
+        <div class="login-card">
+            <div class="login-brand">
+                <span class="brand-mark" aria-hidden="true"></span>
+                <span>Snooker Club Pro</span>
+            </div>
+            <h1 class="login-title">Log in</h1>
+            <p class="login-subtitle">Use the account your club admin gave you.</p>
+
+            <p class="form-error" id="login-error" role="alert" hidden></p>
+
+            <form id="login-form" novalidate>
+                <div class="form-field">
+                    <label for="login-username">Username</label>
+                    <input type="text" id="login-username" name="username" class="input" autocomplete="username"
+                           autocapitalize="none" spellcheck="false" maxlength="60" required>
+                </div>
+                <div class="form-field">
+                    <label for="login-password">Password</label>
+                    <input type="password" id="login-password" name="password" class="input" autocomplete="current-password"
+                           maxlength="200" required>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block login-button" id="login-button">Log in</button>
+            </form>
+
+            <p class="login-help">Forgot your password? Ask an admin to set a new one.</p>
+        </div>
+    </main>
+
+    <script src="/js/core/api.js"></script>
+    <script src="/js/core/ui.js"></script>
+    <script src="/js/pages/login.js"></script>
+</body>
+</html>

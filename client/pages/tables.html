@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#070908">
+    <title>Tables · Snooker Club Pro</title>
+    <link rel="stylesheet" href="/css/theme.css">
+    <link rel="stylesheet" href="/css/layout.css">
+    <link rel="stylesheet" href="/css/components.css">
+</head>
+<body data-page="tables">
+
+    <!-- ===== Sidebar (menu items are added by js/core/layout.js) ===== -->
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+        <a href="/pages/dashboard.html" class="sidebar-brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <span>Snooker Club Pro</span>
+        </a>
+        <nav class="sidebar-nav" id="sidebar-nav"></nav>
+        <div class="sidebar-footer" id="sidebar-footer"></div>
+    </aside>
+    <div class="sidebar-overlay" id="sidebar-overlay" hidden></div>
+
+    <div class="app-main">
+        <!-- ===== Top bar ===== -->
+        <header class="topbar">
+            <button type="button" class="menu-button" id="menu-button"
+                    aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">
+                <span data-icon="menu"></span>
+            </button>
+            <h1 class="topbar-title">Tables</h1>
+
+            <div class="topbar-right">
+                <span class="topbar-date" id="topbar-date"></span>
+                <span class="status-pill" id="server-status" role="status">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span class="status-text">Checking…</span>
+                </span>
+            </div>
+        </header>
+
+        <!-- ===== Page content ===== -->
+        <main class="page-content">
+            <div class="page-header">
+                <p class="page-intro">Start and end play sessions, and manage your tables and hourly rates.</p>
+                <button type="button" class="btn btn-primary" id="add-table-button">
+                    <span data-icon="plus"></span> Add Table
+                </button>
+            </div>
+
+            <div class="toolbar">
+                <div class="search-field">
+                    <span data-icon="search"></span>
+                    <label for="search-input" class="visually-hidden">Search tables</label>
+                    <input type="search" id="search-input" class="input" placeholder="Search by name or number…" maxlength="50" autocomplete="off">
+                </div>
+
+                <!-- Status filter + live counts (filled in by tables.js from GET /api/tables/summary) -->
+                <div class="filter-chips" id="status-filter" role="group" aria-label="Filter by status">
+                    <button type="button" class="chip" data-status="" aria-pressed="true">All <span class="chip-count" data-count="total">0</span></button>
+                    <button type="button" class="chip" data-status="available" aria-pressed="false">Available <span class="chip-count" data-count="available">0</span></button>
+                    <button type="button" class="chip" data-status="occupied" aria-pressed="false">Occupied <span class="chip-count" data-count="occupied">0</span></button>
+                    <button type="button" class="chip" data-status="reserved" aria-pressed="false">Reserved <span class="chip-count" data-count="reserved">0</span></button>
+                    <button type="button" class="chip" data-status="maintenance" aria-pressed="false">Maintenance <span class="chip-count" data-count="maintenance">0</span></button>
+                </div>
+            </div>
+
+            <!-- Shown while loading -->
+            <div class="list-state" id="tables-loading" role="status">
+                <span class="spinner" aria-hidden="true"></span> Loading tables…
+            </div>
+
+            <!-- Shown when there is nothing to list -->
+            <div class="list-state" id="tables-empty" hidden>
+                <div class="empty-state">
+                    <span class="empty-state-icon" data-icon="table"></span>
+                    <p class="empty-state-title" id="empty-title">No tables yet</p>
+                    <p id="empty-text">Add your first snooker table to get started.</p>
+                    <button type="button" class="btn btn-primary" id="empty-add-button">
+                        <span data-icon="plus"></span> Add Table
+                    </button>
+                </div>
+            </div>
+
+            <!-- Table cards are added here by tables.js -->
+            <section class="table-grid" id="tables-grid" aria-label="Snooker tables" hidden></section>
+        </main>
+    </div>
+
+    <!-- ===== Add / Edit form (one form for both) ===== -->
+    <dialog class="modal" id="table-dialog" aria-labelledby="dialog-title">
+        <form class="modal-content" id="table-form" novalidate>
+            <h2 class="modal-title" id="dialog-title">Add Table</h2>
+            <p class="modal-subtitle" id="dialog-subtitle">Each table needs a unique number and an hourly rate.</p>
+
+            <p class="form-error" id="form-error" role="alert" hidden></p>
+
+            <div class="form-row">
+                <div class="form-field">
+                    <label for="field-tableNumber">Table Number</label>
+                    <input type="number" id="field-tableNumber" name="tableNumber" class="input"
+                           min="1" max="999" step="1" inputmode="numeric" required>
+                    <p class="field-error" data-error-for="tableNumber" hidden></p>
+                </div>
+
+                <div class="form-field">
+                    <label for="field-status">Status</label>
+                    <select id="field-status" name="status" class="select" aria-describedby="status-hint">
+                        <option value="available">Available</option>
+                        <!-- Occupied is set automatically by starting a session, so it can't be picked -->
+                        <option value="occupied" disabled>Occupied (session)</option>
+                        <option value="reserved">Reserved</option>
+                        <option value="maintenance">Maintenance</option>
+                    </select>
+                    <p class="field-hint" id="status-hint" hidden></p>
+                    <p class="field-error" data-error-for="status" hidden></p>
+                </div>
+            </div>
+
+            <div class="form-field">
+                <label for="field-name">Name <span class="optional">(optional)</span></label>
+                <input type="text" id="field-name" name="name" class="input" maxlength="50"
+                       placeholder="e.g. VIP Table" autocomplete="off">
+                <p class="field-error" data-error-for="name" hidden></p>
+            </div>
+
+            <div class="form-field">
+                <label for="field-hourlyRate">Hourly Rate</label>
+                <div class="input-group">
+                    <span class="input-prefix" id="currency-prefix">Rs</span>
+                    <input type="text" id="field-hourlyRate" name="hourlyRate" class="input"
+                           inputmode="decimal" placeholder="e.g. 600 or 600.50" autocomplete="off" required>
+                </div>
+                <p class="field-error" data-error-for="hourlyRate" hidden></p>
+            </div>
+
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" id="cancel-button">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="save-button">Save Table</button>
+            </div>
+        </form>
+    </dialog>
+
+    <!-- Order matters: core files first, then this page's script -->
+    <script src="/js/core/api.js"></script>
+    <script src="/js/core/ui.js"></script>
+    <script src="/js/core/format.js"></script>
+    <script src="/js/core/sessions.js"></script>
+    <script src="/js/core/cafe.js"></script>
+    <script src="/js/core/matches.js"></script>
+    <script src="/js/core/billing.js"></script>
+    <script src="/js/core/layout.js"></script>
+    <script src="/js/pages/tables.js"></script>
+</body>
+</html>

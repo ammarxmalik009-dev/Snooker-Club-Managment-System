@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>matches browser suite</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1280" height="900"></iframe>
+<script>
+// Phase 11.4 browser tests: Tables -> start session -> Matches -> Start Match (registered + walk-in
+// players) -> Complete -> winner shown. Several matches in ONE session, 4 Players teams, validation,
+// cancel, roles, ended sessions, phone width.
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+const PASSWORD = "Ui-test-pass-123";
+
+const win = () => frame.contentWindow;
+const doc = () => frame.contentDocument;
+const path = () => { try { return win().location.pathname + win().location.search; } catch { return ""; } };
+async function waitFor(check, timeout = 8000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+async function goto(url, width = 1280, expectPath) {
+  frame.width = width;
+  frame.src = url;
+  await sleep(150);
+  await waitFor(() => doc().readyState === "complete" && (!expectPath || path().startsWith(expectPath)));
+  await sleep(300);
+}
+const api = async (method, p, body) => {
+  const r = await fetch("/api" + p, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json().catch(() => null) };
+};
+const loginAs = async (username) => { await api("POST", "/auth/logout"); return api("POST", "/auth/login", { username, password: PASSWORD }); };
+const text = (el) => (el ? el.textContent.replace(/\s+/g, " ").trim() : "");
+const byText = (root, selector, t) => [...root.querySelectorAll(selector)].find((e) => e.textContent.includes(t));
+const toastHas = (t) => [...doc().querySelectorAll(".toast-message")].some((m) => m.textContent.includes(t));
+const type = (input, value) => { input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); };
+const choose = (input) => { input.checked = true; input.dispatchEvent(new Event("change", { bubbles: true })); };
+const pick = (select, value) => { select.value = value; select.dispatchEvent(new Event("change", { bubbles: true })); };
+const noSideScroll = () => doc().documentElement.scrollWidth <= doc().documentElement.clientWidth + 1;
+
+const dlg = () => doc().querySelector("dialog.matches-dialog[open]");
+const matchRows = () => [...dlg().querySelectorAll(".match-row")];
+const matchRow = (n) => matchRows().find((r) => r.querySelector(".match-title").textContent.startsWith(`#${n} `));
+const form = () => dlg().querySelector(".match-start-form");
+const playerRows = () => [...form().querySelectorAll(".match-player-row")];
+const formError = () => { const e = form().querySelector(".form-error"); return e.hidden ? "" : e.textContent; };
+
+async function openStartForm() {
+  byText(dlg(), "button", "Start New Match").click();
+  return waitFor(() => form());
+}
+function chooseMode(label) {
+  choose([...form().querySelectorAll('input[name="matchGameMode"]')].find((i) => i.closest(".segment").textContent.includes(label)));
+}
+async function registered(row, search, name) {
+  pick(row.querySelector(".match-kind"), "registered");
+  const index = row.dataset.index;
+  const fresh = () => form().querySelector(`.match-player-row[data-index="${index}"]`);
+  type(fresh().querySelector(".match-player-search"), search);
+  const suggestion = await waitFor(() => [...fresh().querySelectorAll(".suggestion")].find((s) => s.textContent.startsWith(name)));
+  suggestion.click();
+  return waitFor(() => fresh().querySelector(".match-chosen"));
+}
+function walkIns(names) {
+  // fills the walk-in rows in order (rows are re-read: the form re-draws itself)
+  names.forEach((name, i) => type(playerRows()[i].querySelector(".match-walkin-name"), name));
+}
+async function submitStart(expectNumber) {
+  form().requestSubmit();
+  if (expectNumber) return waitFor(() => !form() && matchRow(expectNumber));
+}
+async function completeWith(n, label) {
+  byText(matchRow(n), "button", "Complete Match").click();
+  const resultForm = await waitFor(() => matchRow(n).querySelector(".match-result-form"));
+  choose([...resultForm.querySelectorAll(".match-choice")].find((c) => c.textContent.startsWith(label)).querySelector("input"));
+  resultForm.requestSubmit();
+  return waitFor(() => text(matchRow(n)?.querySelector(".status-badge")) === "Completed");
+}
+
+(async () => {
+  try {
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
+    if ((await loginAs("ui-admin")).status !== 200) throw new Error("admin login failed");
+    await api("POST", "/tables", { tableNumber: 1, name: "VIP", hourlyRate: 60000 });
+    for (const name of ["Ali", "Ahmed"]) await api("POST", "/players", { name });
+
+    // ================= 1. Tables -> start session -> Matches =================
+    await goto("/pages/tables.html", 1280, "/pages/tables.html");
+    let d = doc();
+    const card = () => [...doc().querySelectorAll(".table-card")].find((c) => c.querySelector(".table-number").textContent === "1");
+    await waitFor(() => card() && byText(card(), "button", "Start Session"));
+    ok("tables: no Matches button before a session runs", !card().querySelector(".matches-button"));
+    byText(card(), "button", "Start Session").click();
+    await waitFor(() => card()?.querySelector(".matches-button"));
+    ok("tables: running session card has a Matches button", Boolean(card().querySelector(".matches-button")) && !card().querySelector(".matches-button").hidden);
+    card().querySelector(".matches-button").click();
+    await waitFor(() => dlg() && dlg().querySelector(".match-empty"));
+    ok("dialog: 'Matches · Table 1', session start time, no matches yet",
+       text(dlg().querySelector(".modal-title")) === "Matches · Table 1" && text(dlg().querySelector(".modal-subtitle")).startsWith("Session started")
+       && text(dlg().querySelector(".match-empty")).startsWith("No matches yet"));
+
+    // ================= 2. Match 1: Century, registered + walk-in =================
+    await openStartForm();
+    const modeLabels = [...form().querySelectorAll(".segment")].map((s) => text(s.querySelector(".segment-label")));
+    ok("start form: the four game types from the registry, Century first", modeLabels.join() === "Century,Frame,Snooker Point,4 Players", modeLabels);
+    ok("start form: player rules shown, no prices", text(byText(form(), ".segment", "Snooker Point")).includes("exactly 3 players") && text(byText(form(), ".segment", "Century")).includes("2 or more players")
+       && !/Rs\s/.test(text(form())));
+    ok("start form: Century starts with 2 players, each Walk-in by default", playerRows().length === 2 && playerRows().every((r) => r.querySelector(".match-kind").value === "walkin"));
+    await registered(playerRows()[0], "al", "Ali");
+    ok("registered player chosen from the search, marked 'Registered'", text(playerRows()[0].querySelector(".match-chosen")).startsWith("AliRegistered"), text(playerRows()[0]));
+    walkIns([]); type(playerRows()[1].querySelector(".match-walkin-name"), "Guest");
+    await submitStart(1);
+    ok("match #1 started: toast + listed In Progress", await waitFor(() => toastHas("Match #1 (Century) started")) && text(matchRow(1).querySelector(".status-badge")) === "In Progress");
+    ok("match #1: players shown with Registered / Walk-in in words", text(matchRow(1).querySelector(".match-players")) === "Ali (Registered) vs Guest (Walk-in)", text(matchRow(1).querySelector(".match-players")));
+    await completeWith(1, "Guest");
+    ok("complete: 'Who won?' then Completed, Winner: Guest", text(matchRow(1).querySelector(".match-result")) === "Winner: Guest" && toastHas("Match #1 (Century) completed"));
+
+    // ================= 3. Match 2: Frame, three players =================
+    await openStartForm();
+    chooseMode("Frame");
+    byText(form(), "button", "Add player").click();
+    ok("Frame: any number of players (3 rows after 'Add player')", playerRows().length === 3);
+    await registered(playerRows()[0], "ali", "Ali");
+    await registered(playerRows()[1], "ahm", "Ahmed");
+    type(playerRows()[2].querySelector(".match-walkin-name"), "Bilal");
+    await submitStart(2);
+    ok("match #2 (Frame, 3 players) in the same session", text(matchRow(2).querySelector(".match-players")) === "Ali (Registered) vs Ahmed (Registered) vs Bilal (Walk-in)");
+
+    // ================= 4. Validation: Snooker Point =================
+    await openStartForm();
+    chooseMode("Snooker Point");
+    ok("Snooker Point: exactly 3 player rows, no 'Add player'", playerRows().length === 3 && byText(form(), "button", "Add player").hidden);
+    form().requestSubmit();
+    ok("empty walk-in name: clear message, nothing started", formError() === "Player 1: type the walk-in name." && matchRows().length === 2, formError());
+    walkIns(["Zed", " zed ", "Xavi"]);
+    form().requestSubmit();
+    await waitFor(() => formError());
+    ok("same name twice: the server's message is shown in the form", formError() === 'Each player needs a different name ("zed" is there twice)', formError());
+    walkIns(["Zed", "Yasir", "Xavi"]);
+    await submitStart(3);
+    ok("match #3 (Snooker Point, 3 walk-ins) started", text(matchRow(3).querySelector(".match-title")) === "#3 Snooker Point");
+
+    // ================= 5. 4 Players: teams =================
+    await openStartForm();
+    chooseMode("4 Players");
+    const teams = () => [...form().querySelectorAll(".match-team")];
+    ok("4 Players: Team 1 and Team 2, two players each", teams().map((t) => text(t.querySelector(".match-team-title"))).join() === "Team 1 (2 of 2),Team 2 (2 of 2)"
+       && teams().every((t) => t.querySelectorAll(".match-player-row").length === 2));
+    byText(teams()[0], "button", "Move to Team 2").click();
+    ok("move a player: Team 1 has 1, Team 2 has 3", teams().map((t) => text(t.querySelector(".match-team-title"))).join() === "Team 1 (1 of 2),Team 2 (3 of 2)");
+    const fillTeams = () => teams().forEach((t, ti) => [...t.querySelectorAll(".match-walkin-name")].forEach((input, i) => type(input, `${ti === 0 ? "T1" : "T2"}-${i + 1}`)));
+    fillTeams();
+    form().requestSubmit();
+    ok("uneven teams refused before starting", formError() === "Each team needs exactly 2 players (Team 1 has 1, Team 2 has 3)." && matchRows().length === 3, formError());
+    byText(teams()[1], "button", "Move to Team 1").click();
+    ok("moved back: 2 + 2", teams().map((t) => text(t.querySelector(".match-team-title"))).join() === "Team 1 (2 of 2),Team 2 (2 of 2)");
+    // Names by team: Team 1 = Saad, Umar; Team 2 = Kamran, Danish
+    [["Saad", "Umar"], ["Kamran", "Danish"]].forEach((names, ti) => [...teams()[ti].querySelectorAll(".match-walkin-name")].forEach((input, i) => type(input, names[i])));
+    await submitStart(4);
+    ok("match #4 shows the two teams", text(matchRow(4).querySelector(".match-players")) === "Team 1: Saad (Walk-in) & Umar (Walk-in) vs Team 2: Kamran (Walk-in) & Danish (Walk-in)", text(matchRow(4).querySelector(".match-players")));
+    byText(matchRow(4), "button", "Complete Match").click();
+    const teamForm = await waitFor(() => matchRow(4).querySelector(".match-result-form"));
+    ok("4 Players: 'Which team won?' with Team 1 / Team 2", text(teamForm.querySelector(".match-question")) === "Which team won?" && teamForm.querySelectorAll(".match-choice").length === 2);
+    teamForm.requestSubmit();
+    ok("no team chosen: asks to choose", await waitFor(() => text(dlg().querySelector(":scope .modal-content > .form-error")) === "Choose the team that won."));
+    choose([...teamForm.querySelectorAll(".match-choice")].find((c) => c.textContent.startsWith("Team 2")).querySelector("input"));
+    teamForm.requestSubmit();
+    await waitFor(() => text(matchRow(4)?.querySelector(".status-badge")) === "Completed");
+    ok("4 Players completed: Winning Team: Team 2", text(matchRow(4).querySelector(".match-result")) === "Winning Team: Team 2 (Kamran & Danish)");
+
+    // ================= 6. Cancel (confirm) and change result =================
+    byText(matchRow(2), "button", "Cancel Match").click();
+    const confirmBox = await waitFor(() => doc().querySelector("dialog.modal-small[open]"));
+    ok("cancel asks first", text(confirmBox.querySelector(".modal-title")) === "Cancel match #2?");
+    confirmBox.querySelector(".btn-danger").click();
+    await waitFor(() => text(matchRow(2)?.querySelector(".status-badge")) === "Cancelled");
+    ok("match #2 cancelled, kept in the list, no more buttons", text(matchRow(2).querySelector(".status-badge")) === "Cancelled" && matchRows().length === 4 && !matchRow(2).querySelector("button"));
+    byText(matchRow(1), "button", "Change result").click();
+    const change = await waitFor(() => matchRow(1).querySelector(".match-result-form"));
+    ok("change result: current winner pre-selected, bill note shown", change.querySelector("input:checked")?.closest(".match-choice").textContent === "Guest" && text(change).includes("does not change a bill"));
+    choose([...change.querySelectorAll(".match-choice")].find((c) => c.textContent === "Ali").querySelector("input"));
+    change.requestSubmit();
+    await waitFor(() => text(matchRow(1)?.querySelector(".match-result")) === "Winner: Ali");
+    ok("result changed to Ali", text(matchRow(1).querySelector(".match-result")) === "Winner: Ali");
+
+    // ================= 7. One session, many matches (server) - walk-ins not registered =================
+    const sessionId = (await api("GET", "/sessions/active")).body.data.sessions[0].id;
+    const list = (await api("GET", `/sessions/${sessionId}/matches`)).body.data;
+    ok("server: one session holds 4 matches #1-#4", list.map((m) => `${m.number}:${m.gameMode}:${m.status}`).join() === "1:century:completed,2:frame:cancelled,3:snooker_point:in_progress,4:four_player:completed", list.map((m) => m.status));
+    ok("walk-ins created no registered players (still Ali, Ahmed)", (await api("GET", "/players?status=all")).body.data.players.map((p) => p.name).join() === "Ahmed,Ali");
+    dlg().querySelector(".modal-actions .btn-secondary").click();
+    await waitFor(() => !dlg());
+
+    // ================= 8. Same matches from the Sessions page; cashier rules =================
+    await loginAs("ui-cashier");
+    await goto("/pages/sessions.html", 1280, "/pages/sessions.html");
+    d = doc();
+    const activeMatches = await waitFor(() => d.querySelector("#active-sessions .matches-button"));
+    activeMatches.click();
+    await waitFor(() => dlg() && matchRows().length === 4);
+    ok("sessions page: the same 4 matches", matchRows().length === 4);
+    ok("cashier: can complete, but no Cancel Match", Boolean(byText(matchRow(3), "button", "Complete Match")) && !byText(matchRow(3), "button", "Cancel Match"));
+    ok("cashier: server refuses cancelling (403)", (await api("POST", `/matches/${list[2].id}/cancel`, {})).status === 403);
+    await completeWith(3, "Yasir");
+    ok("cashier completed Snooker Point: Winner: Yasir", text(matchRow(3).querySelector(".match-result")) === "Winner: Yasir");
+    dlg().querySelector(".modal-actions .btn-secondary").click();
+    await loginAs("ui-admin");
+
+    // ================= 9. Ended session: history, no new matches =================
+    await api("POST", `/sessions/${sessionId}/end`);
+    await goto("/pages/sessions.html", 1280, "/pages/sessions.html");
+    d = doc();
+    const historyMatches = await waitFor(() => d.querySelector("#history-body .matches-button"));
+    historyMatches.click();
+    await waitFor(() => dlg() && matchRows().length === 4);
+    ok("ended session: matches still listed, no 'Start New Match', explained",
+       !byText(dlg(), "button", "Start New Match") && text(dlg().querySelector(".match-start-area")).includes("session has ended") && text(dlg().querySelector(".modal-subtitle")).includes("session ended"));
+    ok("server: no new match on an ended session (409)",
+       (await api("POST", `/sessions/${sessionId}/matches`, { gameMode: "century", players: [{ name: "A" }, { name: "B" }] })).status === 409);
+    dlg().querySelector(".modal-actions .btn-secondary").click();
+
+    // ================= 10. Dashboard + phone width =================
+    const s2 = (await api("POST", "/sessions", { tableId: (await api("GET", "/tables")).body.data[0].id })).body.data;
+    await api("POST", `/sessions/${s2.id}/matches`, { gameMode: "century", players: [{ name: "Long Walk-in Name Number One" }, { name: "Another Quite Long Name" }] });
+    await goto("/pages/dashboard.html", 375, "/pages/dashboard.html");
+    const dashButton = await waitFor(() => doc().querySelector("#active-sessions .matches-button"));
+    ok("dashboard: running session has a Matches button", Boolean(dashButton));
+    dashButton.click();
+    await waitFor(() => dlg() && matchRows().length === 1);
+    await openStartForm();
+    chooseMode("4 Players");
+    const box = dlg().getBoundingClientRect();
+    ok("375px: Matches dialog with the 4 Players form fits, no sideways scroll", box.left >= -1 && box.right <= doc().documentElement.clientWidth + 1 && noSideScroll(),
+       { left: box.left, right: box.right, width: doc().documentElement.clientWidth, scroll: doc().documentElement.scrollWidth,
+         wide: [...doc().querySelectorAll("body *")].filter((e) => e.getBoundingClientRect().right > doc().documentElement.clientWidth + 1).slice(0, 6).map((e) => `${e.tagName}.${e.className}`) });
+    ok("a second session starts again at match #1", text(matchRows()[0].querySelector(".match-title")) === "#1 Century");
+  } catch (e) {
+    log.push("FAIL suite crashed: " + e.message + " " + e.stack);
+  }
+  const fails = log.filter((l) => l.startsWith("FAIL")).length;
+  document.getElementById("out").textContent = log.join("\n") + `\n\nTOTAL ${log.length - fails} passed, ${fails} failed`;
+})();
+</script>
+</body></html>

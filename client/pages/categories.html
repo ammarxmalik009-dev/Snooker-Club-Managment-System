@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#070908">
+    <title>Categories · Snooker Club Pro</title>
+    <link rel="stylesheet" href="/css/theme.css">
+    <link rel="stylesheet" href="/css/layout.css">
+    <link rel="stylesheet" href="/css/components.css">
+</head>
+<body data-page="categories">
+
+    <!-- ===== Sidebar (menu items are added by js/core/layout.js) ===== -->
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+        <a href="/pages/dashboard.html" class="sidebar-brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <span>Snooker Club Pro</span>
+        </a>
+        <nav class="sidebar-nav" id="sidebar-nav"></nav>
+        <div class="sidebar-footer" id="sidebar-footer"></div>
+    </aside>
+    <div class="sidebar-overlay" id="sidebar-overlay" hidden></div>
+
+    <div class="app-main">
+        <header class="topbar">
+            <button type="button" class="menu-button" id="menu-button"
+                    aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">
+                <span data-icon="menu"></span>
+            </button>
+            <h1 class="topbar-title">Categories</h1>
+            <div class="topbar-right">
+                <span class="topbar-date" id="topbar-date"></span>
+                <span class="status-pill" id="server-status" role="status">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span class="status-text">Checking…</span>
+                </span>
+            </div>
+        </header>
+
+        <main class="page-content">
+            <div class="page-header">
+                <p class="page-intro">Groups for the café products, e.g. Cold drinks, Hot drinks, Snacks.</p>
+                <button type="button" class="btn btn-primary" id="add-category-button" data-permission="products:manage">
+                    <span data-icon="plus"></span> Add Category
+                </button>
+            </div>
+
+            <article class="panel panel-wide">
+                <header class="panel-header">
+                    <h2 class="panel-title">Category list</h2>
+                    <span class="panel-meta" id="categories-summary"></span>
+                </header>
+                <div class="toolbar toolbar-padded">
+                    <div class="search-field">
+                        <span data-icon="search"></span>
+                        <label for="category-search" class="visually-hidden">Search categories</label>
+                        <input type="search" id="category-search" class="input" placeholder="Category name…" maxlength="50" autocomplete="off">
+                    </div>
+                </div>
+                <div id="categories-list">
+                    <div class="empty-state panel-empty"><span class="spinner" aria-hidden="true"></span><p>Loading…</p></div>
+                </div>
+            </article>
+        </main>
+    </div>
+
+    <!-- ===== Add / edit category ===== -->
+    <dialog class="modal modal-small" id="category-dialog" aria-labelledby="category-dialog-title">
+        <form class="modal-content" id="category-form" novalidate>
+            <h2 class="modal-title" id="category-dialog-title">Add category</h2>
+            <p class="form-error" id="category-form-error" role="alert" hidden></p>
+            <div class="form-field">
+                <label for="category-name">Name</label>
+                <input type="text" id="category-name" name="name" class="input" maxlength="100" autocomplete="off">
+                <p class="field-hint">2–100 characters. Each name can be used once (capital letters don't matter).</p>
+                <p class="field-error" data-error-for="name" hidden></p>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" id="category-cancel">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="category-save">Save Category</button>
+            </div>
+        </form>
+    </dialog>
+
+    <script src="/js/core/api.js"></script>
+    <script src="/js/core/ui.js"></script>
+    <script src="/js/core/format.js"></script>
+    <script src="/js/core/layout.js"></script>
+    <script src="/js/pages/categories.js"></script>
+</body>
+</html>

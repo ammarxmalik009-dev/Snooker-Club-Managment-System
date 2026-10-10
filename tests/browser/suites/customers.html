@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>customers UI harness</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1440" height="900"></iframe>
+<script>
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+let seenToasts = [];
+const TOMORROW = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Karachi" }).format(new Date(Date.now() + 864e5));
+
+function nextLoad() {
+  return new Promise((resolve) => {
+    frame.onload = () => {
+      const w = frame.contentWindow;
+      new w.MutationObserver((ms) => { for (const m of ms) for (const n of m.addedNodes)
+        if (n.classList?.contains("toast")) seenToasts.push(n.querySelector(".toast-message").textContent); })
+        .observe(w.document.body, { childList: true, subtree: true });
+      resolve(w);
+    };
+  });
+}
+function loadPage(url, width = 1440) { frame.width = width; const p = nextLoad(); frame.src = url; return p; }
+async function clickAndLoad(el) { const p = nextLoad(); el.click(); return p; }
+async function waitFor(check, timeout = 6000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+const api = async (method, path, body) => {
+  const r = await fetch("/api" + path, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json() };
+};
+const byText = (root, selector, text) => [...root.querySelectorAll(selector)].find((e) => e.textContent.includes(text));
+const type = (input, value) => { input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); };
+
+(async () => {
+  try {
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
+    { const r = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: "ui-admin", password: "Ui-test-pass-123" }) }); if (r.status !== 200) throw new Error("harness login failed: " + r.status); }
+    let w = await loadPage("/pages/customers.html"); let d = w.document;
+    await waitFor(() => !d.getElementById("customers-empty").hidden);
+    ok("empty state", d.getElementById("customers-empty-title").textContent === "No customers yet");
+    ok("sidebar: Customers active", d.querySelector(".nav-link.active")?.textContent.includes("Customers"));
+
+    // Add with validation
+    d.getElementById("add-customer-button").click(); await sleep(150);
+    const f = d.getElementById("customer-form");
+    type(f.elements.name, "K"); d.getElementById("customer-save").click(); await sleep(150);
+    ok("short name refused in the form", d.querySelector('[data-error-for="name"]').textContent === "Enter a name (at least 2 letters)");
+    type(f.elements.name, "Kamran Akmal"); type(f.elements.phone, "abc"); d.getElementById("customer-save").click();
+    await waitFor(() => !d.querySelector('[data-error-for="phone"]').hidden);
+    ok("server phone error under the field", d.querySelector('[data-error-for="phone"]').textContent.startsWith("Phone must be 7 to 20 digits"));
+    type(f.elements.phone, "0321 555 0000"); d.getElementById("customer-save").click();
+    await waitFor(() => !d.getElementById("customer-dialog").open);
+    ok("added: toast + row", seenToasts.includes("Customer Kamran Akmal added") && !!(await waitFor(() => byText(d, "#customers-body tr", "Kamran Akmal"))));
+
+    await api("POST", "/customers", { name: "Zubair" });
+    const regular = (await api("POST", "/customers", { name: "Regular Ali", phone: "0300-1234567" })).body.data;
+    const table = (await api("POST", "/tables", { tableNumber: 1, name: "VIP", hourlyRate: 1 })).body.data;
+    await api("POST", "/bookings", { customerId: regular.id, tableId: table.id, date: TOMORROW, startTime: "18:00", durationMinutes: 90 });
+    w = await loadPage("/pages/customers.html"); d = w.document;
+    const rows = () => [...d.querySelectorAll("#customers-body tr")];
+    await waitFor(() => rows().length === 3);
+    ok("sorted by name, booking counts", rows().map((r) => r.querySelector("td").textContent).join(",") === "Kamran Akmal,Regular Ali,Zubair" &&
+       byText(d, "#customers-body tr", "Regular Ali").querySelectorAll("td")[2].textContent === "1");
+
+    type(d.getElementById("customer-search"), "555 00");
+    await waitFor(() => rows().length === 1);
+    ok("search by phone digits", rows()[0].textContent.includes("Kamran Akmal"));
+    type(d.getElementById("customer-search"), ""); await waitFor(() => rows().length === 3);
+
+    // Edit
+    byText(byText(d, "#customers-body tr", "Zubair"), "button", "Edit").click(); await sleep(150);
+    const form = d.getElementById("customer-form"); // the page was reloaded, so use the new form
+    ok("edit dialog prefilled", form.elements.name.value === "Zubair" && d.getElementById("customer-dialog-title").textContent === "Edit Zubair");
+    type(form.elements.name, "Zubair Khan"); d.getElementById("customer-save").click();
+    await waitFor(() => byText(d, "#customers-body tr", "Zubair Khan"));
+    ok("edit saved", seenToasts.includes("Customer Zubair Khan updated"));
+
+    // Profile with history + archive
+    byText(byText(d, "#customers-body tr", "Regular Ali"), "button", "View").click();
+    await waitFor(() => d.getElementById("profile-dialog").open && d.querySelector("#profile .mini-stats"));
+    const profileText = d.getElementById("profile").textContent;
+    ok("profile: stats + booking history row", profileText.includes("1Bookings") && profileText.includes("1Upcoming") &&
+       d.querySelectorAll("#profile tbody tr").length === 1 && d.querySelector("#profile tbody tr").textContent.includes("Pending"), profileText);
+    ok("profile: 'New booking' link for this customer", d.querySelector(`#profile a[href="/pages/bookings.html?action=new&customer=${regular.id}"]`));
+    byText(d.getElementById("profile"), "button", "Archive").click();
+    const box = await waitFor(() => d.querySelector("dialog.modal-small[open]"));
+    ok("archive confirm explains history is kept", box.querySelector(".modal-text").textContent.includes("will be archived"));
+    box.querySelector(".btn-danger").click();
+    await waitFor(() => !byText(d, "#customers-body tr", "Regular Ali"));
+    ok("archived: hidden from the list", seenToasts.includes("Customer Regular Ali archived (kept because they have bookings)"));
+    d.getElementById("show-archived").click();
+    await waitFor(() => byText(d, "#customers-body tr", "Regular Ali"));
+    ok("'Show archived' shows it with a badge", byText(d, "#customers-body tr", "Regular Ali").querySelector(".archived-badge"));
+
+    // Delete a customer without bookings
+    byText(byText(d, "#customers-body tr", "Kamran Akmal"), "button", "View").click();
+    await waitFor(() => byText(d.getElementById("profile"), "button", "Delete"));
+    ok("no bookings: 'No bookings yet.' + Delete", d.getElementById("profile").textContent.includes("No bookings yet."));
+    byText(d.getElementById("profile"), "button", "Delete").click();
+    (await waitFor(() => d.querySelector("dialog.modal-small[open]"))).querySelector(".btn-danger").click();
+    await waitFor(() => !byText(d, "#customers-body tr", "Kamran Akmal"));
+    ok("deleted for real", seenToasts.includes("Customer Kamran Akmal deleted") && (await api("GET", "/customers?includeArchived=true&search=kamran")).body.data.total === 0);
+
+    // New booking from the profile
+    byText(byText(d, "#customers-body tr", "Zubair Khan"), "button", "View").click();
+    await waitFor(() => d.getElementById("profile-title")?.textContent === "Zubair Khan"); // wait for THIS profile
+    const link = d.querySelector('#profile a[href^="/pages/bookings.html?action=new"]');
+    w = await clickAndLoad(link); d = w.document;
+    await waitFor(() => d.getElementById("booking-dialog").open);
+    ok("profile 'New booking' -> booking form with this customer", d.getElementById("selected-customer-text").textContent === "Zubair Khan");
+
+    w = await loadPage("/pages/customers.html", 375); d = w.document;
+    await sleep(900);
+    ok("customers 375px: no horizontal overflow", d.documentElement.scrollWidth <= d.documentElement.clientWidth);
+    ok("no localStorage used", w.localStorage.length === 0);
+  } catch (error) {
+    ok("harness crashed: " + error.message + " " + error.stack, false);
+  }
+  document.getElementById("out").textContent = log.join("\n");
+})();
+</script>
+</body></html>

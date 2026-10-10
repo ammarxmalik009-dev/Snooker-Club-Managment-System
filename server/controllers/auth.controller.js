@@ -1,0 +1,42 @@
+// Login / logout / "who am I".
+
+const { matchedData } = require("express-validator");
+const authService = require("../services/auth.service");
+const { permissionsForRole } = require("../config/permissions");
+const { sendSuccess } = require("../utils/response");
+
+// Safe user info for the browser (never the password hash)
+function publicUser(user) {
+  return {
+    id: String(user._id),
+    name: user.name,
+    username: user.username,
+    role: user.role,
+    active: user.active,
+    permissions: permissionsForRole(user.role), // used ONLY to hide buttons/menus; the server still checks
+  };
+}
+
+async function login(req, res) {
+  const { username, password } = matchedData(req, { locations: ["body"] });
+  const { token, user } = await authService.login({ username, password, ip: req.ip, userAgent: req.get("user-agent") || "" });
+
+  // If this browser was logged in as someone else, end that login first
+  await authService.logout(req.cookies ? req.cookies[authService.COOKIE_NAME] : undefined);
+
+  res.cookie(authService.COOKIE_NAME, token, authService.cookieOptions());
+  sendSuccess(res, `Welcome, ${user.name}`, publicUser(user));
+}
+
+async function logout(req, res) {
+  await authService.logout(req.cookies ? req.cookies[authService.COOKIE_NAME] : undefined);
+  res.clearCookie(authService.COOKIE_NAME, { path: "/", httpOnly: true, sameSite: "strict", secure: authService.cookieOptions().secure });
+  sendSuccess(res, "Logged out", null);
+}
+
+// 401 when not logged in (handled by requireAuth before this runs)
+async function me(req, res) {
+  sendSuccess(res, "Logged in", publicUser(req.user));
+}
+
+module.exports = { login, logout, me, publicUser };

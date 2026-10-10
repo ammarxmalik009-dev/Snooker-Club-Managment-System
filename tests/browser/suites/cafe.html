@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>cafe browser suite</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1280" height="900"></iframe>
+<script>
+// Phase 10 browser tests: Categories and Products pages, restock / adjust / history, the session
+// café tab, the Create Bill window with products, typed-in items, "who had it" and the café payer
+// rule, stock taken on billing and returned on cancel, the three roles, and phone width.
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+const PASSWORD = "Ui-test-pass-123";
+
+const win = () => frame.contentWindow;
+const doc = () => frame.contentDocument;
+const path = () => { try { return win().location.pathname + win().location.search; } catch { return ""; } };
+async function waitFor(check, timeout = 8000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+async function goto(url, width = 1280, expectPath) {
+  frame.width = width;
+  frame.src = url;
+  await sleep(150);
+  await waitFor(() => doc().readyState === "complete" && (!expectPath || path().startsWith(expectPath)));
+  await sleep(300);
+}
+const api = async (method, p, body) => {
+  const r = await fetch("/api" + p, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json().catch(() => null) };
+};
+const loginAs = async (username) => { await api("POST", "/auth/logout"); return api("POST", "/auth/login", { username, password: PASSWORD }); };
+const stock = async (id) => (await (await fetch(`/_stock/${id}`)).json()).stockQuantity;
+const text = (el) => (el ? el.textContent.replace(/\s+/g, " ").trim() : "");
+const byText = (root, selector, t) => [...root.querySelectorAll(selector)].find((e) => e.textContent.includes(t));
+const toastHas = (t) => [...doc().querySelectorAll(".toast-message")].some((m) => m.textContent.includes(t));
+const type = (input, value) => { input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); input.dispatchEvent(new Event("change", { bubbles: true })); };
+const pick = (select, value) => { select.value = value; select.dispatchEvent(new Event("change", { bubbles: true })); };
+const noSideScroll = () => doc().documentElement.scrollWidth <= doc().documentElement.clientWidth + 1;
+const rowFor = (name) => [...doc().querySelectorAll("#products-list tbody tr")].find((tr) => tr.querySelector("strong")?.textContent === name);
+
+(async () => {
+  try {
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
+    if ((await loginAs("ui-admin")).status !== 200) throw new Error("admin login failed");
+    // Phase 11.3: Century is per billed minute; these sessions bill the 15 min minimum × Rs 20 = Rs 300
+    await api("PATCH", "/settings", { gameRates: { century: 2000 }, framePrice: 15000 });
+
+    // ================= 1. Categories page (admin) =================
+    await goto("/pages/categories.html", 1280, "/pages/categories.html");
+    let d = doc();
+    await waitFor(() => text(d.getElementById("categories-list")).includes("No categories yet"));
+    ok("categories: empty state for a new club", text(d.getElementById("categories-list")).includes("No categories yet"));
+    ok("sidebar: Café Products and Categories links", ["/pages/products.html", "/pages/categories.html"].every((h) => d.querySelector(`#sidebar-nav a[href="${h}"]`)));
+    const addCategory = async (name) => {
+      d.getElementById("add-category-button").click(); await sleep(100);
+      type(d.getElementById("category-name"), name);
+      d.getElementById("category-form").requestSubmit();
+    };
+    await addCategory("  Cold   Drinks ");
+    await waitFor(() => byText(d, "#categories-list strong", "Cold Drinks"));
+    ok("categories: added, spaces tidied", Boolean(byText(d, "#categories-list strong", "Cold Drinks")));
+    await addCategory("cold drinks");
+    await waitFor(() => !d.querySelector('[data-error-for="name"]').hidden);
+    ok("categories: duplicate name (other capitals) refused in the form", text(d.querySelector('[data-error-for="name"]')) === "Category name already exists");
+    d.getElementById("category-cancel").click();
+    await addCategory("Snacks");
+    await waitFor(() => byText(d, "#categories-list strong", "Snacks"));
+    const cats = (await api("GET", "/categories")).body.data;
+    const drinksId = cats.find((c) => c.name === "Cold Drinks").id;
+    const snacksId = cats.find((c) => c.name === "Snacks").id;
+
+    // ================= 2. Products page (admin) =================
+    await goto("/pages/products.html", 1280, "/pages/products.html");
+    d = doc();
+    await waitFor(() => text(d.getElementById("products-list")).includes("No products yet"));
+    ok("products: empty state", text(d.getElementById("products-list")).includes("No products yet"));
+    const addProduct = async ({ name, category, price, track = true, stockNow = "0", low = "5" }) => {
+      d.getElementById("add-product-button").click(); await sleep(100);
+      const f = d.getElementById("product-form");
+      type(f.elements.name, name); pick(f.elements.categoryId, category); type(f.elements.price, price);
+      f.elements.trackStock.checked = track; f.elements.trackStock.dispatchEvent(new Event("change"));
+      if (track) { type(f.elements.stockQuantity, stockNow); type(f.elements.lowStockLimit, low); }
+      f.requestSubmit();
+    };
+    await addProduct({ name: "Cola", category: drinksId, price: "80", stockNow: "3", low: "2" });
+    await waitFor(() => rowFor("Cola"));
+    await addProduct({ name: "Chips", category: snacksId, price: "50.50", stockNow: "10" });
+    await waitFor(() => rowFor("Chips"));
+    await addProduct({ name: "Tea", category: drinksId, price: "40", track: false });
+    await waitFor(() => rowFor("Tea"));
+    ok("products: Cola Rs 80.00, stock 3, free 3", text(rowFor("Cola")).includes("Rs 80.00") && text(rowFor("Cola").querySelector('[data-label="Stock"]')) === "3");
+    ok("products: Chips price with paisa (Rs 50.50)", text(rowFor("Chips")).includes("Rs 50.50"));
+    ok("products: Tea made to order (no stock count, no Restock)", text(rowFor("Tea").querySelector('[data-label="Stock"]')) === "Made to order" && !byText(rowFor("Tea"), "button", "Restock"));
+    await addProduct({ name: " COLA ", category: drinksId, price: "1" });
+    await waitFor(() => !d.querySelector('#product-form [data-error-for="name"]').hidden);
+    ok("products: same name in the same category refused", text(d.querySelector('#product-form [data-error-for="name"]')) === "A product with this name already exists in this category");
+    d.getElementById("product-cancel").click();
+    const prods = (await api("GET", "/products?status=all")).body.data;
+    const cola = prods.find((p) => p.name === "Cola"), chips = prods.find((p) => p.name === "Chips"), tea = prods.find((p) => p.name === "Tea");
+
+    // Restock + adjust + history
+    byText(rowFor("Cola"), "button", "Restock").click(); await sleep(100);
+    type(d.getElementById("stock-quantity"), "5"); type(d.getElementById("stock-reason"), "Delivery");
+    d.getElementById("stock-form").requestSubmit();
+    await waitFor(() => text(rowFor("Cola")?.querySelector('[data-label="Stock"]')) === "8");
+    ok("restock: Cola 3 + 5 = 8 (toast + list)", toastHas("Cola: +5, now 8 in stock") && await stock(cola.id) === 8);
+    byText(rowFor("Cola"), "button", "Adjust").click(); await sleep(100);
+    d.querySelector('#stock-form input[name="type"][value="waste"]').click();
+    d.getElementById("stock-form").dispatchEvent(new Event("change"));
+    type(d.getElementById("stock-quantity"), "1");
+    d.getElementById("stock-form").requestSubmit();
+    await waitFor(() => !d.getElementById("stock-form-error").hidden);
+    ok("adjust: reason is required", text(d.getElementById("stock-form-error")).includes("Give a reason"));
+    type(d.getElementById("stock-reason"), "Broken bottle");
+    d.getElementById("stock-form").requestSubmit();
+    await waitFor(() => text(rowFor("Cola")?.querySelector('[data-label="Stock"]')) === "7");
+    ok("adjust: waste 1 -> 7", await stock(cola.id) === 7);
+    byText(rowFor("Cola"), "button", "Adjust").click(); await sleep(100);
+    type(d.getElementById("stock-quantity"), "-50"); type(d.getElementById("stock-reason"), "Recount");
+    d.getElementById("stock-form").requestSubmit();
+    await waitFor(() => !d.getElementById("stock-form-error").hidden);
+    ok("adjust: can't go below 0 (clear message)", text(d.getElementById("stock-form-error")).includes("stock can't go below 0") && await stock(cola.id) === 7);
+    d.getElementById("stock-cancel").click();
+    byText(rowFor("Cola"), "button", "History").click();
+    await waitFor(() => d.querySelectorAll("#history tbody tr").length === 3);
+    ok("history: waste, restock, starting stock (newest first)", [...d.querySelectorAll("#history tbody tr")].map((r) => text(r.querySelector('[data-label="Type"]'))).join(",") === "Waste,Restock,Starting stock");
+    d.getElementById("history-dialog").close();
+    ok("recent stock changes panel shows the changes", d.querySelectorAll("#recent-movements tbody tr").length >= 4);
+    // Edit: price change, no stock field
+    byText(rowFor("Chips"), "button", "Edit").click(); await sleep(100);
+    ok("edit: the stock field isn't offered (Restock/Adjust only)", d.getElementById("initial-stock-field").hidden);
+    type(d.getElementById("product-price"), "55");
+    d.getElementById("product-form").requestSubmit();
+    await waitFor(() => text(rowFor("Chips")).includes("Rs 55.00"));
+    ok("edit: Chips price now Rs 55.00, stock unchanged", await stock(chips.id) === 10);
+
+    // ================= 3. Session café tab =================
+    const table = (await api("POST", "/tables", { tableNumber: 1, name: "VIP", hourlyRate: 1 })).body.data;
+    const session = (await api("POST", "/sessions", { tableId: table.id })).body.data;
+    await goto("/pages/sessions.html", 1280, "/pages/sessions.html");
+    d = doc();
+    const sessionRow = await waitFor(() => d.querySelector(`.session-row[data-session-id="${session.id}"]`));
+    const cafeButton = sessionRow?.querySelector(".cafe-tab-button");
+    ok("running session has a Café button next to End", cafeButton && !cafeButton.hidden && sessionRow.querySelector(".btn-end"));
+    cafeButton.click();
+    const tab = await waitFor(() => d.querySelector("dialog.cafe-tab-dialog[open] .cafe-add-form"));
+    ok("tab dialog: empty tab", text(tab.closest("dialog")).includes("Nothing on this tab yet."));
+    const tabSelect = tab.querySelector(".product-select");
+    ok("tab dialog: products grouped by category with price and free stock",
+       [...tabSelect.querySelectorAll("optgroup")].map((g) => g.label).join(",") === "Cold Drinks,Snacks" && byText(tabSelect, "option", "Cola · Rs 80.00 · 7 left"));
+    pick(tabSelect, cola.id); type(tab.querySelector(".cafe-qty"), "8");
+    tab.requestSubmit();
+    await waitFor(() => !d.querySelector("dialog.cafe-tab-dialog .form-error").hidden);
+    ok("tab: more than the free stock -> 'Only 7 Cola available'", text(d.querySelector("dialog.cafe-tab-dialog .form-error")) === "Only 7 Cola available");
+    type(tab.querySelector(".cafe-qty"), "2"); type(tab.querySelector(".cafe-consumer"), "Ali");
+    tab.requestSubmit();
+    await waitFor(() => d.querySelectorAll("dialog.cafe-tab-dialog .cafe-tab-row").length === 1);
+    let addForm = d.querySelector("dialog.cafe-tab-dialog .cafe-add-form");
+    pick(addForm.querySelector(".product-select"), "");
+    type(addForm.querySelector('input[placeholder="Item name"]'), "Samosa");
+    type(addForm.querySelector('input[placeholder="Rs each"]'), "30");
+    addForm.requestSubmit();
+    await waitFor(() => d.querySelectorAll("dialog.cafe-tab-dialog .cafe-tab-row").length === 2);
+    ok("tab: Cola × 2 (Ali) + typed-in Samosa; total Rs 190.00", text(d.querySelector(".cafe-tab-total")) === "Open on the tab: Rs 190.00 (2 items)");
+    addForm = d.querySelector("dialog.cafe-tab-dialog .cafe-add-form");
+    pick(addForm.querySelector(".product-select"), tea.id);
+    addForm.requestSubmit();
+    await waitFor(() => d.querySelectorAll("dialog.cafe-tab-dialog .cafe-tab-row").length === 3);
+    byText(d.querySelector("dialog.cafe-tab-dialog"), ".cafe-tab-row", "Samosa").querySelector('button[aria-label^="Remove"]').click();
+    await waitFor(() => d.querySelectorAll("dialog.cafe-tab-dialog .cafe-tab-row").length === 2);
+    ok("tab: item removed", !byText(d.querySelector("dialog.cafe-tab-dialog"), ".cafe-tab-row", "Samosa"));
+    ok("tab: stock not taken yet (taken when billed)", await stock(cola.id) === 7);
+    byText(d.querySelector("dialog.cafe-tab-dialog"), "button", "Close").click();
+    await sleep(200);
+
+    // ================= 4. Bill window with café =================
+    sessionRow.querySelector(".btn-end").click();
+    (await waitFor(() => d.querySelector("dialog.modal-small[open] .btn-danger"))).click();
+    const dlg = await waitFor(() => d.querySelector("dialog.bill-dialog[open]"));
+    ok("bill window lists the 2 tab items", dlg && dlg.querySelectorAll(".tab-item-row").length === 2 && text(dlg).includes("2 items from the session's café tab"));
+    ok("café payer rule shown (there are café items), follows 'Loser Pays'", !dlg.querySelector(".cafe-rule").hidden && dlg.querySelector('input[name="cafePayerRule"]:checked').value === "loser");
+    const players = () => [...dlg.querySelectorAll(".player-row")];
+    type(players()[0].querySelector("input"), "Ali");
+    type(players()[1].querySelector("input"), "Usman");
+    pick(players()[1].querySelector("select"), "loser");
+    await sleep(100);
+    const colaTabRow = byText(dlg, ".tab-item-row", "Cola");
+    ok("tab item's 'who had it' matched to player Ali", colaTabRow.querySelector(".consumer-select").value === "Ali");
+    pick(byText(dlg, ".tab-item-row", "Tea").querySelector(".consumer-select"), "Usman");
+    byText(dlg, "button", "Add café item").click();
+    const cafeRow = dlg.querySelector(".cafe-row");
+    ok("bill window: new café row offers products first (typed-in fields hidden)", cafeRow.querySelector(".product-select").value === cola.id && cafeRow.querySelector('input[type="text"]').hidden);
+    pick(cafeRow.querySelector(".product-select"), chips.id); type(cafeRow.querySelector('input[type="number"]'), "2");
+    pick(cafeRow.querySelector(".consumer-select"), "Usman");
+    dlg.querySelector('input[name="cafePayerRule"][value="consumer"]').click();
+    dlg.querySelector('input[name="cafePayerRule"][value="consumer"]').dispatchEvent(new Event("change", { bubbles: true }));
+    const summary = () => text(dlg.querySelector(".bill-summary"));
+    await waitFor(() => summary().includes("Café: Consumer Pays") && summary().includes("Chips × 2"));
+    // game 300 (Usman loses) + Cola 2x80 (Ali) + Tea 40 (Usman) + Chips 2x55 (Usman) = 610
+    ok("preview: tab items + Chips at today's price, total Rs 610.00", summary().includes("Cola × 2 @ Rs 80.00 (Ali)") && summary().includes("Chips × 2 @ Rs 55.00 (Usman)") && summary().includes("TotalRs 610.00"), summary());
+    const shares = [...dlg.querySelectorAll(".summary-shares li")].map((li) => [...li.children].map((part) => part.textContent).join(" / "));
+    ok("preview: Ali pays his Cola; Usman the game + Tea + Chips",
+       shares.join("|") === "Ali / game Rs 0.00 + café Rs 160.00 / Rs 160.00|Usman / game Rs 300.00 + café Rs 150.00 / Rs 450.00", shares);
+    dlg.querySelector('button[type="submit"]').click();
+    await waitFor(() => !d.querySelector("dialog.bill-dialog"));
+    ok("bill created", toastHas("created · Rs 610.00"));
+    ok("stock taken at billing: Cola 7-2=5, Chips 10-2=8", await stock(cola.id) === 5 && await stock(chips.id) === 8);
+
+    // Bill detail on the Billing page
+    const bill = (await api("GET", "/bills")).body.data.bills[0];
+    await goto(`/pages/billing.html?bill=${bill.id}`, 1280, "/pages/billing.html");
+    d = doc();
+    await waitFor(() => d.getElementById("bill-dialog")?.open && d.querySelector(".fact-grid"));
+    ok("bill detail: café lines with who had them", byText(d, "td", "Cola (café, Ali)") && byText(d, "td", "Chips (café, Usman)"));
+    const cafeFact = [...d.querySelectorAll(".fact-grid > div")].find((div) => div.querySelector("dt")?.textContent === "Café paid by");
+    ok("bill detail: 'Café paid by: Consumer Pays' + game/café parts", cafeFact?.querySelector("dd").textContent === "Consumer Pays"
+       && byText(d, ".cell-sub", "game Rs 300.00 + café Rs 150.00"), text(d.querySelector(".fact-grid")));
+    // Cancel (unpaid) -> stock back
+    byText(d, "button", "Cancel bill").click();
+    (await waitFor(() => d.querySelector("dialog.modal-small[open] .btn-danger"))).click();
+    await waitFor(() => toastHas("cancelled"));
+    ok("cancel before payment puts the stock back: Cola 5, Chips 8 -> 7, 10", await stock(cola.id) === 7 && await stock(chips.id) === 10);
+
+    // ================= 5. Out of stock can't be chosen =================
+    await api("POST", `/products/${chips.id}/adjust`, { type: "waste", quantity: 10, reason: "expired" });
+    const s2 = (await api("POST", "/sessions", { tableId: table.id })).body.data;
+    await goto("/pages/sessions.html", 1280, "/pages/sessions.html");
+    d = doc();
+    (await waitFor(() => d.querySelector(`.session-row[data-session-id="${s2.id}"] .cafe-tab-button`))).click();
+    const chipsOption = await waitFor(() => byText(d.querySelector("dialog.cafe-tab-dialog[open] .product-select"), "option", "Chips"));
+    ok("out of stock product shown but can't be chosen", chipsOption && chipsOption.disabled && chipsOption.textContent.includes("out of stock"));
+    byText(d.querySelector("dialog.cafe-tab-dialog"), "button", "Close").click();
+    await goto("/pages/products.html", 1280, "/pages/products.html");
+    d = doc();
+    await waitFor(() => !d.getElementById("low-stock-alert").hidden);
+    ok("low-stock warning lists Chips (0) as out of stock", text(d.getElementById("low-stock-alert")).includes("(1 out of stock)") && text(d.getElementById("low-stock-alert")).includes("Chips (0)"));
+    ok("Chips row: 'Out of stock' badge", byText(rowFor("Chips"), ".badge", "Out of stock"));
+    byText(rowFor("Cola"), "button", "Delete").click();
+    (await waitFor(() => d.querySelector("dialog.modal-small[open] .btn-danger"))).click();
+    ok("delete a sold product -> refused, set inactive instead", await waitFor(() => toastHas("Set it to inactive instead")));
+
+    // ================= 6. Roles =================
+    await loginAs("ui-staff");
+    await goto("/pages/products.html", 1280, "/pages/products.html");
+    d = doc();
+    await waitFor(() => rowFor("Cola"));
+    ok("staff: can restock, can't add/edit/delete/adjust", d.getElementById("add-product-button").hidden && byText(rowFor("Cola"), "button", "Restock")
+       && !byText(rowFor("Cola"), "button", "Edit") && !byText(rowFor("Cola"), "button", "Adjust") && !byText(rowFor("Cola"), "button", "Delete"));
+    ok("staff: server refuses a price change (403)", (await api("PATCH", `/products/${cola.id}`, { price: 1 })).status === 403);
+    ok("staff: server refuses adjust (403), allows restock", (await api("POST", `/products/${cola.id}/adjust`, { type: "waste", quantity: 1, reason: "x" })).status === 403
+       && (await api("POST", `/products/${cola.id}/restock`, { quantity: 1 })).status === 201);
+    await goto("/pages/categories.html", 1280, "/pages/categories.html");
+    await waitFor(() => doc().querySelector("#categories-list tbody tr"));
+    ok("staff: categories visible, no Add/Rename/Delete", doc().getElementById("add-category-button").hidden && !byText(doc(), "#categories-list button", "Rename"));
+
+    await loginAs("ui-cashier");
+    await goto("/pages/products.html", 1280, "/pages/products.html");
+    d = doc();
+    await waitFor(() => rowFor("Cola"));
+    ok("cashier: sees products but no stock buttons or stock history", !byText(rowFor("Cola"), "button", "Restock") && !byText(rowFor("Cola"), "button", "History")
+       && d.querySelector('[data-permission="stock:view"]').hidden);
+    ok("cashier: restock refused by the server (403)", (await api("POST", `/products/${cola.id}/restock`, { quantity: 1 })).status === 403);
+    ok("cashier: can sell (add to a session tab)", (await api("POST", `/sessions/${s2.id}/cafe-items`, { productId: tea.id, quantity: 1 })).status === 201);
+    await api("POST", "/auth/logout");
+    ok("logged out: products API -> 401", (await api("GET", "/products")).status === 401);
+    await loginAs("ui-admin");
+
+    // ================= 7. Phone width =================
+    for (const width of [375, 820]) {
+      await goto("/pages/products.html", width, "/pages/products.html");
+      await waitFor(() => rowFor("Cola"));
+      ok(`${width}px: products page has no sideways scroll`, noSideScroll(), { scroll: doc().documentElement.scrollWidth });
+    }
+    await goto("/pages/sessions.html", 375, "/pages/sessions.html");
+    d = doc();
+    (await waitFor(() => d.querySelector(`.session-row[data-session-id="${s2.id}"] .cafe-tab-button`))).click();
+    const phoneTab = await waitFor(() => d.querySelector("dialog.cafe-tab-dialog[open] .cafe-add-form"));
+    const dialogBox = phoneTab.closest("dialog").getBoundingClientRect();
+    ok("375px: café tab dialog fits the screen", dialogBox.right <= doc().documentElement.clientWidth + 1 && dialogBox.left >= -1 && noSideScroll(), dialogBox);
+    ok("375px: Café and End buttons visible on the session row", d.querySelector(`.session-row[data-session-id="${s2.id}"] .cafe-tab-button`).getBoundingClientRect().width > 0);
+  } catch (e) {
+    log.push("FAIL suite crashed: " + e.message + " " + e.stack);
+  }
+  const fails = log.filter((l) => l.startsWith("FAIL")).length;
+  document.getElementById("out").textContent = log.join("\n") + `\n\nTOTAL ${log.length - fails} passed, ${fails} failed`;
+})();
+</script>
+</body></html>

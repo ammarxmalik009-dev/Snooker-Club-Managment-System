@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>player history browser suite</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1280" height="900"></iframe>
+<script>
+// Phase 11.6 browser tests: Player -> Match -> Café consumer -> Bill -> Payment.
+// Match bills made in the Matches window with a registered and a walk-in café consumer (Consumer Pays),
+// "Both Pay" wording, a payment on the Billing page, then the Players page: details, match history,
+// billing history and outstanding - for every role, and at phone width.
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+const PASSWORD = "Ui-test-pass-123";
+
+const win = () => frame.contentWindow;
+const doc = () => frame.contentDocument;
+const path = () => { try { return win().location.pathname + win().location.search; } catch { return ""; } };
+async function waitFor(check, timeout = 8000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+async function goto(url, width = 1280, expectPath) {
+  frame.width = width;
+  frame.src = url;
+  await sleep(150);
+  await waitFor(() => doc().readyState === "complete" && (!expectPath || path().startsWith(expectPath)));
+  await sleep(300);
+}
+const api = async (method, p, body) => {
+  const r = await fetch("/api" + p, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json().catch(() => null) };
+};
+const loginAs = async (username) => { await api("POST", "/auth/logout"); return api("POST", "/auth/login", { username, password: PASSWORD }); };
+const text = (el) => (el ? el.textContent.replace(/\s+/g, " ").trim() : "");
+const byText = (root, selector, t) => [...root.querySelectorAll(selector)].find((e) => e.textContent.includes(t));
+const toastHas = (t) => [...doc().querySelectorAll(".toast-message")].some((m) => m.textContent.includes(t));
+const choose = (input) => { input.checked = true; input.dispatchEvent(new Event("change", { bubbles: true })); };
+const pick = (select, value) => { select.value = value; select.dispatchEvent(new Event("change", { bubbles: true })); };
+const noSideScroll = () => doc().documentElement.scrollWidth <= doc().documentElement.clientWidth + 1;
+
+const dlg = () => doc().querySelector("dialog.matches-dialog[open]");
+const billDlg = () => doc().querySelector("dialog.match-bill-dialog[open]");
+const matchRow = (n) => [...dlg().querySelectorAll(".match-row")].find((r) => r.querySelector(".match-title").textContent.startsWith(`#${n} `));
+const summary = () => text(billDlg()?.querySelector(".bill-summary"));
+const sharesText = () => [...billDlg().querySelectorAll(".summary-shares li")].map((li) => text(li)).join("|");
+const consumerFor = (item) => byText(billDlg(), ".match-tab-item", item).querySelector("select");
+const profile = () => doc().querySelector("#player-profile-dialog[open] #player-profile");
+const statOf = (label) => text(profile()?.querySelector(`.mini-stat[data-stat="${label}"] strong`));
+const playerRow = (name) => [...doc().querySelectorAll("#players-list tbody tr")].find((tr) => tr.querySelector("strong")?.textContent === name);
+const historyRows = (box) => [...profile().querySelectorAll(`.${box} tbody tr`)];
+
+// Opens the Matches window of the ended session on table <name> (Sessions page history)
+async function openMatchesFor(tableName) {
+  await goto("/pages/sessions.html", 1280, "/pages/sessions.html");
+  const button = await waitFor(() => [...doc().querySelectorAll("#history-body .matches-button")].find((b) => b.closest("tr").textContent.includes(tableName)));
+  button.click();
+  await waitFor(() => dlg() && matchRow(1));
+}
+async function openPlayer(name) {
+  await waitFor(() => playerRow(name));
+  byText(playerRow(name), "button", "History").click();
+  return waitFor(() => profile() && profile().querySelector(".player-bills") && profile().querySelector(".mini-stats"));
+}
+
+(async () => {
+  try {
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
+    if ((await loginAs("ui-admin")).status !== 200) throw new Error("admin login failed");
+
+    // ---------- Setup through the API: two tables, two registered players ----------
+    const alpha = (await api("POST", "/tables", { tableNumber: 1, name: "Alpha", hourlyRate: 60000 })).body.data;
+    const bravo = (await api("POST", "/tables", { tableNumber: 2, name: "Bravo", hourlyRate: 60000 })).body.data;
+    const ali = (await api("POST", "/players", { name: "Ali" })).body.data;
+    const ahmed = (await api("POST", "/players", { name: "Ahmed", phone: "0300-1112223", notes: "Weekend regular" })).body.data;
+    const start = async (sessionId, gameMode, players, result) => {
+      const m = (await api("POST", `/sessions/${sessionId}/matches`, { gameMode, players })).body.data;
+      if (result) await api("POST", `/matches/${m.id}/complete`, result);
+      return m;
+    };
+    // Table Alpha: Frame, Ali beats Ahmed; café: Tea Rs 150 (Ali), Burger Rs 300 (Ahmed)
+    const s1 = (await api("POST", "/sessions", { tableId: alpha.id })).body.data;
+    await start(s1.id, "frame", [{ playerId: ali.id }, { playerId: ahmed.id }], { winnerSeat: 1 });
+    await api("POST", `/sessions/${s1.id}/cafe-items`, { description: "Tea", unitPrice: 15000, quantity: 1 });
+    await api("POST", `/sessions/${s1.id}/cafe-items`, { description: "Burger", unitPrice: 30000, quantity: 1, consumer: "Ahmed" });
+    await api("POST", `/sessions/${s1.id}/end`);
+    // Table Bravo: Frame, walk-in Guest beats Ali; café: Juice Rs 50 (Guest, a walk-in); a 4 Players match; a cancelled match
+    const s2 = (await api("POST", "/sessions", { tableId: bravo.id })).body.data;
+    await start(s2.id, "frame", [{ playerId: ali.id }, { name: "Guest" }], { winnerSeat: 2 });
+    await api("POST", `/sessions/${s2.id}/cafe-items`, { description: "Juice", unitPrice: 5000, quantity: 1, consumer: "Guest" });
+    await start(s2.id, "four_player", [{ playerId: ali.id, team: 1 }, { name: "Mate", team: 1 }, { playerId: ahmed.id, team: 2 }, { name: "Zed", team: 2 }], { winningTeam: 1 });
+    const cancelled = await start(s2.id, "frame", [{ playerId: ali.id }, { name: "Quitter" }]);
+    await api("POST", `/matches/${cancelled.id}/cancel`, {});
+    await api("POST", `/sessions/${s2.id}/end`);
+
+    // ================= 1. Registered café consumer, Consumer Pays (table Alpha) =================
+    await openMatchesFor("Alpha");
+    matchRow(1).querySelector(".match-create-bill").click();
+    await waitFor(() => billDlg() && summary().includes("Grand total"));
+    const teaSelect = consumerFor("Tea");
+    ok("café consumer list: the match's players, registered or walk-in in words",
+       [...teaSelect.options].map((o) => o.textContent).join("|") === "Who had it?|Ali (Registered)|Ahmed (Registered)", [...teaSelect.options].map((o) => o.textContent));
+    ok("'who had it' prefilled from the tab (Burger -> Ahmed), Tea not yet chosen", consumerFor("Burger").value === "Ahmed" && teaSelect.value === "");
+    ok("'Both Pay' wording in the match bill window (never 'Split equally')",
+       [...billDlg().querySelectorAll(".segment-label")].map((s) => s.textContent).join() === "Loser Pays,Winner Pays,Both Pay" && !/split/i.test(text(billDlg())));
+    ok("café rule options: Loser Pays / Consumer Pays / Both Pay",
+       [...billDlg().querySelectorAll(".bill-section select:not(.consumer-select) option")].map((o) => o.textContent).join() === "Same as the game,Loser Pays,Consumer Pays,Both Pay");
+    pick(teaSelect, "Ali");
+    pick(billDlg().querySelector(".bill-section select:not(.consumer-select)"), "consumer");
+    await waitFor(() => sharesText() === "Ali (Winner)Rs 150.00|Ahmed (Loser)Rs 550.00");
+    ok("Consumer Pays: Ali Rs 150 (his Tea), Ahmed Rs 250 game + Rs 300 Burger", sharesText() === "Ali (Winner)Rs 150.00|Ahmed (Loser)Rs 550.00" && summary().includes("Grand totalRs 700.00"), sharesText());
+    billDlg().querySelector('button[type="submit"]').click();
+    await waitFor(() => !billDlg() && /Bill B-/.test(text(matchRow(1).querySelector(".match-billing"))));
+    ok("bill created for match #1", toastHas("created for match #1"));
+    const bill1 = (await api("GET", "/bills?limit=10")).body.data.bills[0];
+    ok("server: Tea and Burger carry the registered consumer's reference", bill1.lineItems.filter((l) => l.type === "cafe").map((l) => `${l.consumer}:${l.consumerPlayer === (l.consumer === "Ali" ? ali.id : ahmed.id)}`).join() === "Ali:true,Ahmed:true");
+
+    // ================= 2. Walk-in café consumer + Both Pay (table Bravo) =================
+    await openMatchesFor("Bravo");
+    matchRow(1).querySelector(".match-create-bill").click();
+    await waitFor(() => billDlg() && summary().includes("Grand total"));
+    ok("walk-in consumer offered and prefilled: Juice -> Guest (Walk-in)", consumerFor("Juice").value === "Guest"
+       && [...consumerFor("Juice").options].map((o) => o.textContent).includes("Guest (Walk-in)"));
+    choose(billDlg().querySelector('input[name="matchPayerRule"][value="split"]'));
+    await waitFor(() => summary().includes("Both Pay"));
+    pick(billDlg().querySelector(".bill-section select:not(.consumer-select)"), "consumer");
+    await waitFor(() => sharesText() === "Ali (Loser)Rs 125.00|Guest (Winner)Rs 175.00");
+    ok("Both Pay for the game (Rs 125 each) + Consumer Pays for the Juice (Guest Rs 50)", sharesText() === "Ali (Loser)Rs 125.00|Guest (Winner)Rs 175.00"
+       && summary().includes("Both Pay · Billed time"), [sharesText(), summary()]);
+    billDlg().querySelector('button[type="submit"]').click();
+    await waitFor(() => !billDlg() && /Bill B-/.test(text(matchRow(1).querySelector(".match-billing"))));
+    matchRow(2).querySelector(".match-create-bill").click();            // 4 Players: losing team (Ahmed + Zed) pays Rs 500
+    await waitFor(() => billDlg() && summary().includes("Grand total"));
+    billDlg().querySelector('button[type="submit"]').click();
+    await waitFor(() => !billDlg() && /Bill B-/.test(text(matchRow(2).querySelector(".match-billing"))));
+    ok("cancelled match stays 'Cancelled — not billed'", text(matchRow(3).querySelector(".match-billing")) === "Billing: Cancelled — not billed");
+    const bills = (await api("GET", "/bills?limit=10")).body.data.bills;
+    const juiceBill = bills.find((b) => b.lineItems.some((l) => l.description === "Juice"));
+    ok("server: walk-in consumer stored by name only", juiceBill.lineItems[1].consumer === "Guest" && !juiceBill.lineItems[1].consumerPlayer && juiceBill.payerRule === "split");
+
+    // ================= 3. Match -> Bill -> Payment: Ali pays Rs 100 of his Rs 150 =================
+    await goto(`/pages/billing.html?bill=${bill1.id}`, 1280, "/pages/billing.html");
+    const detail = await waitFor(() => doc().getElementById("bill-dialog")?.open && doc().getElementById("bill-detail")?.querySelector(".payment-form") && doc().getElementById("bill-detail"));
+    ok("bill page: 'Who pays: Loser Pays' and 'Café paid by: Consumer Pays'", detail.textContent.includes("Who paysLoser Pays") && detail.textContent.includes("Café paid byConsumer Pays"), text(detail.querySelector(".fact-grid")));
+    pick(doc().getElementById("pay-payer"), "Ali");
+    doc().getElementById("pay-amount").value = "100";
+    detail.querySelector(".payment-form").requestSubmit();
+    await waitFor(() => detail.querySelector(".bill-detail-header .status-badge")?.textContent === "Partially paid");
+    ok("payment recorded: bill partially paid", detail.querySelector(".bill-detail-header .status-badge").textContent === "Partially paid");
+
+    // ================= 4. Players page: details, match history, billing history, outstanding =================
+    await goto("/pages/players.html", 1280, "/pages/players.html");
+    await openPlayer("Ali");
+    ok("details: name, active status, close button", text(profile().querySelector(".modal-title")) === "Ali" && text(profile().querySelector(".status-badge")) === "Active");
+    ok("stats from the matches: 4 matches, 2 wins (frame + 4 Players), 1 loss", statOf("Matches") === "4" && statOf("Wins") === "2" && statOf("Losses") === "1",
+       ["Matches", "Wins", "Losses"].map(statOf));
+    ok("outstanding: Rs 50 left of Rs 150 + Rs 125 = Rs 175; paid Rs 100", statOf("Outstanding") === "Rs 175.00" && statOf("Paid") === "Rs 100.00" && statOf("Bills") === "3",
+       ["Bills", "Paid", "Outstanding"].map(statOf));
+    const matchRows = historyRows("player-matches");
+    ok("match history: 4 rows, newest first (cancelled, 4 Players, frame on Bravo, frame on Alpha)", matchRows.length === 4
+       && text(matchRows[0]).includes("Cancelled") && text(matchRows[3]).includes("Table 1"), matchRows.map(text));
+    const teamRow = matchRows.find((tr) => text(tr).includes("4 Players"));
+    ok("match history: 4 Players shows the team, team-mate, opponents and winning team", text(teamRow).includes("Team 1 with Mate · vs Ahmed, Zed") && text(teamRow).includes("Won (Team 1 won)"), text(teamRow));
+    const alphaRow = matchRows[3];
+    ok("match history: opponent, result and the bill's status", text(alphaRow).includes("vs Ahmed") && text(alphaRow).includes("Won") && text(alphaRow).includes(bill1.billNumber) && text(alphaRow).includes("Partially paid"), text(alphaRow));
+    const billRows = historyRows("player-bills");
+    const aliBill1 = billRows.find((tr) => tr.textContent.includes(bill1.billNumber));
+    ok("billing history: bill number (link), game, status, total, share, paid, owes", Boolean(aliBill1)
+       && aliBill1.querySelector("a").getAttribute("href") === `/pages/billing.html?bill=${bill1.id}`
+       && [...aliBill1.querySelectorAll("td.numeric")].map(text).join("|") === "Rs 700.00|Rs 150.00|Rs 100.00|Rs 50.00"
+       && text(aliBill1).includes("Frame · match #1") && text(aliBill1).includes("café: Tea × 1"), text(aliBill1));
+    ok("billing history: Both Pay bill shown with its wording", billRows.some((tr) => text(tr).includes("Both Pay") && text(tr).includes("Rs 125.00")));
+    ok("outstanding line", text(profile().querySelector(".player-owes")) === "Outstanding: Rs 175.00 on 2 bills");
+    profile().querySelector(".modal-actions .btn-secondary").click();
+    await waitFor(() => !profile());
+
+    await openPlayer("Ahmed");
+    ok("Ahmed: phone and notes shown, 2 matches, 0 wins, owes Rs 550 + Rs 250 = Rs 800", text(profile()).includes("0300-1112223") && text(profile()).includes("Weekend regular")
+       && statOf("Matches") === "2" && statOf("Wins") === "0" && statOf("Outstanding") === "Rs 800.00", ["Matches", "Wins", "Outstanding"].map(statOf));
+    profile().querySelector(".modal-actions .btn-secondary").click();
+
+    // Ahmed pays everything -> outstanding Rs 0
+    for (const b of (await api(`GET`, `/players/${ahmed.id}/bills`)).body.data.bills) {
+      await api("POST", `/bills/${b.id}/payments`, { amount: b.share.outstanding, method: "cash", payerName: "Ahmed" });
+    }
+    await openPlayer("Ahmed");
+    ok("after paying: Ahmed's outstanding is Rs 0.00 (nothing owed)", statOf("Outstanding") === "Rs 0.00" && text(profile().querySelector(".player-owes")) === "Outstanding: Rs 0.00 (nothing owed)");
+    profile().querySelector(".modal-actions .btn-secondary").click();
+
+    // A player with no history
+    await api("POST", "/players", { name: "Newcomer" });
+    await goto("/pages/players.html", 1280, "/pages/players.html");
+    await openPlayer("Newcomer");
+    ok("new player: 'No matches yet.' and 'No bills yet.'", text(profile()).includes("No matches yet.") && text(profile()).includes("No bills yet.") && statOf("Outstanding") === "Rs 0.00");
+    profile().querySelector(".modal-actions .btn-secondary").click();
+
+    // Deactivated player: history still there
+    await api("POST", `/players/${ali.id}/deactivate`);
+    doc().querySelector('#player-status-filter [data-status="all"]').click();
+    await openPlayer("Ali");
+    ok("deactivated player: shown as Inactive, history kept", text(profile().querySelector(".status-badge")) === "Inactive" && historyRows("player-matches").length === 4 && statOf("Outstanding") === "Rs 175.00");
+    profile().querySelector(".modal-actions .btn-secondary").click();
+    await api("POST", `/players/${ali.id}/reactivate`);
+
+    // ================= 5. Roles =================
+    for (const role of ["ui-staff", "ui-cashier"]) {
+      await loginAs(role);
+      await goto("/pages/players.html", 1280, "/pages/players.html");
+      await openPlayer("Ali");
+      ok(`${role}: can open Ali's history (same numbers)`, statOf("Outstanding") === "Rs 175.00" && historyRows("player-bills").length === 3);
+      profile().querySelector(".modal-actions .btn-secondary").click();
+    }
+    await api("POST", "/auth/logout");
+    ok("logged out: player history API -> 401", (await api("GET", `/players/${ali.id}/bills`)).status === 401);
+    await loginAs("ui-admin");
+
+    // ================= 6. Phone width =================
+    await goto("/pages/players.html", 375, "/pages/players.html");
+    await openPlayer("Ali");
+    const box = doc().getElementById("player-profile-dialog").getBoundingClientRect();
+    ok("375px: player details fit, no sideways page scroll", noSideScroll() && box.right <= doc().documentElement.clientWidth + 1 && box.left >= -1,
+       { scroll: doc().documentElement.scrollWidth, width: doc().documentElement.clientWidth, right: box.right });
+  } catch (e) {
+    log.push("FAIL suite crashed: " + e.message + " " + e.stack);
+  }
+  const fails = log.filter((l) => l.startsWith("FAIL")).length;
+  document.getElementById("out").textContent = log.join("\n") + `\n\nTOTAL ${log.length - fails} passed, ${fails} failed`;
+})();
+</script>
+</body></html>

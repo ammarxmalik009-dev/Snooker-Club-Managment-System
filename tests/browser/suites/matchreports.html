@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>match reports browser suite</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1280" height="900"></iframe>
+<script>
+// Phase 11.7 browser tests: the Matches and Players sections of the Reports page, with known data
+// on 10 Sep 2026 (Karachi): all four game types, completed / cancelled / not billed matches,
+// registered and walk-in players, partly paid bills. Filters (every game type), sorting, paging,
+// CSV, Print, error + Retry, empty period, the link to a player's history, roles, phone width.
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+const PASSWORD = "Ui-test-pass-123";
+const SECTIONS = ["revenue", "payments", "games", "matches", "players", "tables", "bookings", "customers", "outstanding"];
+const PAGE = "/pages/reports.html?from=2026-09-10&to=2026-09-10";
+
+const win = () => frame.contentWindow;
+const doc = () => frame.contentDocument;
+const path = () => { try { return win().location.pathname + win().location.search; } catch { return ""; } };
+async function waitFor(check, timeout = 8000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+async function goto(url, width = 1280, expectPath) {
+  frame.width = width;
+  frame.src = url;
+  await sleep(150);
+  await waitFor(() => doc().readyState === "complete" && (!expectPath || path().startsWith(expectPath)));
+  await sleep(150);
+}
+const api = async (method, p, body) => {
+  const r = await fetch("/api" + p, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json().catch(() => null) };
+};
+const loginAs = async (username) => { await api("POST", "/auth/logout"); return api("POST", "/auth/login", { username, password: PASSWORD }); };
+const k = (local) => new Date(`${local}+05:00`).toISOString();
+const setDate = (collection, id, field, local) => fetch(`/_setdate/${collection}/${id}/${field}/${encodeURIComponent(k(local))}`);
+
+const sec = (name) => doc().getElementById(name);
+const bodyOf = (name) => sec(name).querySelector("[data-body]");
+const text = (el) => (el ? el.textContent.replace(/\s+/g, " ").trim() : "");
+const sectionsSettled = () => SECTIONS.every((n) => !sec(n).classList.contains("is-loading") && !bodyOf(n).querySelector(".spinner"));
+async function settle() { await sleep(100); await waitFor(sectionsSettled); await sleep(100); }
+const cardValue = (name, label) => text([...sec(name).querySelectorAll(".report-stat")].find((c) => text(c.querySelector(".stat-label")) === label)?.querySelector(".stat-value"));
+const cellText = (row, label) => text(row?.querySelector(`td[data-label="${label}"]`));
+const gameRows = () => [...sec("matches").querySelectorAll(".report-table")][0].querySelectorAll("tbody tr");
+const matchRows = () => [...sec("matches").querySelectorAll("tr[data-match-id]")];
+const playerRows = () => [...sec("players").querySelectorAll("tbody tr[data-player-id]")];
+const playerRow = (name) => playerRows().find((tr) => cellText(tr, "Player").startsWith(name));
+const footRows = () => [...sec("players").querySelectorAll("tfoot tr")];
+const noSideScroll = () => doc().documentElement.scrollWidth <= doc().documentElement.clientWidth + 1;
+const setSelect = (id, value) => { const s = doc().getElementById(id); s.value = value; s.dispatchEvent(new Event("change", { bubbles: true })); };
+
+let downloads = [];
+function captureDownloads() {
+  downloads = [];
+  const w = win();
+  const blobs = new Map();
+  const realCreate = w.URL.createObjectURL.bind(w.URL);
+  w.URL.createObjectURL = (blob) => { const url = realCreate(blob); blobs.set(url, blob); return url; };
+  w.HTMLAnchorElement.prototype.click = function () {
+    if (this.download) downloads.push({ name: this.download, blob: blobs.get(this.href) });
+  };
+}
+async function csvText(i) { return (await downloads[i].blob.text()).replace(/^﻿/, ""); }
+
+(async () => {
+  try {
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
+    for (const name of ["matches", "players"]) await fetch(`/_failreport/${name}/off`);
+    if ((await loginAs("ui-admin")).status !== 200) throw new Error("admin login failed");
+
+    // ================= Data (real API), moved to 10 Sep 2026 =================
+    await api("PATCH", "/settings", { gameRates: { century: 1000, frame: 25000, snooker_point: 35000, four_player: 50000 } });
+    const alpha = (await api("POST", "/tables", { tableNumber: 1, name: "Alpha", hourlyRate: 60000 })).body.data;
+    const bravo = (await api("POST", "/tables", { tableNumber: 2, name: "Bravo", hourlyRate: 60000 })).body.data;
+    const ali = (await api("POST", "/players", { name: "Ali" })).body.data;
+    const ahmed = (await api("POST", "/players", { name: "Ahmed" })).body.data;
+    const s1 = (await api("POST", "/sessions", { tableId: alpha.id })).body.data;
+    const start = async (session, gameMode, players, result, startedLocal) => {
+      const m = (await api("POST", `/sessions/${session.id}/matches`, { gameMode, players })).body.data;
+      if (result) await api("POST", `/matches/${m.id}/complete`, result);
+      await setDate("matches", m.id, "startedAt", startedLocal);
+      return m;
+    };
+    const m1 = await start(s1, "century", [{ playerId: ali.id }, { name: "Guest" }], { winnerSeat: 1 }, "2026-09-10T10:00:00");
+    const m2 = await start(s1, "frame", [{ playerId: ali.id }, { playerId: ahmed.id }], { winnerSeat: 2 }, "2026-09-10T11:00:00");
+    const m3 = await start(s1, "snooker_point", [{ name: "A" }, { playerId: ahmed.id }, { name: "C" }], { winnerSeat: 2 }, "2026-09-10T12:00:00");
+    const m4 = await start(s1, "four_player", [{ playerId: ali.id, team: 1 }, { name: "Mate", team: 1 }, { playerId: ahmed.id, team: 2 }, { name: "Zed", team: 2 }], { winningTeam: 2 }, "2026-09-10T13:00:00");
+    const m5 = await start(s1, "frame", [{ name: "X" }, { name: "Y" }], null, "2026-09-10T14:00:00");
+    await api("POST", `/matches/${m5.id}/cancel`, {});
+    const m6 = await start(s1, "frame", [{ name: "P" }, { name: "Q" }], { winnerSeat: 1 }, "2026-09-10T15:00:00");
+    await fetch("/_backdate/1/1200"); // 20 billed minutes -> Century Rs 200
+    await api("POST", `/sessions/${s1.id}/end`);
+    const bills = {};
+    for (const [key, m] of Object.entries({ m1, m2, m3, m4 })) {
+      bills[key] = (await api("POST", `/matches/${m.id}/bill`, { payerRule: "loser" })).body.data;
+      await setDate("bills", bills[key].id, "createdAt", "2026-09-10T16:00:00");
+    }
+    await api("POST", `/bills/${bills.m2.id}/payments`, { amount: 10000, method: "cash", payerName: "Ali" });
+    await api("POST", `/bills/${bills.m4.id}/payments`, { amount: 25000, method: "cash", payerName: "Ali" });
+    ok("setup: 4 match bills through the API", Object.values(bills).map((b) => b.total).join() === "20000,25000,35000,50000", Object.values(bills).map((b) => b.total));
+
+    // ================= 1. The new sections =================
+    await goto(PAGE, 1280, "/pages/reports.html");
+    await settle();
+    ok("jump bar: Matches and Players links", ["#matches", "#players"].every((h) => doc().querySelector(`.report-jump a[href="${h}"]`)));
+    ok("sections in order: … Game types, Matches, Players, Table performance …",
+       [...doc().querySelectorAll(".report-section")].map((s) => s.id).join() === SECTIONS.join());
+    ok("section hints: which filters apply", text(sec("matches").querySelector(".section-filters")).endsWith("Filters: table, game type.")
+       && text(sec("players").querySelector(".section-filters")).endsWith("Filters: table, game type."));
+    ok("CSV and Print buttons on both", ["matches", "players"].every((n) => sec(n).querySelector(`[data-export="${n}"]`) && sec(n).querySelector(`[data-print="${n}"]`)));
+
+    // ================= 2. Matches: cards, game types, list =================
+    ok("matches cards: 6 matches, 4 billed, Rs 1,300 billed, Rs 950 outstanding, 46.2% registered",
+       cardValue("matches", "Matches") === "6" && cardValue("matches", "Billed") === "4" && cardValue("matches", "Match bills") === "Rs 1,300.00"
+       && cardValue("matches", "Outstanding") === "Rs 950.00" && cardValue("matches", "Registered players") === "46.2%",
+       ["Matches", "Billed", "Match bills", "Outstanding", "Registered players"].map((l) => cardValue("matches", l)));
+    ok("matches card hints: completed / cancelled, not billed",
+       text([...sec("matches").querySelectorAll(".report-stat")][0]).includes("5 completed · 1 cancelled · 0 in progress")
+       && text([...sec("matches").querySelectorAll(".report-stat")][1]).includes("1 not billed"));
+    const games = [...gameRows()];
+    ok("by game type: all four game types listed", games.map((tr) => cellText(tr, "Game type")).join() === "Century,Frame,Snooker Point,4 Players", games.map((tr) => cellText(tr, "Game type")));
+    const frameRow = games[1];
+    ok("by game type: Frame 3 matches, 1 cancelled, 1 billed, 1 not billed, Rs 250 billed, Rs 150 owed",
+       ["Matches", "Cancelled", "Billed", "Not billed", "Bill total", "Outstanding"].map((l) => cellText(frameRow, l)).join("|") === "3|1|1|1|Rs 250.00|Rs 150.00",
+       ["Matches", "Cancelled", "Billed", "Not billed", "Bill total", "Outstanding"].map((l) => cellText(frameRow, l)));
+    ok("by game type: 4 Players Rs 500, Rs 250 paid", cellText(games[3], "Bill total") === "Rs 500.00" && cellText(games[3], "Paid") === "Rs 250.00");
+    const rowOf = (m) => matchRows().find((tr) => tr.dataset.matchId === m.id);
+    ok("match list: 6 matches, newest first", matchRows().length === 6 && matchRows()[0].dataset.matchId === m6.id && matchRows()[5].dataset.matchId === m1.id);
+    ok("match list: 4 Players row - teams, winning team, bill status and amount",
+       cellText(rowOf(m4), "Players").startsWith("Team 1: Ali & Mate vs Team 2: Ahmed & Zed") && cellText(rowOf(m4), "Players").includes("2 registered · 2 walk-in")
+       && cellText(rowOf(m4), "Result") === "Winning team: Team 2 (Ahmed & Zed)" && cellText(rowOf(m4), "Bill") === `${bills.m4.billNumber} Partially paid`
+       && cellText(rowOf(m4), "Amount") === "Rs 500.00" && cellText(rowOf(m4), "Game type") === "4 Players" && cellText(rowOf(m4), "Table") === "Table 1 · Alpha",
+       ["Players", "Result", "Bill", "Amount"].map((l) => cellText(rowOf(m4), l)));
+    ok("match list: match number and start time (Karachi)", cellText(rowOf(m1), "Match") === "#1" && /^10 Sept? 2026, 10:00 am$/.test(cellText(rowOf(m1), "Started")), cellText(rowOf(m1), "Started"));
+    ok("match list: Century and Snooker Point winners", cellText(rowOf(m1), "Result") === "Winner: Ali" && cellText(rowOf(m3), "Result") === "Winner: Ahmed");
+    ok("match list: cancelled match and a completed match without a bill",
+       cellText(rowOf(m5), "Status") === "Cancelled" && cellText(rowOf(m5), "Bill") === "—" && cellText(rowOf(m6), "Bill") === "Not billed" && cellText(rowOf(m6), "Amount") === "—");
+    ok("match list: the bill number opens the bill", rowOf(m2).querySelector("a.cell-link").getAttribute("href") === `/pages/billing.html?bill=${bills.m2.id}`);
+    ok("matches: money note (start day vs Revenue)", text(bodyOf("matches")).includes("a match belongs to the day it started"));
+
+    // ================= 3. Players =================
+    const aliRow = playerRow("Ali");
+    ok("players: 2 registered players (walk-ins never listed as players)", playerRows().length === 2 && !playerRow("Guest") && !playerRow("Mate"));
+    ok("players: Ali 3 played, 1 win, 2 losses, 33.3%, 3 bills, Rs 500 billed, Rs 350 paid, Rs 150 owed",
+       ["Matches", "Wins", "Losses", "Win %", "Bills", "Billed", "Paid", "Outstanding"].map((l) => cellText(aliRow, l)).join("|") === "3|1|2|33.3%|3|Rs 500.00|Rs 350.00|Rs 150.00",
+       ["Matches", "Wins", "Losses", "Win %", "Bills", "Billed", "Paid", "Outstanding"].map((l) => cellText(aliRow, l)));
+    ok("players: team-mate's debt isn't Ali's (Mate still owes on the 4 Players bill)", cellText(aliRow, "Outstanding") === "Rs 150.00");
+    ok("players: Ahmed won all 3, owes nothing", ["Wins", "Losses", "Win %", "Outstanding"].map((l) => cellText(playerRow("Ahmed"), l)).join("|") === "3|0|100%|Rs 0.00");
+    ok("players: walk-ins on one line: 7 places, 2 wins, Rs 800 owed",
+       cellText(footRows()[0], "Player") === "Walk-in players (not registered)" && ["Matches", "Wins", "Losses", "Outstanding"].map((l) => cellText(footRows()[0], l)).join("|") === "7|2|5|Rs 800.00",
+       ["Matches", "Wins", "Losses", "Outstanding"].map((l) => cellText(footRows()[0], l)));
+    ok("players: totals row (money only) and cards", cellText(footRows()[1], "Player") === "All registered players (2)" && cellText(footRows()[1], "Billed") === "Rs 500.00"
+       && cardValue("players", "Outstanding") === "Rs 150.00" && cardValue("players", "Registered players") === "2");
+    ok("players: limitation note (old bills keep names only)", text(bodyOf("players")).includes("keep player names only"));
+
+    // ================= 4. Sorting (kept in the address bar) =================
+    setSelect("players-sort", "billed"); await settle();
+    ok("players sort Billed: Ali first, psort in the URL", cellText(playerRows()[0], "Player") === "Ali" && path().includes("psort=billed"));
+    setSelect("players-sort", "wins"); await settle();
+    ok("players sort Wins: Ahmed first", cellText(playerRows()[0], "Player") === "Ahmed");
+    setSelect("matches-sort", "oldest"); await settle();
+    ok("matches sort Oldest: #1 first, msort in the URL", matchRows()[0].dataset.matchId === m1.id && path().includes("msort=oldest"));
+    await goto(path(), 1280, "/pages/reports.html"); await settle();
+    ok("refresh keeps both sorts", doc().getElementById("matches-sort").value === "oldest" && doc().getElementById("players-sort").value === "wins" && matchRows()[0].dataset.matchId === m1.id);
+    setSelect("matches-sort", "newest"); setSelect("players-sort", "matches"); await settle();
+
+    // ================= 5. Filters: every game type, table =================
+    const gameOptions = [...doc().getElementById("filter-game").options].map((o) => o.value).filter(Boolean);
+    ok("game filter offers all four game types", ["century", "frame", "snooker_point", "four_player"].every((m) => gameOptions.includes(m)), gameOptions);
+    setSelect("filter-game", "snooker_point"); await settle();
+    ok("Snooker Point filter works everywhere (no error): 1 match, Ahmed only, Game types Rs 350",
+       !doc().querySelector(".report-error:not([hidden])") && cardValue("matches", "Matches") === "1" && playerRows().length === 1 && cellText(playerRows()[0], "Player") === "Ahmed"
+       && [...sec("games").querySelectorAll("tbody tr")].map((tr) => cellText(tr, "Game type") + ":" + cellText(tr, "Total billed")).join() === "Snooker Point:Rs 350.00",
+       { matches: cardValue("matches", "Matches"), error: text(doc().querySelector(".report-error:not([hidden])")) });
+    ok("game filter: only that game type in the Matches table", [...gameRows()].map((tr) => cellText(tr, "Game type")).join() === "Snooker Point");
+    setSelect("filter-game", "four_player"); await settle();
+    ok("4 Players filter: 1 match, Ali lost and owes nothing on it", cardValue("matches", "Matches") === "1" && cellText(playerRow("Ali"), "Losses") === "1" && cellText(playerRow("Ali"), "Outstanding") === "Rs 0.00");
+    setSelect("filter-game", ""); setSelect("filter-table", bravo.id); await settle();
+    ok("table filter: nothing on Bravo -> empty states", text(bodyOf("matches")).includes("No matches in the selected period.") && text(bodyOf("players")).includes("No player activity in the selected period."));
+    setSelect("filter-table", ""); setSelect("filter-method", "card"); await settle();
+    ok("payment-method filter doesn't apply to matches (still 6)", cardValue("matches", "Matches") === "6");
+    doc().getElementById("reset-filters").click(); await settle();
+
+    // ================= 6. CSV =================
+    captureDownloads();
+    sec("matches").querySelector('[data-export="matches"]').click();
+    await waitFor(() => downloads.length === 1);
+    let csv = await csvText(0);
+    ok("CSV matches: file name, header and one row per match", downloads[0]?.name === "matches_2026-09-10_to_2026-09-10.csv"
+       && csv.startsWith("Started at,Table,Match,Game type,Status,Players,Registered players,Result,Bill,Bill status,Bill total (Rs),Paid (Rs),Remaining (Rs)")
+       && csv.trim().split("\r\n").length === 7, downloads[0]?.name);
+    ok("CSV matches: the 4 Players row", csv.includes(`four_player,completed,Team 1: Ali & Mate vs Team 2: Ahmed & Zed,2,Winning team: Team 2 (Ahmed & Zed),${bills.m4.billNumber},partially_paid,500.00,250.00,250.00`), csv);
+    sec("players").querySelector('[data-export="players"]').click();
+    await waitFor(() => downloads.length === 2);
+    csv = await csvText(1);
+    ok("CSV players: every player + the walk-in line", downloads[1]?.name === "players_2026-09-10_to_2026-09-10.csv"
+       && csv.includes("Ali,active,3,1,2,33.3,3,500.00,350.00,150.00") && csv.includes("Walk-in players (not registered),,7,2,5,28.6,5,800.00,0.00,800.00"), csv);
+    ok("CSV: success message", await waitFor(() => [...doc().querySelectorAll(".toast-message")].some((m) => m.textContent.includes("Downloaded players_"))));
+
+    // ================= 7. Print =================
+    let printed = null;
+    win().print = () => {
+      printed = {
+        visible: [...doc().querySelectorAll(".report-section")].filter((s) => !s.classList.contains("print-skip")).map((s) => s.id),
+        range: text(doc().getElementById("print-range")), meta: text(doc().getElementById("print-meta")),
+      };
+    };
+    setSelect("filter-game", "frame"); await settle();
+    sec("matches").querySelector('[data-print="matches"]').click();
+    ok("print Matches: only that section, period, filters and who printed",
+       printed?.visible.join() === "matches" && printed.range === "Period: 10 September 2026 (Karachi time)" && printed.meta.startsWith("Filters: Frame · Printed") && printed.meta.endsWith("by Ui Admin"), printed);
+    win().dispatchEvent(new Event("afterprint"));
+    printed = null;
+    sec("players").querySelector('[data-print="players"]').click();
+    ok("print Players: only that section", printed?.visible.join() === "players", printed);
+    win().dispatchEvent(new Event("afterprint"));
+    ok("after printing: everything back on screen", doc().querySelectorAll(".print-skip").length === 0);
+    doc().getElementById("reset-filters").click(); await settle();
+
+    // ================= 8. Error + Retry =================
+    await fetch("/_failreport/matches/on");
+    setSelect("matches-sort", "oldest"); await settle();
+    let alert = sec("matches").querySelector(".report-error");
+    ok("API failure: error in Matches, old figures kept and marked", alert && !alert.hidden && text(alert).includes("The database is not available.")
+       && bodyOf("matches").classList.contains("is-stale") && cardValue("matches", "Matches") === "6");
+    await fetch("/_failreport/matches/off");
+    alert.querySelector("button").click(); await settle();
+    ok("Retry after recovery: error gone, new order", alert.hidden && !bodyOf("matches").classList.contains("is-stale") && matchRows()[0].dataset.matchId === m1.id);
+    setSelect("matches-sort", "newest"); await settle();
+    await fetch("/_failreport/players/on");
+    await goto(PAGE, 1280, "/pages/reports.html"); await settle();
+    alert = sec("players").querySelector(".report-error");
+    ok("first-load failure: Players 'couldn't be loaded', no fake rows; Matches loaded", alert && text(alert).includes("This report couldn't be loaded.")
+       && playerRows().length === 0 && cardValue("matches", "Matches") === "6");
+    await fetch("/_failreport/players/off");
+    alert.querySelector("button").click(); await settle();
+    ok("first-load failure: Retry loads Players", playerRows().length === 2 && alert.hidden);
+
+    // ================= 9. Paging (27 matches -> 2 pages of 25) =================
+    const s2 = (await api("POST", "/sessions", { tableId: bravo.id })).body.data;
+    for (let i = 0; i < 21; i += 1) await start(s2, "frame", [{ name: `W${i}` }, { name: `V${i}` }], null, `2026-09-10T17:${String(i).padStart(2, "0")}:00`);
+    await goto(PAGE, 1280, "/pages/reports.html"); await settle();
+    const pager = sec("matches").querySelector(".pager");
+    ok("paging: 25 rows, 'Page 1 of 2', note says CSV has all 27", matchRows().length === 25 && text(pager).includes("Page 1 of 2") && text(bodyOf("matches")).includes("CSV export includes all 27"));
+    [...pager.querySelectorAll("button")].find((b) => b.textContent === "Next").click(); await settle();
+    ok("paging: Next shows the last 2 (oldest) matches", matchRows().length === 2 && matchRows()[1].dataset.matchId === m1.id && cardValue("matches", "Matches") === "27");
+
+    // ================= 10. Empty period =================
+    doc().querySelector('[data-preset="today"]').click(); await settle();
+    ok("empty period: both sections say so", text(bodyOf("matches")).includes("No matches in the selected period.") && text(bodyOf("players")).includes("No player activity in the selected period."));
+
+    // ================= 11. Link to the player's history =================
+    await goto(PAGE, 1280, "/pages/reports.html"); await settle();
+    const link = playerRow("Ali").querySelector("a.cell-link");
+    ok("player name links to the Players page", link.getAttribute("href") === `/pages/players.html?player=${ali.id}`);
+    await goto(link.getAttribute("href"), 1280, "/pages/players.html");
+    const profile = await waitFor(() => doc().querySelector("#player-profile-dialog[open] .player-bills") && doc().querySelector("#player-profile-dialog[open]"));
+    ok("the link opens Ali's history, same outstanding (Rs 150.00)", profile && text(profile.querySelector(".modal-title")) === "Ali"
+       && text(profile.querySelector('.mini-stat[data-stat="Outstanding"] strong')) === "Rs 150.00");
+
+    // ================= 12. Roles =================
+    await loginAs("ui-staff");
+    await goto(PAGE, 1280, "/pages/reports.html"); await settle();
+    ok("staff: sees Matches and Players", cardValue("matches", "Matches") === "27" && playerRows().length === 2);
+    await loginAs("ui-cashier");
+    await goto(PAGE, 1280, "/pages/dashboard.html");
+    ok("cashier: Reports page sends them to the dashboard", path().startsWith("/pages/dashboard.html"));
+    const denied = await Promise.all(["/reports/matches?preset=today", "/reports/players?preset=today", "/reports/export/matches?preset=today", "/reports/export/players?preset=today"].map((p) => api("GET", p)));
+    ok("cashier: both reports and both CSVs refused (403)", denied.every((r) => r.status === 403), denied.map((r) => r.status));
+    await api("POST", "/auth/logout");
+    ok("logged out: 401", (await api("GET", "/reports/players?preset=today")).status === 401);
+    await loginAs("ui-admin");
+
+    // ================= 13. Phone width =================
+    for (const width of [375, 820]) {
+      await goto(PAGE, width, "/pages/reports.html"); await settle();
+      ok(`${width}px: no sideways scroll; Matches and Players fit`, noSideScroll()
+         && ["matches", "players"].every((n) => sec(n).getBoundingClientRect().right <= doc().documentElement.clientWidth + 1),
+         { scroll: doc().documentElement.scrollWidth, width: doc().documentElement.clientWidth });
+    }
+    await goto(PAGE, 375, "/pages/reports.html"); await settle();
+    ok("375px: match and player rows become labelled cards", getComputedStyle(matchRows()[0]).display === "block" && getComputedStyle(playerRows()[0]).display === "block");
+  } catch (e) {
+    log.push("FAIL suite crashed: " + e.message + " " + e.stack);
+  }
+  const fails = log.filter((l) => l.startsWith("FAIL")).length;
+  document.getElementById("out").textContent = log.join("\n") + `\n\nTOTAL ${log.length - fails} passed, ${fails} failed`;
+})();
+</script>
+</body></html>

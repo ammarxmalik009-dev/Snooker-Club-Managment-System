@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>auth UI harness</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1280" height="900"></iframe>
+<script>
+// Phase 8 browser tests: login, logout, invalid login, redirects, per-role pages/buttons,
+// the admin Users page, and responsive login / sidebar. Everything goes through the real server.
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+const PASSWORD = "Ui-test-pass-123";
+
+const doc = () => frame.contentDocument;
+const path = () => { try { return frame.contentWindow.location.pathname + frame.contentWindow.location.search; } catch { return ""; } };
+async function waitFor(check, timeout = 6000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+// Navigate the frame and wait until the given path has loaded (redirects included)
+async function goto(url, width = 1280, expectPath) {
+  frame.width = width;
+  frame.src = url;
+  await sleep(100);
+  await waitFor(() => doc().readyState === "complete" && (!expectPath || path().startsWith(expectPath)));
+  await sleep(150);
+}
+const api = async (method, p, body) => {
+  const r = await fetch("/api" + p, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json() };
+};
+const loginAs = (username, password = PASSWORD) => api("POST", "/auth/login", { username, password });
+const logoutApi = () => api("POST", "/auth/logout");
+const navHrefs = () => [...doc().querySelectorAll("#sidebar-nav a.nav-link")].map((a) => a.getAttribute("href"));
+const visible = (el) => el && !el.hidden && el.offsetParent !== null;
+const toastHas = (text) => [...doc().querySelectorAll(".toast-message")].some((t) => t.textContent.includes(text));
+const byText = (root, selector, text) => [...root.querySelectorAll(selector)].find((e) => e.textContent.includes(text));
+const noSideScroll = () => doc().documentElement.scrollWidth <= doc().documentElement.clientWidth + 1;
+const rowFor = (username) => [...doc().querySelectorAll("#users-list tbody tr")].find((tr) => tr.children[1]?.textContent === username);
+
+(async () => {
+  try {
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
+    await logoutApi();
+
+    // ===== 1. Not logged in: pages redirect to login, API says 401 =====
+    await goto("/pages/billing.html", 1280, "/pages/login.html");
+    ok("logged out: app page redirects to login with ?next", path() === "/pages/login.html?next=%2Fpages%2Fbilling.html", path());
+    ok("logged out: /api/tables -> 401", (await api("GET", "/tables")).status === 401);
+    ok("logged out: /api/health is public", (await api("GET", "/health")).status === 200);
+    // Phase 11.8: an encoded spelling of a protected page no longer skips the login
+    const encoded = await fetch("/pages/users%2Ehtml");
+    ok("logged out: /pages/users%2Ehtml ends at the login page (not the Users page)", encoded.url.includes("/pages/login.html?next=") && !(await encoded.text()).includes("<title>Users"), encoded.url);
+
+    // ===== 2. Login page: validation, wrong password, unknown user, loading state =====
+    let d = doc();
+    const form = d.getElementById("login-form"), error = d.getElementById("login-error"), button = d.getElementById("login-button");
+    ok("login: username field focused", d.activeElement === d.getElementById("login-username"));
+    form.requestSubmit(); await sleep(100);
+    ok("login: empty form -> asks for username and password", !error.hidden && error.textContent === "Enter your username and password.", error.textContent);
+
+    d.getElementById("login-username").value = "ui-admin"; d.getElementById("login-password").value = "Wrong-password-1";
+    form.requestSubmit(); await sleep(10);
+    const busy = button.disabled && button.textContent.includes("Logging in");
+    await waitFor(() => !button.disabled);
+    ok("login: button shows loading state while checking", busy);
+    ok("login: wrong password -> generic error", error.textContent === "Invalid username or password.", error.textContent);
+    ok("login: password field cleared after failure", d.getElementById("login-password").value === "");
+
+    d.getElementById("login-username").value = "nobody-here"; d.getElementById("login-password").value = "Wrong-password-1";
+    form.requestSubmit(); await waitFor(() => !button.disabled && error.textContent); await sleep(200);
+    ok("login: unknown user -> the SAME generic error", error.textContent === "Invalid username or password.", error.textContent);
+    ok("login: still on login page, not logged in", path().startsWith("/pages/login.html") && (await api("GET", "/auth/me")).status === 401);
+
+    // ===== 3. Valid admin login -> goes to the page it asked for =====
+    d.getElementById("login-username").value = "  UI-Admin "; // usernames are not case-sensitive
+    d.getElementById("login-password").value = PASSWORD;
+    form.requestSubmit();
+    await waitFor(() => path().startsWith("/pages/billing.html"), 8000);
+    ok("login: admin goes to the requested page (billing)", path().startsWith("/pages/billing.html"), path());
+    await waitFor(() => doc().querySelector(".user-name"));
+    d = doc();
+    ok("sidebar: shows admin's name", d.querySelector(".user-name")?.textContent === "Ui Admin");
+    ok("sidebar: shows role badge 'Admin'", d.querySelector(".user-box .role-badge")?.textContent === "Admin");
+    ok("sidebar: Log out button present", visible(d.getElementById("logout-button")));
+    ok("sidebar: admin sees Users and Settings", navHrefs().includes("/pages/users.html") && navHrefs().includes("/pages/settings.html"), navHrefs());
+    const me = (await api("GET", "/auth/me")).body.data;
+    ok("/auth/me: id, name, username, role, active; never a password hash",
+       me.username === "ui-admin" && me.role === "admin" && me.active === true && !("passwordHash" in me) && !JSON.stringify(me).includes("scrypt"), me);
+
+    // Already logged in -> the login page sends you on
+    await goto("/pages/login.html", 1280, "/pages/dashboard.html");
+    ok("login page while logged in -> dashboard", path().startsWith("/pages/dashboard.html"), path());
+    await waitFor(() => doc().querySelector(".user-name"));
+    ok("dashboard (admin): Settings and Users quick actions shown",
+       visible(doc().querySelector('.quick-action[href="/pages/settings.html"]')) && visible(doc().querySelector('.quick-action[href="/pages/users.html"]')));
+
+    // Data for later: rates, a table, a finished session and an unpaid bill
+    await api("PATCH", "/settings", { centuryPrice: 30000, framePrice: 15000 });
+    const table = (await api("POST", "/tables", { tableNumber: 1, name: "VIP", hourlyRate: 60000 })).body.data;
+    const session = (await api("POST", "/sessions", { tableId: table.id })).body.data;
+    await api("POST", `/sessions/${session.id}/end`);
+    const bill = (await api("POST", "/bills", { sessionId: session.id, gameMode: "century", quantity: 1, payerRule: "loser",
+      players: [{ name: "Ali", result: "loser" }, { name: "Usman" }] })).body.data;
+    ok("setup: bill created by admin (audit snapshot)", bill.createdBy?.username === "ui-admin", bill.createdBy);
+
+    // ===== 4. Users page (admin) =====
+    await goto("/pages/users.html", 1280, "/pages/users.html");
+    await waitFor(() => doc().querySelectorAll("#users-list tbody tr").length >= 3);
+    d = doc();
+    ok("users: lists the 3 seeded accounts", d.querySelectorAll("#users-list tbody tr").length === 3);
+    ok("users: summary counts active admins", d.getElementById("users-summary").textContent.includes("1 active admin"), d.getElementById("users-summary").textContent);
+    ok("users: Users link active in sidebar", d.querySelector(".nav-link.active")?.getAttribute("href") === "/pages/users.html");
+    const myRow = rowFor("ui-admin");
+    ok("users: own row marked 'You' and has no Deactivate button", myRow.textContent.includes("You") && !byText(myRow, "button", "Deactivate"));
+    ok("users: last login shown for admin, 'Never' for others", !rowFor("ui-admin").children[4].textContent.includes("Never") && rowFor("ui-staff").children[4].textContent === "Never");
+    ok("users: no password hash anywhere in the page", !d.body.innerHTML.includes("scrypt$"));
+
+    // Create: weak password -> field error
+    d.getElementById("add-user-button").click(); await sleep(150);
+    const uf = d.getElementById("user-form");
+    ok("users: Add dialog opens with username + password fields", d.getElementById("user-dialog").open && !d.getElementById("username-field").hidden && !d.getElementById("password-fields").hidden);
+    uf.elements.name.value = "Sara Khan"; uf.elements.username.value = "sara"; uf.elements.role.value = "cashier";
+    uf.elements.password.value = "short1"; d.getElementById("user-password2").value = "short1";
+    uf.requestSubmit();
+    await waitFor(() => !d.querySelector('[data-error-for="password"]').hidden);
+    ok("users: weak password refused by the server (field error)", !d.querySelector('[data-error-for="password"]').hidden, d.querySelector('[data-error-for="password"]').textContent);
+    // Different repeat
+    uf.elements.password.value = "Till-cash-2026"; d.getElementById("user-password2").value = "Till-cash-2027";
+    uf.requestSubmit(); await sleep(150);
+    ok("users: mismatching repeat password caught", d.querySelector('[data-error-for="password"]').textContent.includes("different"));
+    // Duplicate username (case-insensitive)
+    uf.elements.username.value = "UI-Staff"; uf.elements.password.value = "Till-cash-2026"; d.getElementById("user-password2").value = "Till-cash-2026";
+    uf.requestSubmit();
+    await waitFor(() => !d.getElementById("user-form-error").hidden || !d.querySelector('[data-error-for="username"]').hidden);
+    const dupText = d.getElementById("user-form-error").textContent + d.querySelector('[data-error-for="username"]').textContent;
+    ok("users: duplicate username (other case) -> refused", /already|taken|exists/i.test(dupText), dupText);
+    ok("users: password fields emptied after an error", uf.elements.password.value === "");
+    // Valid
+    uf.elements.username.value = "sara"; uf.elements.password.value = "Till-cash-2026"; d.getElementById("user-password2").value = "Till-cash-2026";
+    uf.requestSubmit();
+    await waitFor(() => rowFor("sara"));
+    ok("users: new cashier created and listed", rowFor("sara")?.textContent.includes("Cashier") && !d.getElementById("user-dialog").open);
+    ok("users: toast confirms creation", await waitFor(() => toastHas("created")));
+
+    // Search + role filter
+    d.getElementById("user-search").value = "sara"; d.getElementById("user-search").dispatchEvent(new Event("input"));
+    await waitFor(() => d.querySelectorAll("#users-list tbody tr").length === 1);
+    ok("users: search narrows to 1", d.querySelectorAll("#users-list tbody tr").length === 1);
+    d.getElementById("user-search").value = ""; d.getElementById("user-search").dispatchEvent(new Event("input"));
+    await sleep(500);
+    d.querySelector('#role-filter [data-role="cashier"]').click();
+    await waitFor(() => d.querySelectorAll("#users-list tbody tr").length === 2);
+    ok("users: role filter 'Cashiers' shows 2", d.querySelectorAll("#users-list tbody tr").length === 2);
+    d.querySelector('#role-filter [data-role=""]').click();
+    await waitFor(() => d.querySelectorAll("#users-list tbody tr").length === 4);
+
+    // Edit own role -> refused (can't lock yourself out)
+    byText(rowFor("ui-admin"), "button", "Edit").click(); await sleep(150);
+    ok("users: edit dialog hides username/password", d.getElementById("username-field").hidden && d.getElementById("password-fields").hidden);
+    uf.elements.role.value = "staff"; uf.requestSubmit();
+    await waitFor(() => !d.getElementById("user-form-error").hidden);
+    ok("users: admin can't remove own admin role", d.getElementById("user-form-error").textContent.includes("can't remove your own admin role"), d.getElementById("user-form-error").textContent);
+    d.getElementById("user-cancel").click();
+
+    // Edit sara -> name change + role staff
+    byText(rowFor("sara"), "button", "Edit").click(); await sleep(150);
+    uf.elements.name.value = "Sara K."; uf.elements.role.value = "staff"; uf.requestSubmit();
+    await waitFor(() => rowFor("sara")?.textContent.includes("Sara K."));
+    ok("users: edit name + role saved", rowFor("sara")?.textContent.includes("Sara K.") && rowFor("sara")?.textContent.includes("Staff"));
+
+    // Reset password
+    byText(rowFor("sara"), "button", "Password").click(); await sleep(150);
+    ok("users: password dialog open", d.getElementById("password-dialog").open);
+    d.getElementById("new-password").value = "Fresh-pass-2026x"; d.getElementById("new-password2").value = "Fresh-pass-2026x";
+    d.getElementById("password-form").requestSubmit();
+    await waitFor(() => !d.getElementById("password-dialog").open);
+    ok("users: password reset saved", !d.getElementById("password-dialog").open);
+    ok("users: password fields cleared", d.getElementById("new-password").value === "");
+
+    // Deactivate sara (confirm dialog)
+    byText(rowFor("sara"), "button", "Deactivate").click(); await sleep(200);
+    const confirmBtn = byText(d, "dialog[open] button", "Deactivate");
+    ok("users: deactivate asks for confirmation", Boolean(confirmBtn));
+    confirmBtn.click();
+    await waitFor(() => rowFor("sara")?.textContent.includes("Inactive"));
+    ok("users: sara now Inactive (row dimmed)", rowFor("sara")?.textContent.includes("Inactive") && rowFor("sara").classList.contains("is-inactive"));
+    ok("users: Activate button offered", Boolean(byText(rowFor("sara"), "button", "Activate")));
+
+    // ===== 5. Log out from the sidebar =====
+    d.getElementById("logout-button").click();
+    await waitFor(() => path().startsWith("/pages/login.html"));
+    ok("logout: back on the login page", path().startsWith("/pages/login.html"), path());
+    ok("logout: session really ended (/auth/me 401)", (await api("GET", "/auth/me")).status === 401);
+    ok("logout: old pages need login again", (await fetch("/pages/users.html", { redirect: "manual" })).type === "opaqueredirect");
+
+    // Deactivated + reset accounts
+    ok("deactivated user can't log in (generic 401)", (await loginAs("sara", "Fresh-pass-2026x")).status === 401);
+
+    // ===== 6. Staff =====
+    ok("staff: login OK", (await loginAs("ui-staff")).status === 200);
+    await goto("/pages/dashboard.html", 1280, "/pages/dashboard.html");
+    await waitFor(() => doc().querySelector(".user-name"));
+    d = doc();
+    ok("staff: name + 'Staff' badge in sidebar", d.querySelector(".user-name").textContent === "Ui Staff" && d.querySelector(".user-box .role-badge").textContent === "Staff");
+    ok("staff: no Users / Settings links", !navHrefs().includes("/pages/users.html") && !navHrefs().includes("/pages/settings.html"), navHrefs());
+    ok("staff: still has Tables, Sessions, Bookings, Customers, Billing", ["tables", "sessions", "bookings", "customers", "billing"].every((p) => navHrefs().includes(`/pages/${p}.html`)));
+    ok("staff: no 'System' menu section", ![...d.querySelectorAll(".nav-section-label")].some((l) => l.textContent === "System"));
+    ok("staff: Settings / Users / Collect Payments quick actions hidden",
+       !visible(d.querySelector('.quick-action[href="/pages/settings.html"]')) && !visible(d.querySelector('.quick-action[href="/pages/users.html"]')) && !visible(d.querySelector('.quick-action[href="/pages/billing.html?status=open"]')));
+    await goto("/pages/settings.html", 1280, "/pages/dashboard.html");
+    ok("staff: opening settings.html directly -> sent to dashboard", path().startsWith("/pages/dashboard.html"), path());
+    ok("staff: 'no permission' message shown", await waitFor(() => toastHas("don't have permission")));
+    await goto("/pages/users.html", 1280, "/pages/dashboard.html");
+    ok("staff: opening users.html directly -> sent to dashboard", path().startsWith("/pages/dashboard.html"), path());
+    const staffSettings = await api("PATCH", "/settings", { centuryPrice: 1 });
+    ok("staff: PATCH /api/settings -> 403", staffSettings.status === 403 && staffSettings.body.message === "You don't have permission to do this.", staffSettings);
+    ok("staff: changing game rates (Phase 11.3) -> 403", (await api("PATCH", "/settings", { gameRates: { century: 1 } })).status === 403);
+    ok("staff: GET /api/users -> 403", (await api("GET", "/users")).status === 403);
+    ok("staff: recording a payment via API -> 403", (await api("POST", `/bills/${bill.id}/payments`, { amount: 100, method: "cash", payerName: "Ali" })).status === 403);
+
+    await goto(`/pages/billing.html?bill=${bill.id}`, 1280, "/pages/billing.html");
+    await waitFor(() => doc().getElementById("bill-dialog")?.open && doc().querySelector(".bill-detail-header"));
+    d = doc();
+    ok("staff: can open the bill and see payments section", Boolean(byText(d, ".detail-section-title", "Payments")));
+    ok("staff: no payment form, explains why", !d.querySelector(".payment-form") && Boolean(byText(d, ".field-hint", "can view payments but not record")));
+    ok("staff: no Cancel bill button, Print receipt still there", !byText(d, "button", "Cancel bill") && Boolean(byText(d, "button", "Print receipt")));
+    ok("staff: bill shows who created it", Boolean(byText(d, ".audit-line", "Bill created by Ui Admin (ui-admin)")));
+    ok("staff: 'Rates & tax' link hidden", !visible(d.querySelector('.page-header a[href="/pages/settings.html"]')));
+    await logoutApi();
+
+    // ===== 7. Cashier =====
+    ok("cashier: login OK", (await loginAs("ui-cashier")).status === 200);
+    await goto(`/pages/billing.html?bill=${bill.id}`, 1280, "/pages/billing.html");
+    await waitFor(() => doc().querySelector(".payment-form"));
+    d = doc();
+    ok("cashier: 'Cashier' badge", d.querySelector(".user-box .role-badge")?.textContent === "Cashier");
+    ok("cashier: no Users / Settings links", !navHrefs().includes("/pages/users.html") && !navHrefs().includes("/pages/settings.html"));
+    ok("cashier: payment form shown", Boolean(d.querySelector(".payment-form")));
+    ok("cashier: Cancel bill button shown (unpaid bill)", Boolean(byText(d, "button", "Cancel bill")));
+    // Part payment through the UI
+    d.getElementById("pay-amount").value = "100";
+    d.querySelector(".payment-form").requestSubmit();
+    await waitFor(() => byText(doc(), ".payment-meta", "received by Ui Cashier"));
+    d = doc();
+    ok("cashier: part payment recorded, shows 'received by Ui Cashier'", Boolean(byText(d, ".payment-meta", "received by Ui Cashier")));
+    const paid = (await api("GET", `/bills/${bill.id}`)).body.data;
+    ok("cashier: bill now partially paid (billing maths unchanged)", paid.status === "partially_paid" && paid.amountPaid === 10000 && paid.payments[0].receivedBy.username === "ui-cashier", { status: paid.status, amountPaid: paid.amountPaid });
+    ok("cashier: PATCH /api/settings -> 403", (await api("PATCH", "/settings", { centuryPrice: 1 })).status === 403);
+    ok("cashier: changing game rates (Phase 11.3) -> 403, rate unchanged", (await api("PATCH", "/settings", { gameRates: { century: 1 } })).status === 403
+       && (await api("GET", "/settings")).body.data.gameRates.century === 1000);
+    await goto("/pages/settings.html", 1280, "/pages/dashboard.html");
+    ok("cashier: settings.html -> sent to dashboard", path().startsWith("/pages/dashboard.html"));
+    await logoutApi();
+
+    // ===== 8. Responsive: login page and sidebar user box =====
+    for (const width of [360, 768]) {
+      await goto("/pages/login.html", width, "/pages/login.html");
+      d = doc();
+      const card = d.querySelector(".login-card").getBoundingClientRect();
+      ok(`login ${width}px: card fits the screen, no sideways scroll`, card.left >= 0 && card.right <= width && noSideScroll(), { left: card.left, right: card.right });
+      ok(`login ${width}px: button at least 44px tall`, d.getElementById("login-button").getBoundingClientRect().height >= 44);
+    }
+    await loginAs("ui-admin");
+    await goto("/pages/dashboard.html", 360, "/pages/dashboard.html");
+    await waitFor(() => doc().querySelector(".user-name"));
+    d = doc();
+    d.getElementById("menu-button").click(); await sleep(400);
+    const sidebar = d.getElementById("sidebar").getBoundingClientRect();
+    const logoutRect = d.getElementById("logout-button").getBoundingClientRect();
+    ok("phone: menu opens, Log out visible inside the sidebar", d.getElementById("sidebar").classList.contains("is-open") && logoutRect.right <= sidebar.right + 1 && logoutRect.width > 0, { sidebar: sidebar.right, logout: logoutRect.right });
+    ok("phone: no sideways scroll with the user box", noSideScroll());
+    await goto("/pages/users.html", 360, "/pages/users.html");
+    await waitFor(() => doc().querySelectorAll("#users-list tbody tr").length >= 3);
+    ok("phone: users page has no sideways page scroll (table scrolls inside its box)", noSideScroll());
+    await goto("/pages/users.html", 1280, "/pages/users.html");
+    await sleep(300);
+  } catch (e) {
+    log.push("FAIL harness crashed: " + e.message + " " + e.stack);
+  }
+  const fails = log.filter((l) => l.startsWith("FAIL")).length;
+  document.getElementById("out").textContent = log.join("\n") + `\n\nTOTAL ${log.length - fails} passed, ${fails} failed`;
+})();
+</script>
+</body></html>

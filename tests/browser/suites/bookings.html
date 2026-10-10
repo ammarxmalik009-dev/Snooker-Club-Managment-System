@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>bookings UI harness</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1440" height="900"></iframe>
+<script>
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+let seenToasts = [];
+const clubDate = (days) => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Karachi" }).format(new Date(Date.now() + days * 864e5));
+const TODAY = clubDate(0), TOMORROW = clubDate(1);
+
+function nextLoad() {
+  return new Promise((resolve) => {
+    frame.onload = () => {
+      const w = frame.contentWindow;
+      new w.MutationObserver((ms) => { for (const m of ms) for (const n of m.addedNodes)
+        if (n.classList?.contains("toast")) seenToasts.push(n.querySelector(".toast-message").textContent); })
+        .observe(w.document.body, { childList: true, subtree: true });
+      resolve(w);
+    };
+  });
+}
+function loadPage(url, width = 1440) { frame.width = width; const p = nextLoad(); frame.src = url; return p; }
+async function waitFor(check, timeout = 6000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+const api = async (method, path, body) => {
+  const r = await fetch("/api" + path, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json() };
+};
+const byText = (root, selector, text) => [...root.querySelectorAll(selector)].find((e) => e.textContent.includes(text));
+const type = (input, value) => { input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); };
+const select = (el, value) => { el.value = value; el.dispatchEvent(new Event("change", { bubbles: true })); };
+
+(async () => {
+  try {
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
+    { const r = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: "ui-admin", password: "Ui-test-pass-123" }) }); if (r.status !== 200) throw new Error("harness login failed: " + r.status); }
+    // Time fixture: the server's clock is set to 12:00 club time on today's club date, so the bookings
+    // placed relative to "now" (Ali +10 min, Bilal -20 min, "later" +90 min) always fall on TODAY,
+    // whatever the real time of day is (before this, the suite failed after 22:30 club time).
+    { const r = await fetch(`/_clock/${encodeURIComponent(`${TODAY}T12:00:00+05:00`)}`); if (!r.ok) throw new Error("test clock failed: " + r.status); }
+    const t1 =(await api("POST", "/tables", { tableNumber: 1, name: "VIP", hourlyRate: 60000 })).body.data;
+    const t2 = (await api("POST", "/tables", { tableNumber: 2, name: "Corner", hourlyRate: 50000 })).body.data;
+    await api("POST", "/tables", { tableNumber: 3, hourlyRate: 50000, status: "maintenance" });
+    const ali = (await api("POST", "/customers", { name: "Ali Raza", phone: "0300-1234567" })).body.data;
+
+    // ===== 1. Empty day =====
+    let w = await loadPage("/pages/bookings.html"); let d = w.document;
+    await waitFor(() => d.querySelectorAll(".timeline-row:not(.timeline-head)").length === 3);
+    ok("today shown, 3 table rows in day view", d.getElementById("day-input").value === TODAY && d.querySelectorAll(".timeline-row:not(.timeline-head)").length === 3);
+    ok("empty list message", d.querySelector("#booking-list .empty-state-title")?.textContent === "No bookings on this day");
+    ok("sidebar: Bookings active", d.querySelector(".nav-link.active")?.textContent.includes("Bookings"));
+    d.getElementById("day-next").click();
+    await waitFor(() => d.getElementById("day-input").value === TOMORROW);
+    ok("next-day button", d.getElementById("day-title").textContent.length > 10);
+
+    // ===== 2. New booking with an existing customer =====
+    d.getElementById("new-booking-button").click(); await sleep(150);
+    const dlg = d.getElementById("booking-dialog");
+    ok("dialog opens on the shown day", dlg.open && d.getElementById("booking-date").value === TOMORROW);
+    type(d.getElementById("customer-search"), "ali");
+    const suggestion = await waitFor(() => d.querySelector("#customer-suggestions .suggestion:not(.is-empty)"));
+    ok("customer suggestions from the server", suggestion?.textContent === "Ali Raza0300-1234567");
+    suggestion.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    ok("customer selected", !d.getElementById("selected-customer").hidden && d.getElementById("selected-customer-text").textContent === "Ali Raza · 0300-1234567");
+    select(d.getElementById("booking-table"), t1.id);
+    select(d.getElementById("booking-start"), "18:00");
+    select(d.getElementById("booking-duration"), "90");
+    d.getElementById("booking-save").click();
+    await waitFor(() => !dlg.open);
+    ok("saved: toast", seenToasts.includes("Table 1 booked for Ali Raza"), seenToasts);
+    const block = await waitFor(() => d.querySelector(".timeline-block"));
+    ok("day view block on Table 1: 6:00 pm – 7:30 pm · Ali Raza",
+       block && block.closest(".timeline-row").querySelector(".table-number").textContent === "1" &&
+       block.textContent === "6:00 pm – 7:30 pmAli Raza" && block.classList.contains("booking-pending"), block?.textContent);
+    const rowAli = () => byText(d, ".booking-row", "Ali Raza");
+    ok("list row: time, duration, table, phone, Pending", rowAli()?.textContent.includes("6:00 pm – 7:30 pm1h 30m") &&
+       rowAli().textContent.includes("Table 1 · VIP") && rowAli().querySelector(".status-badge").textContent === "Pending");
+    const checkInBtn = byText(rowAli(), "button", "Check in");
+    ok("check-in disabled before it opens (with hint)", checkInBtn.disabled && /^Check-in opens at 5:30 pm$/.test(checkInBtn.title), checkInBtn.title);
+
+    // ===== 3. Clash shown in the form; touching slot OK; new customer =====
+    d.getElementById("new-booking-button").click(); await sleep(150);
+    d.getElementById("new-customer-toggle").click();
+    type(d.getElementById("new-customer-name"), "Bilal");
+    select(d.getElementById("booking-table"), t1.id);
+    select(d.getElementById("booking-start"), "19:00");
+    select(d.getElementById("booking-duration"), "60");
+    d.getElementById("booking-save").click();
+    const clashMsg = await waitFor(() => { const e = d.querySelector('[data-error-for="startTime"]'); return !e.hidden && e.textContent; });
+    ok("overlap error under the time, dialog stays open", clashMsg === "Table 1 is already booked 6:00 pm–7:30 pm (Ali Raza)" && dlg.open, clashMsg);
+    select(d.getElementById("booking-start"), "19:30");
+    d.getElementById("booking-save").click();
+    await waitFor(() => !dlg.open);
+    ok("touching slot 7:30 pm saved with a new customer", seenToasts.includes("Table 1 booked for Bilal") &&
+       (await api("GET", "/customers?search=bilal")).body.data.total === 1);
+
+    // unknown customer -> offer to add
+    d.getElementById("new-booking-button").click(); await sleep(150);
+    type(d.getElementById("customer-search"), "Zainab");
+    const offer = await waitFor(() => d.querySelector("#customer-suggestions .is-empty"));
+    ok("unknown name -> offer to add as new", offer?.textContent.includes('No customer called "Zainab"'));
+    byText(offer, "button", "Add").dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    ok("…which fills the new-customer form", !d.getElementById("new-customer-fields").hidden && d.getElementById("new-customer-name").value === "Zainab");
+    d.getElementById("booking-cancel").click(); await sleep(100);
+
+    // ===== 4. Confirm, edit =====
+    byText(rowAli(), "button", "Confirm").click();
+    await waitFor(() => rowAli()?.querySelector(".status-badge").textContent === "Confirmed");
+    ok("confirm -> Confirmed (and no Confirm button)", !byText(rowAli(), "button", "Confirm"));
+    byText(rowAli(), "button", "Edit").click(); await sleep(150);
+    ok("edit prefilled from the booking", d.getElementById("booking-start").value === "18:00" && d.getElementById("booking-duration").value === "90" &&
+       d.getElementById("booking-table").value === t1.id && d.getElementById("customer-section").textContent.includes("Ali Raza"));
+    select(d.getElementById("booking-duration"), "60");
+    d.getElementById("booking-save").click();
+    await waitFor(() => rowAli()?.textContent.includes("6:00 pm – 7:00 pm"));
+    ok("edit saved: 6:00 pm – 7:00 pm", seenToasts.includes("Booking updated"));
+
+    // ===== 5. Check in -> session =====
+    const aliBooking = (await api("GET", `/bookings?customerId=${ali.id}`)).body.data.bookings[0];
+    await fetch(`/_bookingstart/${aliBooking.id}/10`);
+    w = await loadPage("/pages/bookings.html"); d = w.document;
+    await waitFor(() => rowAli());
+    const enabled = byText(rowAli(), "button", "Check in");
+    ok("check-in enabled 10 min before start", enabled && !enabled.disabled);
+    enabled.click();
+    await waitFor(() => rowAli()?.querySelector(".status-badge").textContent === "Checked in");
+    ok("checked in: toast + status + View session link", seenToasts.includes("Ali Raza checked in · session started on Table 1") &&
+       rowAli().querySelector('a[href^="/pages/sessions.html#session-"]'));
+    const active = (await api("GET", "/sessions/active")).body.data.sessions;
+    ok("session running on Table 1, linked to the booking", active.length === 1 && active[0].tableNumber === 1 && active[0].booking === aliBooking.id);
+    ok("table 1 now occupied", (await api("GET", `/tables/${t1.id}`)).body.data.status === "occupied");
+    ok("day view block turns 'checked in'", d.querySelector(".timeline-block.booking-completed"));
+
+    // ===== 6. Late hint, automatic no-show, cancel =====
+    const bilal = (await api("GET", "/bookings?search=bilal")).body.data.bookings[0];
+    await fetch(`/_bookingstart/${bilal.id}/-5`);
+    w = await loadPage("/pages/bookings.html"); d = w.document;
+    await waitFor(() => byText(d, ".booking-row", "Bilal"));
+    ok("5 min late -> warning with no-show time", byText(d, ".booking-row", "Bilal").querySelector(".booking-late")?.textContent.startsWith("Late: becomes a no-show at"));
+    await fetch(`/_bookingstart/${bilal.id}/-20`);
+    w = await loadPage("/pages/bookings.html"); d = w.document;
+    await waitFor(() => byText(d, ".booking-row", "Bilal"));
+    const bilalRow = byText(d, ".booking-row", "Bilal");
+    ok("20 min late -> automatically No-show, no actions", bilalRow.querySelector(".status-badge").textContent === "No-show" && !bilalRow.querySelector("button"));
+
+    const third = (await api("POST", "/bookings", { tableId: t2.id, newCustomer: { name: "Usman" }, date: TOMORROW, startTime: "12:00", durationMinutes: 60 })).body.data;
+    w = await loadPage(`/pages/bookings.html?date=${TOMORROW}`); d = w.document;
+    await waitFor(() => byText(d, ".booking-row", "Usman"));
+    ok("?date= opens that day", d.getElementById("day-input").value === TOMORROW);
+    byText(byText(d, ".booking-row", "Usman"), "button", "Cancel").click();
+    (await waitFor(() => d.querySelector("dialog.modal-small[open]"))).querySelector(".btn-danger").click();
+    await waitFor(() => byText(d, ".booking-row", "Usman")?.querySelector(".status-badge").textContent === "Cancelled");
+    ok("cancel -> Cancelled", true);
+    ok("cancelled bookings are not drawn in the day view", !byText(d, ".timeline-block", "Usman"));
+    d.querySelector('.chip[data-status="cancelled"]').click();
+    await waitFor(() => d.querySelectorAll(".booking-row").length === 1);
+    ok("filter Cancelled", d.querySelectorAll(".booking-row").length === 1);
+
+    // ===== 7. Tables page + dashboard =====
+    const later = (await api("POST", "/bookings", { tableId: t2.id, customerId: ali.id, date: TOMORROW, startTime: "20:00", durationMinutes: 60 })).body.data;
+    await fetch(`/_bookingstart/${later.id}/90`);
+    w = await loadPage("/pages/tables.html"); d = w.document;
+    const corner = await waitFor(() => [...d.querySelectorAll(".table-card")].find((c) => c.querySelector(".table-number").textContent === "2" && c.querySelector(".table-card-booking")));
+    ok("Tables page: 'Next booking … · Ali Raza' on Table 2", corner?.querySelector(".table-card-booking").textContent.startsWith("Next booking") && corner.textContent.includes("Ali Raza"));
+    w = await loadPage("/pages/dashboard.html"); d = w.document;
+    await waitFor(() => d.querySelector('[data-value="today.bookingCount"]').textContent !== "—");
+    ok("dashboard: Today's Bookings = 3 (Ali, Bilal no-show, later)", d.querySelector('[data-value="today.bookingCount"]').textContent === "3",
+       d.querySelector('[data-value="today.bookingCount"]').textContent);
+    const upcoming = [...d.querySelectorAll("#upcoming-bookings .upcoming-row")];
+    ok("dashboard: upcoming bookings list", upcoming.length === 1 && upcoming[0].textContent.includes("Ali Raza") && upcoming[0].textContent.includes("Pending"));
+    ok("dashboard quick action New Booking", d.querySelector('.quick-action[href="/pages/bookings.html?action=new"]'));
+
+    // ===== 8. Deep link with a customer =====
+    w = await loadPage(`/pages/bookings.html?action=new&customer=${ali.id}`); d = w.document;
+    await waitFor(() => d.getElementById("booking-dialog").open);
+    ok("?action=new&customer= opens the form with that customer", d.getElementById("selected-customer-text").textContent === "Ali Raza · 0300-1234567");
+
+    // ===== 9. Settings: no-show minutes =====
+    w = await loadPage("/pages/settings.html"); d = w.document;
+    await waitFor(() => !d.getElementById("settings-form").hidden);
+    ok("settings shows no-show minutes (15)", d.getElementById("field-noShowGraceMinutes").value === "15");
+
+    // ===== 10. Responsive =====
+    for (const [page, width] of [["bookings", 375], ["bookings", 820], ["customers", 375], ["dashboard", 375], ["tables", 375]]) {
+      w = await loadPage(`/pages/${page}.html`, width); d = w.document;
+      await sleep(1000);
+      const el = d.documentElement;
+      ok(`${page} ${width}px: no horizontal overflow`, el.scrollWidth <= el.clientWidth, [el.scrollWidth, el.clientWidth]);
+    }
+    w = await loadPage("/pages/bookings.html", 375); d = w.document;
+    await sleep(800);
+    d.getElementById("new-booking-button").click(); await sleep(200);
+    const box = d.getElementById("booking-dialog").getBoundingClientRect();
+    ok("booking dialog fits a 375px phone", box.left >= 0 && box.right <= d.documentElement.clientWidth);
+    ok("no localStorage used", w.localStorage.length === 0);
+  } catch (error) {
+    ok("harness crashed: " + error.message + " " + error.stack, false);
+  }
+  document.getElementById("out").textContent = log.join("\n");
+})();
+</script>
+</body></html>

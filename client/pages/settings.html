@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#070908">
+    <title>Settings · Snooker Club Pro</title>
+    <link rel="stylesheet" href="/css/theme.css">
+    <link rel="stylesheet" href="/css/layout.css">
+    <link rel="stylesheet" href="/css/components.css">
+</head>
+<body data-page="settings">
+
+    <!-- ===== Sidebar (menu items are added by js/core/layout.js) ===== -->
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+        <a href="/pages/dashboard.html" class="sidebar-brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <span>Snooker Club Pro</span>
+        </a>
+        <nav class="sidebar-nav" id="sidebar-nav"></nav>
+        <div class="sidebar-footer" id="sidebar-footer"></div>
+    </aside>
+    <div class="sidebar-overlay" id="sidebar-overlay" hidden></div>
+
+    <div class="app-main">
+        <!-- ===== Top bar ===== -->
+        <header class="topbar">
+            <button type="button" class="menu-button" id="menu-button"
+                    aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">
+                <span data-icon="menu"></span>
+            </button>
+            <h1 class="topbar-title">Settings</h1>
+
+            <div class="topbar-right">
+                <span class="topbar-date" id="topbar-date"></span>
+                <span class="status-pill" id="server-status" role="status">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span class="status-text">Checking…</span>
+                </span>
+            </div>
+        </header>
+
+        <!-- ===== Page content ===== -->
+        <main class="page-content settings-page">
+            <p class="page-intro">The club's rate list, time rule and tax. Changes apply to <strong>new</strong> bills only. Existing bills keep the prices they were made with.</p>
+
+            <div class="list-state" id="settings-loading" role="status">
+                <span class="spinner" aria-hidden="true"></span> Loading settings…
+            </div>
+
+            <form id="settings-form" novalidate hidden>
+                <p class="form-error" id="form-error" role="alert" hidden></p>
+
+                <article class="panel panel-wide">
+                    <header class="panel-header"><h2 class="panel-title">Rate list</h2></header>
+                    <div class="settings-body">
+                        <!-- One field per game type, built by settings.js from the game-mode registry
+                             (GET /api/game-modes): Century per minute, Frame per frame, Snooker Point, 4 Players -->
+                        <div class="form-row rate-fields" id="rate-fields"></div>
+                    </div>
+                </article>
+
+                <article class="panel panel-wide">
+                    <header class="panel-header"><h2 class="panel-title">Time rule</h2></header>
+                    <div class="settings-body">
+                        <p class="field-hint settings-explain" id="time-rule-text"></p>
+                        <div class="form-row">
+                            <div class="form-field">
+                                <label for="field-minimumBillableMinutes">Minimum minutes</label>
+                                <input type="number" id="field-minimumBillableMinutes" name="minimumBillableMinutes" class="input" min="1" max="240" step="1">
+                                <p class="field-error" data-error-for="minimumBillableMinutes" hidden></p>
+                            </div>
+                            <div class="form-field">
+                                <label for="field-billingIncrementMinutes">Round up to the next … minutes</label>
+                                <input type="number" id="field-billingIncrementMinutes" name="billingIncrementMinutes" class="input" min="1" max="60" step="1">
+                                <p class="field-error" data-error-for="billingIncrementMinutes" hidden></p>
+                            </div>
+                        </div>
+                    </div>
+                </article>
+
+                <article class="panel panel-wide">
+                    <header class="panel-header"><h2 class="panel-title">Tax</h2></header>
+                    <div class="settings-body">
+                        <label class="switch-field" for="field-taxEnabled">
+                            <input type="checkbox" id="field-taxEnabled" name="taxEnabled" role="switch">
+                            <span class="switch-text">
+                                <strong>Add tax to bills</strong>
+                                <span class="field-hint">Off: bills have no tax. On: the rate below is added to every new bill.</span>
+                            </span>
+                        </label>
+                        <div class="form-field tax-rate-field">
+                            <label for="field-taxRate">Tax rate (%)</label>
+                            <input type="text" id="field-taxRate" name="taxRateBasisPoints" class="input" inputmode="decimal" autocomplete="off" placeholder="e.g. 16">
+                            <p class="field-error" data-error-for="taxRateBasisPoints" hidden></p>
+                        </div>
+                    </div>
+                </article>
+
+                <article class="panel panel-wide">
+                    <header class="panel-header"><h2 class="panel-title">Bookings</h2></header>
+                    <div class="settings-body">
+                        <div class="form-field tax-rate-field">
+                            <label for="field-noShowGraceMinutes">No-show after (minutes)</label>
+                            <input type="number" id="field-noShowGraceMinutes" name="noShowGraceMinutes" class="input" min="5" max="120" step="1">
+                            <p class="field-hint">A booking that isn't checked in this many minutes after its start time is marked as a no-show automatically.</p>
+                            <p class="field-error" data-error-for="noShowGraceMinutes" hidden></p>
+                        </div>
+                    </div>
+                </article>
+
+                <article class="panel panel-wide" id="backup-panel">
+                    <header class="panel-header"><h2 class="panel-title">Backup (XML)</h2></header>
+                    <div class="settings-body">
+                        <p class="field-hint settings-explain">The whole database (bills, payments, players, matches, café, users…) is saved as one XML file. Restore a file with <code>npm.cmd run restore-backup</code> (see README).</p>
+                        <label class="switch-field" for="field-backupEnabled">
+                            <input type="checkbox" id="field-backupEnabled" name="backupEnabled" role="switch">
+                            <span class="switch-text">
+                                <strong>Automatic backup</strong>
+                                <span class="field-hint">On: a backup is made every few hours while the app is running (and at once after a start, if one is overdue).</span>
+                            </span>
+                        </label>
+                        <div class="form-row">
+                            <div class="form-field">
+                                <label for="field-backupIntervalHours">Backup every … hours</label>
+                                <input type="number" id="field-backupIntervalHours" name="backupIntervalHours" class="input" min="1" max="168" step="1">
+                                <p class="field-hint">1 to 168 hours (168 = once a week). Default 12.</p>
+                                <p class="field-error" data-error-for="backupIntervalHours" hidden></p>
+                            </div>
+                            <div class="form-field">
+                                <label for="field-backupKeepCount">Keep the last … backups</label>
+                                <input type="number" id="field-backupKeepCount" name="backupKeepCount" class="input" min="1" max="365" step="1">
+                                <p class="field-hint">Older files are deleted automatically.</p>
+                                <p class="field-error" data-error-for="backupKeepCount" hidden></p>
+                            </div>
+                        </div>
+
+                        <div class="alert alert-warning" id="backup-drive-warning" role="alert" hidden>
+                            The backup folder is on the system drive. If Windows or this drive breaks, the backups are lost too. Set <code>BACKUP_DIR</code> in .env to another drive, a USB drive or a OneDrive folder.
+                        </div>
+                        <dl class="backup-status" id="backup-status">
+                            <dt>Folder</dt><dd id="backup-folder">—</dd>
+                            <dt>Last backup</dt><dd id="backup-last">—</dd>
+                            <dt>Next backup</dt><dd id="backup-next">—</dd>
+                        </dl>
+                        <p class="form-error" id="backup-error" role="alert" hidden></p>
+                        <div class="backup-actions">
+                            <button type="button" class="btn btn-secondary" id="backup-now-button">Backup Now</button>
+                        </div>
+
+                        <div class="table-scroll">
+                            <table class="data-table" id="backup-table">
+                                <thead><tr><th>Backup file</th><th>Saved</th><th class="numeric">Size</th><th></th></tr></thead>
+                                <tbody id="backup-files"></tbody>
+                            </table>
+                        </div>
+                        <p class="field-hint" id="backup-empty" hidden>No backups yet.</p>
+                    </div>
+                </article>
+
+                <div class="settings-actions">
+                    <button type="submit" class="btn btn-primary" id="save-button">Save settings</button>
+                </div>
+            </form>
+        </main>
+    </div>
+
+    <script src="/js/core/api.js"></script>
+    <script src="/js/core/ui.js"></script>
+    <script src="/js/core/format.js"></script>
+    <script src="/js/core/layout.js"></script>
+    <script src="/js/pages/settings.js"></script>
+</body>
+</html>

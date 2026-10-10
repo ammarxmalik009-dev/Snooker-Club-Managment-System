@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>billing UI harness</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1280" height="900"></iframe>
+<script>
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+let seenToasts = [];
+let printCalls = 0;
+
+function loadPage(url, width = 1280) {
+  frame.width = width;
+  return new Promise((resolve) => {
+    frame.onload = () => {
+      const w = frame.contentWindow;
+      w.print = () => { printCalls += 1; }; // don't open a real print window
+      new w.MutationObserver((ms) => { for (const m of ms) for (const n of m.addedNodes)
+        if (n.classList?.contains("toast")) seenToasts.push(n.querySelector(".toast-message").textContent); })
+        .observe(w.document.body, { childList: true, subtree: true });
+      resolve(w);
+    };
+    frame.src = url;
+  });
+}
+async function waitFor(check, timeout = 6000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+const api = async (method, path, body) => {
+  const r = await fetch("/api" + path, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json() };
+};
+const byText = (root, selector, text) => [...root.querySelectorAll(selector)].find((e) => e.textContent.includes(text));
+const type = (input, value) => { input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); };
+const choose = (input) => { input.checked = true; input.dispatchEvent(new Event("change", { bubbles: true })); };
+const summaryText = (dlg) => dlg.querySelector(".bill-summary").textContent;
+const text = (el) => (el ? el.textContent.replace(/\s+/g, " ").trim() : "");
+
+(async () => {
+  try {
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
+    { const r = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: "ui-admin", password: "Ui-test-pass-123" }) }); if (r.status !== 200) throw new Error("harness login failed: " + r.status); }
+    for (const t of [{ tableNumber: 1, name: "VIP", hourlyRate: 80000 }, { tableNumber: 2, name: "Corner", hourlyRate: 50000 }]) await api("POST", "/tables", t);
+
+    // ===== 1. Billing page while a rate is switched off =====
+    // Phase 11.3: a new club already has default rates (Century Rs 10/min, Frame Rs 250, ...),
+    // so the warning is shown for a game type whose price was set to Rs 0.
+    const defaults = (await api("GET", "/settings")).body.data.gameRates;
+    ok("new club: default rates Century Rs 10/min, Frame Rs 250, Snooker Point Rs 350, 4 Players Rs 500",
+       JSON.stringify(defaults) === JSON.stringify({ century: 1000, frame: 25000, snooker_point: 35000, four_player: 50000 }), defaults);
+    await api("PATCH", "/settings", { gameRates: { century: 0 } });
+    let w = await loadPage("/pages/billing.html"); let d = w.document;
+    await waitFor(() => !d.getElementById("bills-empty").hidden);
+    ok("billing: empty state 'No bills yet'", d.getElementById("bills-empty-title").textContent === "No bills yet");
+    await waitFor(() => !d.getElementById("rates-warning").hidden);
+    ok("billing: warns that a rate is not set (Rs 0)", !d.getElementById("rates-warning").hidden);
+    ok("sidebar: Billing active, Settings clickable", d.querySelector(".nav-link.active")?.textContent.includes("Billing") && d.querySelector('a.nav-link[href="/pages/settings.html"]'));
+
+    // ===== 2. Settings: rate list =====
+    w = await loadPage("/pages/settings.html"); d = w.document;
+    await waitFor(() => !d.getElementById("settings-form").hidden);
+    const f = d.getElementById("settings-form");
+    ok("settings: defaults 15 / 5, tax off, tax rate disabled",
+       f.elements.minimumBillableMinutes.value === "15" && f.elements.billingIncrementMinutes.value === "5" && !d.getElementById("field-taxEnabled").checked && d.getElementById("field-taxRate").disabled);
+    ok("settings: time rule explained", d.getElementById("time-rule-text").textContent.includes("at least 15 minutes, then rounded up to the next 5 minutes"));
+    const rateField = (key) => d.getElementById(`field-gameRate-${key}`).closest(".form-field");
+    ok("settings: four rate fields 'Century Rs ___ per minute', 'Frame Rs ___ per frame', 'Snooker Point Rs ___', '4 Players Rs ___'",
+       ["century", "frame", "snooker_point", "four_player"].map((k) => [rateField(k).querySelector("label"), ...rateField(k).querySelector(".input-group").children]
+         .map(text).filter(Boolean).join(" ")).join("|")
+         === "Century Rs per minute|Frame Rs per frame|Snooker Point Rs|4 Players Rs",
+       ["century", "frame", "snooker_point", "four_player"].map((k) => text(rateField(k))));
+    ok("settings: rates filled (century 0.00 = off, frame / snooker point / 4 players defaults)",
+       ["century", "frame", "snooker_point", "four_player"].map((k) => f.elements[`gameRate-${k}`].value).join() === "0.00,250.00,350.00,500.00");
+    // Phase 11.8: they ARE billable - from their completed matches; only the Create Bill window doesn't offer them
+    ok("settings: Snooker Point and 4 Players say they are billed from their matches (not the Create Bill window)",
+       text(rateField("snooker_point")).includes("on the bill of each completed Snooker Point match") && text(rateField("four_player")).includes("on the bill of each completed 4 Players match")
+       && text(rateField("four_player")).includes("Not offered in the Create Bill window") && !d.body.textContent.includes("can't be billed")
+       && text(rateField("century")).includes("Charged for every billed minute"), [text(rateField("snooker_point")), text(rateField("four_player"))]);
+    type(f.elements["gameRate-century"], "10"); type(f.elements["gameRate-frame"], "abc");
+    d.getElementById("save-button").click(); await sleep(200);
+    ok("settings: bad price shows field error", !d.querySelector('[data-error-for="gameRates.frame"]').hidden
+       && d.querySelector('[data-error-for="gameRates.frame"]').textContent === "Frame: enter an amount like 250 or 250.50");
+    type(f.elements["gameRate-frame"], "150");
+    ok("settings: typing again hides the error", d.querySelector('[data-error-for="gameRates.frame"]').hidden);
+    choose(d.getElementById("field-taxEnabled")); d.getElementById("save-button").click(); await sleep(200);
+    ok("settings: tax on without a rate is refused", d.querySelector('[data-error-for="taxRateBasisPoints"]').textContent === "Enter the tax rate, or switch tax off");
+    d.getElementById("field-taxEnabled").checked = false; d.getElementById("field-taxEnabled").dispatchEvent(new Event("change"));
+    d.getElementById("save-button").click();
+    await waitFor(() => seenToasts.includes("Settings saved"));
+    ok("settings: saved", seenToasts.includes("Settings saved"));
+    const saved = (await api("GET", "/settings")).body.data;
+    ok("settings stored as paisa: century 1000/min, frame 15000 (old framePrice kept in step), tax off",
+       saved.gameRates.century === 1000 && saved.gameRates.frame === 15000 && saved.framePrice === 15000 && saved.gameRates.snooker_point === 35000 && saved.taxEnabled === false, saved);
+    w = await loadPage("/pages/settings.html"); d = w.document;
+    await waitFor(() => !d.getElementById("settings-form").hidden);
+    ok("settings: reload shows 10.00 / 150.00", d.getElementById("field-gameRate-century").value === "10.00" && d.getElementById("field-gameRate-frame").value === "150.00");
+    // Phase 11.8: the time rule and the no-show minutes are saved from the page too (then put back)
+    const before = (await api("GET", "/settings")).body.data;
+    type(d.getElementById("field-minimumBillableMinutes"), "20");
+    type(d.getElementById("field-billingIncrementMinutes"), "10");
+    type(d.getElementById("field-noShowGraceMinutes"), "25");
+    seenToasts.length = 0;
+    d.getElementById("save-button").click();
+    await waitFor(() => seenToasts.includes("Settings saved"));
+    const timeRule = (await api("GET", "/settings")).body.data;
+    ok("settings: time rule (20 min minimum, 10 min steps) and no-show minutes (25) saved from the page",
+       timeRule.minimumBillableMinutes === 20 && timeRule.billingIncrementMinutes === 10 && timeRule.noShowGraceMinutes === 25, timeRule);
+    await api("PATCH", "/settings", { minimumBillableMinutes: before.minimumBillableMinutes, billingIncrementMinutes: before.billingIncrementMinutes, noShowGraceMinutes: before.noShowGraceMinutes });
+
+    // Backup (XML): every 12 hours by default, the hours can be changed, Backup Now lists a downloadable file
+    w = await loadPage("/pages/settings.html"); d = w.document;
+    await waitFor(() => !d.getElementById("settings-form").hidden && d.getElementById("backup-folder").textContent !== "—");
+    ok("backup: on, every 12 hours, keep 30, no backups yet",
+       d.getElementById("field-backupEnabled").checked && d.getElementById("field-backupIntervalHours").value === "12"
+       && d.getElementById("field-backupKeepCount").value === "30" && !d.getElementById("backup-empty").hidden);
+    type(d.getElementById("field-backupIntervalHours"), "0");
+    seenToasts.length = 0;
+    d.getElementById("save-button").click(); await sleep(200);
+    ok("backup: 0 hours refused", d.querySelector('[data-error-for="backupIntervalHours"]').textContent === "Enter 1 to 168 hours");
+    type(d.getElementById("field-backupIntervalHours"), "6");
+    d.getElementById("save-button").click();
+    await waitFor(() => seenToasts.includes("Settings saved"));
+    ok("backup: 6 hours saved from the page", (await api("GET", "/settings")).body.data.backupIntervalHours === 6);
+    d.getElementById("backup-now-button").click();
+    await waitFor(() => d.querySelector("#backup-files a"));
+    const backupLink = d.querySelector("#backup-files a");
+    ok("backup: Backup Now -> file listed with a Download link, last backup shown",
+       seenToasts.some((message) => message.startsWith("Backup saved: snooker-backup-")) && backupLink.textContent === "Download"
+       && backupLink.getAttribute("href").startsWith("/api/backups/snooker-backup-") && d.getElementById("backup-last").textContent.includes("snooker-backup-"),
+       seenToasts);
+    const downloaded = await fetch(backupLink.getAttribute("href"));
+    ok("backup: the file downloads as XML", downloaded.status === 200 && (await downloaded.text()).includes("<snookerBackup version=\"1\""));
+    await api("PATCH", "/settings", { backupIntervalHours: 12 });
+    w = await loadPage("/pages/settings.html", 375); d = w.document;
+    await waitFor(() => !d.getElementById("settings-form").hidden);
+    const suffixBox = d.querySelector("#rate-fields .input-suffix").getBoundingClientRect();
+    ok("375px: rate fields fit, no sideways scroll", d.documentElement.scrollWidth <= d.documentElement.clientWidth + 1 && suffixBox.right <= d.documentElement.clientWidth + 1,
+       { scroll: d.documentElement.scrollWidth, client: d.documentElement.clientWidth, suffixRight: suffixBox.right });
+
+    // ===== 3. End a session -> Create Bill dialog =====
+    w = await loadPage("/pages/tables.html"); d = w.document;
+    const card = (n) => [...d.querySelectorAll(".table-card")].find((c) => c.querySelector(".table-number").textContent === String(n));
+    await waitFor(() => card(1));
+    byText(card(1), "button", "Start Session").click();
+    await waitFor(() => byText(card(1), "button", "End Session"));
+    await fetch("/_backdate/1/2830"); // 47m 10s
+    w = await loadPage("/pages/tables.html"); d = w.document;
+    await waitFor(() => card(1) && byText(card(1), "button", "End Session"));
+    byText(card(1), "button", "End Session").click();
+    const confirmBox = await waitFor(() => d.querySelector("dialog.modal-small[open]"));
+    confirmBox.querySelector(".btn-danger").click();
+
+    const dlg = await waitFor(() => d.querySelector("dialog.bill-dialog[open]"));
+    ok("bill dialog opens after End Session", !!dlg);
+    ok("dialog title 'Create bill · Table 1' + played time", dlg.querySelector(".modal-title").textContent === "Create bill · Table 1" && dlg.querySelector(".modal-subtitle").textContent.startsWith("VIP · Played 47m"));
+    ok("century option shows Rs 10.00 / minute, frame Rs 150.00 each",
+       byText(dlg, ".segment", "Century").textContent.includes("Rs 10.00 / minute") && byText(dlg, ".segment", "Frame").textContent.includes("Rs 150.00 each"));
+    await waitFor(() => summaryText(dlg).includes("Enter a name"));
+    ok("empty names -> asks for names, Create disabled", summaryText(dlg).includes("Enter a name for every player.") && dlg.querySelector('button[type="submit"]').disabled);
+
+    const playerRows = () => [...dlg.querySelectorAll(".player-row")];
+    type(playerRows()[0].querySelector("input"), "Ali");
+    type(playerRows()[1].querySelector("input"), "Usman");
+    playerRows()[1].querySelector("select").value = "loser"; playerRows()[1].querySelector("select").dispatchEvent(new Event("change", { bubbles: true }));
+    await waitFor(() => summaryText(dlg).includes("Total"));
+    // Phase 11.3: Century = billed minutes × Rs 10 (47m10s -> 50 billed minutes = Rs 500)
+    ok("server preview: century 50 min × Rs 10 = Rs 500, loser Usman pays all, billed 50m",
+       summaryText(dlg).includes("Century minutes × 50 @ Rs 10.00") && summaryText(dlg).includes("TotalRs 500.00") && summaryText(dlg).includes("Loser Pays · Billed time 50m") &&
+       [...dlg.querySelectorAll(".summary-shares li")].map((li) => li.textContent).join("|") === "AliRs 0.00|UsmanRs 500.00", summaryText(dlg));
+
+    byText(dlg, "button", "").parentElement; // no-op
+    dlg.querySelector('.stepper button[aria-label="One more"]').click();
+    await sleep(700); // let the preview refresh
+    ok("+1 -> 2 century games: still Rs 500 (time decides the price)",
+       dlg.querySelector(".stepper-input").value === "2" && summaryText(dlg).includes("Century minutes × 50 @ Rs 10.00") && summaryText(dlg).includes("TotalRs 500.00"), summaryText(dlg));
+
+    choose(dlg.querySelector('input[name="gameMode"][value="frame"]'));
+    await waitFor(() => summaryText(dlg).includes("Frames × 2"));
+    ok("switch to Frame: 2 x Rs 150 = Rs 300", summaryText(dlg).includes("TotalRs 300.00"));
+
+    byText(dlg, "button", "Add player").click();
+    type(playerRows()[2].querySelector("input"), "Bilal");
+    choose(dlg.querySelector('input[name="payerRule"][value="split"]'));
+    byText(dlg, "button", "Add café item").click();
+    const cafe = dlg.querySelector(".cafe-row").querySelectorAll("input");
+    type(cafe[0], "Tea"); type(cafe[1], "2"); type(cafe[2], "80");
+    await waitFor(() => summaryText(dlg).includes("TotalRs 460.00"));
+    ok("3 players split + Tea 2 x Rs 80 -> Rs 460.00 total",
+       summaryText(dlg).includes("Tea × 2 @ Rs 80.00") && summaryText(dlg).includes("TotalRs 460.00"), summaryText(dlg));
+    ok("split shares 153.34 / 153.33 / 153.33 (add up exactly)",
+       [...dlg.querySelectorAll(".summary-shares li")].map((li) => li.textContent).join("|") === "AliRs 153.34|UsmanRs 153.33|BilalRs 153.33");
+    ok("no tax line while tax is off", !summaryText(dlg).includes("Tax"));
+
+    dlg.querySelector('button[type="submit"]').click();
+    await waitFor(() => !d.querySelector("dialog.bill-dialog"));
+    ok("bill created toast", seenToasts.some((t) => /^Bill B-\d{8}-0001 created · Rs 460\.00$/.test(t)), seenToasts);
+    await waitFor(() => card(1)?.dataset.status === "available");
+    ok("table 1 available again after billing", card(1).dataset.status === "available");
+
+    // ===== 4. Sessions history: bill column =====
+    const t2 = (await api("GET", "/tables?search=2")).body.data.find((t) => t.tableNumber === 2);
+    const s2 = (await api("POST", "/sessions", { tableId: t2.id })).body.data;
+    await api("POST", `/sessions/${s2.id}/end`);
+    w = await loadPage("/pages/sessions.html"); d = w.document;
+    const rows = () => [...d.querySelectorAll("#history-body tr")];
+    await waitFor(() => rows().length === 2);
+    const billCell = (row) => row.querySelectorAll("td")[4];
+    ok("history: billed session shows 'Unpaid' + bill number link",
+       billCell(rows()[1]).querySelector(".status-badge")?.textContent === "Unpaid" && /^B-\d{8}-0001$/.test(billCell(rows()[1]).querySelector(".bill-link-number")?.textContent) &&
+       billCell(rows()[1]).querySelector("a").getAttribute("href").startsWith("/pages/billing.html?bill="));
+    ok("history: unbilled session shows 'Create bill'", byText(billCell(rows()[0]), "button", "Create bill"));
+    byText(billCell(rows()[0]), "button", "Create bill").click();
+    const dlg2 = await waitFor(() => d.querySelector("dialog.bill-dialog[open]"));
+    ok("'Create bill' from history opens the dialog for Table 2", dlg2?.querySelector(".modal-title").textContent === "Create bill · Table 2");
+    byText(dlg2, "button", "Bill later").click();
+    await waitFor(() => !d.querySelector("dialog.bill-dialog"));
+    ok("'Bill later' closes without a bill", (await api("GET", "/bills")).body.data.total === 1);
+    // second bill for table 2 via API (unpaid, used for cancel)
+    const bill2 = (await api("POST", "/bills", { sessionId: s2.id, gameMode: "century", quantity: 1, payerRule: "loser",
+                   players: [{ name: "Kamran", result: "loser" }, { name: "Zubair" }] })).body.data;
+
+    // ===== 5. Billing page: list + payments =====
+    w = await loadPage("/pages/billing.html"); d = w.document;
+    const billRows = () => [...d.querySelectorAll("#bills-body tr")];
+    await waitFor(() => billRows().length === 2);
+    ok("rates warning hidden once prices are set", d.getElementById("rates-warning").hidden);
+    const first = billRows().find((r) => r.textContent.includes("-0001"));
+    const tds = [...first.querySelectorAll("td")].map((td) => td.textContent);
+    ok("list row: table, Frame × 2, total/paid/balance, Unpaid",
+       tds[1] === "1 · VIP" && tds[2] === "Frame × 2" && tds[3] === "Rs 460.00" && tds[4] === "Rs 0.00" && tds[5] === "Rs 460.00" && tds[6] === "Unpaid", tds);
+
+    byText(first, "button", "View").click();
+    const detail = () => d.getElementById("bill-detail");
+    await waitFor(() => d.getElementById("bill-dialog").open && detail().textContent.includes("Record payment"));
+    ok("unpaid detail has no stray 'null' text", !/null/.test(detail().textContent));
+    ok("detail: charges, billed time, players, no payments yet",
+       detail().textContent.includes("Frames") && detail().textContent.includes("Tea (café)") && detail().textContent.includes("Billed time50m") &&
+       detail().querySelectorAll(".detail-table")[1].querySelectorAll("tbody tr").length === 3 && detail().textContent.includes("No payments yet."));
+    ok("address shows ?bill=<id> (shareable)", w.location.search.startsWith("?bill="));
+    ok("payment form defaults to Ali owing Rs 153.34", d.getElementById("pay-payer").value === "Ali" && d.getElementById("pay-amount").value === "153.34");
+
+    const savePayment = () => byText(detail(), "button", "Save payment").click();
+    type(d.getElementById("pay-amount"), "200"); savePayment();
+    await waitFor(() => detail().querySelector(".payment-form .form-error:not([hidden])"));
+    ok("more than Ali's share -> clear error in form", detail().querySelector(".payment-form .form-error").textContent === "Ali only owes Rs 153.34 more");
+
+    type(d.getElementById("pay-amount"), "100"); savePayment();
+    await waitFor(() => detail().textContent.includes("Partially paid") && detail().querySelectorAll(".payment-list li").length === 1);
+    ok("part payment Rs 100 -> Partially paid, listed", detail().querySelector(".payment-list li").textContent.includes("Ali · Cash") && detail().textContent.includes("Rs 100.00"));
+    ok("Ali's remaining now defaults to Rs 53.34", d.getElementById("pay-amount").value === "53.34");
+    savePayment();
+    await waitFor(() => detail().querySelectorAll(".payment-list li").length === 2);
+    d.getElementById("pay-payer").value = "Bilal"; d.getElementById("pay-payer").dispatchEvent(new Event("change"));
+    d.getElementById("pay-method").value = "jazzcash";
+    savePayment();
+    await waitFor(() => detail().querySelectorAll(".payment-list li").length === 3);
+    ok("payer list only shows people who still owe", [...d.getElementById("pay-payer").options].map((o) => o.value).join(",") === "Usman");
+    savePayment();
+    await waitFor(() => !detail().querySelector(".payment-form"));
+    ok("last payment -> 'fully paid' toast, status Paid, form gone",
+       seenToasts.some((t) => /is fully paid$/.test(t)) && detail().querySelector(".bill-detail-header .status-badge").textContent === "Paid");
+    ok("4 payments recorded, JazzCash shown", detail().querySelectorAll(".payment-list li").length === 4 && detail().textContent.includes("Bilal · JazzCash"));
+    ok("no Cancel button on a paid bill", !byText(detail(), "button", "Cancel bill"));
+
+    // Print
+    byText(detail(), "button", "Print receipt").click(); await sleep(100);
+    const receipt = d.getElementById("print-receipt").textContent;
+    ok("print: receipt built and print window requested", printCalls === 1 && receipt.includes("-0001") && receipt.includes("TOTALRs 460.00") && receipt.includes("PAID"), receipt);
+    ok("no stray 'null' text in bill detail or receipt", !/null/.test(detail().textContent) && !/null/.test(receipt));
+    byText(detail(), "button", "").click; // no-op
+    d.querySelector('#bill-detail .bill-detail-header button[aria-label="Close"]').click();
+    await waitFor(() => !d.getElementById("bill-dialog").open);
+    await waitFor(() => billRows().find((r) => r.textContent.includes("-0001"))?.textContent.includes("Paid"));
+    ok("list row updated to Paid without reload", billRows().find((r) => r.textContent.includes("-0001")).querySelectorAll("td")[6].textContent === "Paid");
+
+    // ===== 6. Cancel an unpaid bill =====
+    byText(billRows().find((r) => r.textContent.includes(bill2.billNumber)), "button", "View").click();
+    await waitFor(() => byText(detail(), "button", "Cancel bill"));
+    byText(detail(), "button", "Cancel bill").click();
+    const box = await waitFor(() => d.querySelector("dialog.modal-small[open]"));
+    box.querySelector(".btn-danger").click();
+    await waitFor(() => detail().querySelector(".bill-detail-header .status-badge")?.textContent === "Cancelled");
+    ok("cancel -> Cancelled, no payment form, balance Rs 0.00",
+       !detail().querySelector(".payment-form") && detail().querySelector(".row-balance").textContent.includes("Rs 0.00"));
+    d.querySelector('#bill-detail .bill-detail-header button[aria-label="Close"]').click();
+
+    // ===== 7. Filters =====
+    const chip = (s) => d.querySelector(`.chip[data-status="${s}"]`);
+    chip("paid").click(); await waitFor(() => billRows().length === 1 && billRows()[0].textContent.includes("Paid"));
+    ok("filter Paid -> 1", billRows().length === 1);
+    chip("cancelled").click(); await waitFor(() => billRows().length === 1 && billRows()[0].textContent.includes("Cancelled"));
+    ok("filter Cancelled -> 1", billRows()[0].textContent.includes(bill2.billNumber));
+    chip("unpaid").click(); await waitFor(() => !d.getElementById("bills-empty").hidden);
+    ok("filter Unpaid -> 'No matching bills'", d.getElementById("bills-empty-title").textContent === "No matching bills");
+    chip("").click(); await waitFor(() => billRows().length === 2);
+    type(d.getElementById("filter-search"), "bilal");
+    await waitFor(() => billRows().length === 1);
+    ok("search player 'bilal' -> 1 bill", billRows().length === 1 && billRows()[0].textContent.includes("-0001"));
+    d.getElementById("filter-clear").click(); await waitFor(() => billRows().length === 2);
+    d.getElementById("filter-today").click(); await sleep(300); await waitFor(() => billRows().length === 2);
+    ok("Today -> both bills", billRows().length === 2);
+
+    // ===== 8. Deep link + responsive =====
+    w = await loadPage(`/pages/billing.html?bill=${bill2.id}`, 375); d = w.document;
+    await waitFor(() => d.getElementById("bill-dialog").open);
+    const dialogBox = d.getElementById("bill-dialog").getBoundingClientRect();
+    ok("?bill=<id> opens that bill; dialog fits a 375px phone",
+       d.getElementById("bill-detail").textContent.includes(bill2.billNumber) && dialogBox.left >= 0 && dialogBox.right <= d.documentElement.clientWidth);
+    for (const [page, width] of [["billing", 375], ["settings", 375], ["billing", 820], ["sessions", 375]]) {
+      w = await loadPage(`/pages/${page}.html`, width); d = w.document;
+      await sleep(900);
+      const el = d.documentElement;
+      ok(`${page} ${width}px: no horizontal overflow`, el.scrollWidth <= el.clientWidth, [el.scrollWidth, el.clientWidth]);
+    }
+    // bill dialog on a phone
+    const s3t = (await api("POST", "/sessions", { tableId: t2.id })).body.data;
+    w = await loadPage("/pages/sessions.html", 375); d = w.document;
+    await waitFor(() => d.querySelector(".session-row"));
+    byText(d.querySelector(".session-row"), "button", "End").click();
+    (await waitFor(() => d.querySelector("dialog.modal-small[open]"))).querySelector(".btn-danger").click();
+    const phoneDialog = await waitFor(() => d.querySelector("dialog.bill-dialog[open]"));
+    const rect = phoneDialog.getBoundingClientRect();
+    ok("bill dialog fits a 375px phone", rect.left >= 0 && rect.right <= d.documentElement.clientWidth && phoneDialog.scrollWidth <= phoneDialog.clientWidth + 1, [rect.left, rect.right, phoneDialog.scrollWidth, phoneDialog.clientWidth]);
+    byText(phoneDialog, "button", "Bill later").click();
+    ok("no localStorage used", w.localStorage.length === 0);
+  } catch (error) {
+    ok("harness crashed: " + error.message + " " + error.stack, false);
+  }
+  document.getElementById("out").textContent = log.join("\n");
+})();
+</script>
+</body></html>

@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#070908">
+    <title>Players · Snooker Club Pro</title>
+    <link rel="stylesheet" href="/css/theme.css">
+    <link rel="stylesheet" href="/css/layout.css">
+    <link rel="stylesheet" href="/css/components.css">
+</head>
+<body data-page="players">
+
+    <!-- ===== Sidebar (menu items are added by js/core/layout.js) ===== -->
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+        <a href="/pages/dashboard.html" class="sidebar-brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <span>Snooker Club Pro</span>
+        </a>
+        <nav class="sidebar-nav" id="sidebar-nav"></nav>
+        <div class="sidebar-footer" id="sidebar-footer"></div>
+    </aside>
+    <div class="sidebar-overlay" id="sidebar-overlay" hidden></div>
+
+    <div class="app-main">
+        <header class="topbar">
+            <button type="button" class="menu-button" id="menu-button"
+                    aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">
+                <span data-icon="menu"></span>
+            </button>
+            <h1 class="topbar-title">Players</h1>
+            <div class="topbar-right">
+                <span class="topbar-date" id="topbar-date"></span>
+                <span class="status-pill" id="server-status" role="status">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span class="status-text">Checking…</span>
+                </span>
+            </div>
+        </header>
+
+        <main class="page-content">
+            <div class="page-header">
+                <p class="page-intro">Registered players. Walk-in players don't need to be registered to play. Open a player for their matches, bills and what they still owe.</p>
+                <button type="button" class="btn btn-primary" id="add-player-button" data-permission="players:manage">
+                    <span data-icon="plus"></span> Add Player
+                </button>
+            </div>
+
+            <article class="panel panel-wide">
+                <header class="panel-header">
+                    <h2 class="panel-title">Player list</h2>
+                    <span class="panel-meta" id="players-summary"></span>
+                </header>
+                <div class="toolbar toolbar-padded">
+                    <div class="search-field">
+                        <span data-icon="search"></span>
+                        <label for="player-search" class="visually-hidden">Search players</label>
+                        <input type="search" id="player-search" class="input" placeholder="Name or phone…" maxlength="50" autocomplete="off">
+                    </div>
+                    <div class="filter-chips" id="player-status-filter" role="group" aria-label="Status">
+                        <button type="button" class="chip" data-status="active" aria-pressed="true">Active</button>
+                        <button type="button" class="chip" data-status="inactive" aria-pressed="false">Inactive</button>
+                        <button type="button" class="chip" data-status="all" aria-pressed="false">All</button>
+                    </div>
+                </div>
+                <div id="players-list">
+                    <div class="empty-state panel-empty"><span class="spinner" aria-hidden="true"></span><p>Loading…</p></div>
+                </div>
+                <nav class="pagination" id="players-pagination" aria-label="Player pages" hidden>
+                    <button type="button" class="btn btn-secondary btn-small" id="players-prev">Previous</button>
+                    <span class="pagination-info" id="players-page-info"></span>
+                    <button type="button" class="btn btn-secondary btn-small" id="players-next">Next</button>
+                </nav>
+            </article>
+        </main>
+    </div>
+
+    <!-- ===== Add / edit player ===== -->
+    <dialog class="modal" id="player-dialog" aria-labelledby="player-dialog-title">
+        <form class="modal-content" id="player-form" novalidate>
+            <h2 class="modal-title" id="player-dialog-title">Add player</h2>
+            <p class="form-error" id="player-form-error" role="alert" hidden></p>
+            <div class="form-field">
+                <label for="player-name">Name</label>
+                <input type="text" id="player-name" name="name" class="input" maxlength="60" autocomplete="off">
+                <p class="field-hint">Each registered name can be used once (capital letters don't matter).</p>
+                <p class="field-error" data-error-for="name" hidden></p>
+            </div>
+            <div class="form-field">
+                <label for="player-phone">Phone <span class="optional">(optional)</span></label>
+                <input type="tel" id="player-phone" name="phone" class="input" maxlength="20" placeholder="0300-1234567" autocomplete="off">
+                <p class="field-error" data-error-for="phone" hidden></p>
+            </div>
+            <div class="form-field">
+                <label for="player-notes">Notes <span class="optional">(optional)</span></label>
+                <input type="text" id="player-notes" name="notes" class="input" maxlength="200">
+                <p class="field-error" data-error-for="notes" hidden></p>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" id="player-cancel">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="player-save">Save Player</button>
+            </div>
+        </form>
+    </dialog>
+
+    <!-- ===== Player details & history (Phase 11.6, filled in by players.js) ===== -->
+    <dialog class="modal modal-wide player-profile-dialog" id="player-profile-dialog" aria-labelledby="player-profile-title">
+        <div class="modal-content" id="player-profile"></div>
+    </dialog>
+
+    <script src="/js/core/api.js"></script>
+    <script src="/js/core/ui.js"></script>
+    <script src="/js/core/format.js"></script>
+    <script src="/js/core/layout.js"></script>
+    <script src="/js/pages/players.js"></script>
+</body>
+</html>

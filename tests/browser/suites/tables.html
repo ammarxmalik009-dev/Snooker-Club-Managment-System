@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>tables UI harness</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1280" height="900"></iframe>
+<script>
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+
+function loadPage(url, width = 1280) {
+  frame.width = width;
+  return new Promise((resolve) => { frame.onload = () => resolve(frame.contentWindow); frame.src = url; });
+}
+async function waitFor(check, timeout = 4000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+
+(async () => {
+  try {
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
+    { const r = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: "ui-admin", password: "Ui-test-pass-123" }) }); if (r.status !== 200) throw new Error("harness login failed: " + r.status); }
+    let w = await loadPage("/pages/tables.html");
+    let d = w.document;
+    const $ = (id) => d.getElementById(id);
+    const cards = () => [...d.querySelectorAll("#tables-grid .table-card")];
+    const card = (n) => cards().find((c) => c.querySelector(".table-number").textContent === String(n));
+    const count = (key) => d.querySelector(`[data-count="${key}"]`).textContent;
+    // Record every toast the moment it appears (they disappear after a few seconds)
+    const seenToasts = [];
+    new w.MutationObserver((mutations) => {
+      for (const m of mutations) for (const node of m.addedNodes) {
+        if (node.classList?.contains("toast")) seenToasts.push(node.querySelector(".toast-message").textContent);
+      }
+    }).observe(d.body, { childList: true, subtree: true });
+    const toastText = () => seenToasts;
+
+    // Record every API call the page makes (method, url, status)
+    const requests = [];
+    const realFetch = w.fetch.bind(w);
+    w.fetch = async (url, options = {}) => {
+      const entry = { method: options.method || "GET", url: String(url), status: "pending" };
+      requests.push(entry);
+      try { const r = await realFetch(url, options); entry.status = r.status; return r; }
+      catch (e) { entry.status = "error " + e.message; throw e; }
+    };
+    window.__requests = requests;
+    window.__events = [];
+    const fieldError = (f) => { const e = d.querySelector(`[data-error-for="${f}"]`); return e.hidden ? "" : e.textContent; };
+    const fill = (values) => { for (const [k, v] of Object.entries(values)) d.getElementById("table-form").elements[k].value = v; };
+    const submit = () => $("save-button").click();
+    const clickChip = (status) => d.querySelector(`.chip[data-status="${status}"]`).click();
+
+    // 1. Empty state on a fresh database
+    await waitFor(() => !$("tables-empty").hidden);
+    ok("empty state shown", !$("tables-empty").hidden && $("empty-title").textContent === "No tables yet");
+    ok("sidebar: Tables active link", d.querySelector('.nav-link.active')?.textContent.includes("Tables"));
+
+    // 2. Client-side validation (no request sent)
+    $("add-table-button").click(); await sleep(150);
+    ok("dialog opens", $("table-dialog").open && $("dialog-title").textContent === "Add Table");
+    submit(); await sleep(150);
+    ok("required errors shown", fieldError("tableNumber") === "Table number is required" && fieldError("hourlyRate") === "Hourly rate is required",
+       [fieldError("tableNumber"), fieldError("hourlyRate")]);
+    fill({ tableNumber: "1", hourlyRate: "6.005" }); submit(); await sleep(150);
+    ok("bad money input rejected", fieldError("hourlyRate") === "Enter an amount like 600 or 600.50", fieldError("hourlyRate"));
+
+    // 3. Valid add
+    fill({ tableNumber: "1", name: "VIP Table", hourlyRate: "600.5", status: "available" }); submit();
+    await waitFor(() => card(1));
+    ok("dialog closes after save", !$("table-dialog").open);
+    ok("toast 'Table 1 added'", toastText().includes("Table 1 added"), toastText());
+    ok("card shows name + Rs 600.50 / hour + Available",
+       card(1)?.querySelector(".table-card-name").textContent === "VIP Table" &&
+       card(1)?.querySelector(".table-card-rate").textContent === "Rs 600.50 / hour" &&
+       card(1)?.querySelector(".status-badge").textContent === "Available");
+    await waitFor(() => count("total") === "1");
+    ok("chip count All = 1", count("total") === "1");
+
+    // 4. Duplicate number -> server error under the field, dialog stays open
+    $("add-table-button").click(); await sleep(150);
+    fill({ tableNumber: "1", hourlyRate: "500" }); submit();
+    await waitFor(() => fieldError("tableNumber"));
+    ok("server 409 shown under field", fieldError("tableNumber") === "Table number 1 already exists" && $("table-dialog").open, fieldError("tableNumber"));
+    $("cancel-button").click(); await sleep(100);
+    ok("cancel closes dialog", !$("table-dialog").open);
+
+    // 5. More tables
+    for (const t of [{ tableNumber: "2", name: "Corner", hourlyRate: "500", status: "available" },
+                     { tableNumber: "3", name: "", hourlyRate: "1,200.75", status: "maintenance" }]) {
+      $("add-table-button").click(); await sleep(100); fill(t); submit();
+      await waitFor(() => card(Number(t.tableNumber)));
+    }
+    // Phase 4: a table becomes occupied by starting a session on it
+    [...card(2).querySelectorAll("button")].find((b) => b.textContent.includes("Start Session")).click();
+    await waitFor(() => card(2)?.dataset.status === "occupied");
+    ok("3 cards sorted 1,2,3", cards().map((c) => c.querySelector(".table-number").textContent).join(",") === "1,2,3");
+    ok("unnamed table shows 'Table 3'", card(3)?.querySelector(".table-card-name").textContent === "Table 3");
+    ok("Rs 1,200.75 formatting", card(3)?.querySelector(".table-card-rate").textContent === "Rs 1,200.75 / hour");
+    ok("occupied badge text", card(2)?.querySelector(".status-badge").textContent === "Occupied");
+    await waitFor(() => count("total") === "3");
+    ok("chip counts 3/1/1/0/1", [count("total"), count("available"), count("occupied"), count("reserved"), count("maintenance")].join("/") === "3/1/1/0/1");
+
+    // 6. Edit
+    card(1).querySelector(".table-card-actions .btn").click(); await sleep(150);
+    ok("edit prefilled", $("dialog-title").textContent === "Edit Table 1" && $("field-hourlyRate").value === "600.50" && $("field-name").value === "VIP Table",
+       [$("field-hourlyRate").value, $("field-name").value]);
+    fill({ name: "VIP Gold", hourlyRate: "650" }); submit();
+    await waitFor(() => card(1)?.querySelector(".table-card-name").textContent === "VIP Gold");
+    ok("edit saved", card(1)?.querySelector(".table-card-rate").textContent === "Rs 650.00 / hour");
+    ok("toast 'Table 1 updated'", toastText().includes("Table 1 updated"));
+
+    // 7. Filter & search (server-side)
+    clickChip("occupied"); await waitFor(() => cards().length === 1);
+    ok("filter Occupied -> table 2 only", cards().length === 1 && card(2));
+    ok("chip pressed state", d.querySelector('.chip[data-status="occupied"]').getAttribute("aria-pressed") === "true");
+    clickChip("reserved"); await waitFor(() => !$("tables-empty").hidden);
+    ok("filter with no results -> 'No matching tables'", $("empty-title").textContent === "No matching tables" && $("empty-add-button").hidden);
+    clickChip(""); await waitFor(() => cards().length === 3);
+    $("search-input").value = "gold"; $("search-input").dispatchEvent(new Event("input"));
+    await waitFor(() => cards().length === 1);
+    ok("search 'gold' -> table 1", cards().length === 1 && card(1));
+    $("search-input").value = "3"; $("search-input").dispatchEvent(new Event("input"));
+    await waitFor(() => cards().length === 1 && card(3));
+    ok("search '3' -> table 3", cards().length === 1 && card(3));
+    $("search-input").value = ""; $("search-input").dispatchEvent(new Event("input"));
+    await waitFor(() => cards().length === 3);
+
+    // 8. Delete occupied -> confirm dialog -> 409 toast, card stays
+    card(2).querySelector(".is-danger").click();
+    const confirmBox = await waitFor(() => d.querySelector("dialog.modal-small[open]"));
+    ok("custom confirm dialog shown", confirmBox && confirmBox.querySelector(".modal-title").textContent === "Delete Table 2?");
+    ok("cancel is focused by default", d.activeElement?.textContent === "Cancel");
+    confirmBox.addEventListener("close", () => window.__events.push("confirm closed: rv=" + confirmBox.returnValue));
+    confirmBox.querySelector(".btn-danger").click();
+    window.__events.push("clicked danger; open now=" + confirmBox.open + " inDom=" + confirmBox.isConnected);
+    await waitFor(() => toastText().some((t) => t.includes("occupied")));
+    window.__events.push("after wait; open=" + confirmBox.open + " inDom=" + confirmBox.isConnected + " deleteReqs=" + JSON.stringify(requests.filter((r) => r.method === "DELETE")));
+    ok("409 shown as error toast", toastText().includes("Table 2 is currently occupied. Free the table before deleting it."), toastText());
+    ok("occupied table still listed", !!card(2));
+    ok("delete button restored (icon + text)", card(2).querySelector(".is-danger svg") && card(2).querySelector(".is-danger").textContent === "Delete");
+
+    // 9. Delete: cancel first, then confirm
+    card(3).querySelector(".is-danger").click();
+    let box = await waitFor(() => d.querySelector("dialog.modal-small[open]"));
+    box.querySelector(".btn-secondary").click();
+    await waitFor(() => !d.querySelector("dialog.modal-small"));
+    const leftover = [...d.querySelectorAll("dialog.modal-small")].map((x) => ({ open: x.open, title: x.querySelector(".modal-title").textContent, rv: x.returnValue }));
+    ok("cancel keeps table 3", !!card(3) && leftover.length === 0, { cardStillThere: !!card(3), leftover });
+    card(3).querySelector(".is-danger").click();
+    box = await waitFor(() => d.querySelector("dialog.modal-small[open]"));
+    box.querySelector(".btn-danger").click();
+    await waitFor(() => !card(3));
+    ok("table 3 deleted", !card(3) && toastText().includes("Table 3 deleted"));
+    await waitFor(() => count("total") === "2");
+    ok("counts updated after delete", count("total") === "2" && count("maintenance") === "0");
+    ok("no localStorage used", w.localStorage.length === 0);
+
+    // 10. Dashboard shows real counts
+    w = await loadPage("/pages/dashboard.html"); d = w.document;
+    await waitFor(() => d.querySelector('[data-value="tables.total"]').textContent !== "—");
+    ok("dashboard total/available/occupied = 2/1/1",
+       ['[data-value="tables.total"]', '[data-value="tables.available"]', '[data-value="tables.occupied"]'].map((id) => d.querySelector(id).textContent).join("/") === "2/1/1",
+       ['[data-value="tables.total"]', '[data-value="tables.available"]', '[data-value="tables.occupied"]'].map((id) => d.querySelector(id).textContent));
+    ok("dashboard Tables link is clickable", !!d.querySelector('a.nav-link[href="/pages/tables.html"]'));
+    ok("status pill online", d.getElementById("server-status").classList.contains("is-online"));
+
+    // 11. Responsive: no sideways scrolling
+    for (const width of [375, 820]) {
+      w = await loadPage("/pages/tables.html", width); d = w.document;
+      await waitFor(() => d.querySelectorAll(".table-card").length === 2);
+      const el = d.documentElement;
+      ok(`tables page ${width}px: no horizontal overflow`, el.scrollWidth <= el.clientWidth, [el.scrollWidth, el.clientWidth]);
+      d.querySelector("#add-table-button").click(); await sleep(150);
+      const dlg = d.getElementById("table-dialog").getBoundingClientRect();
+      ok(`dialog fits at ${width}px`, dlg.left >= 0 && dlg.right <= el.clientWidth, [dlg.left, dlg.right]);
+    }
+  } catch (error) {
+    ok("harness crashed: " + error.message, false);
+  }
+  log.push("--- events ---", ...(window.__events || []));
+  log.push("--- non-GET requests ---", ...(window.__requests || []).filter((r) => r.method !== "GET").map((r) => `${r.method} ${r.url} -> ${r.status}`));
+  document.getElementById("out").textContent = log.join("\n");
+})();
+</script>
+</body></html>

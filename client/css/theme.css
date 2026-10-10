@@ -1,0 +1,106 @@
+/* =========================================================
+   theme.css - colours, fonts and sizes used everywhere.
+   Change a value here and the whole app changes with it.
+   ========================================================= */
+
+:root {
+    color-scheme: dark;
+
+    /* Backgrounds: black -> charcoal */
+    --color-bg: #070908;
+    --color-surface: #111513;
+    --color-surface-raised: #171c19;
+    --color-surface-hover: #1d2420;
+    --color-border: #232b27;
+    --color-border-strong: #2f3a35;
+
+    /* Text */
+    --color-text: #e8ecea;
+    --color-text-muted: #94a09a;
+    --color-text-faint: #6b7670;
+
+    /* Emerald green accent */
+    --color-primary: #10b981;
+    --color-primary-strong: #34d399;
+    --color-primary-soft: rgba(16, 185, 129, 0.12);
+    --color-primary-border: rgba(52, 211, 153, 0.35);
+
+    /* Status colours */
+    --color-success: #34d399;
+    --color-warning: #fbbf24;
+    --color-warning-soft: rgba(251, 191, 36, 0.12);
+    --color-danger: #f87171;
+    --color-danger-soft: rgba(248, 113, 113, 0.12);
+    --color-info: #60a5fa;
+    --color-info-soft: rgba(96, 165, 250, 0.12);
+
+    /* Font: built into every computer, so it works offline */
+    --font-sans: "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+
+    /* Sizes */
+    --radius-sm: 6px;
+    --radius: 10px;
+    --radius-lg: 14px;
+    --sidebar-width: 248px;
+    --topbar-height: 64px;
+    --shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    --transition: 160ms ease;
+}
+
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+html {
+    -webkit-text-size-adjust: 100%;
+}
+
+body {
+    margin: 0;
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.5;
+    color: var(--color-text);
+    background: var(--color-bg);
+}
+
+h1, h2, h3 {
+    margin: 0;
+    line-height: 1.25;
+    font-weight: 600;
+}
+
+a {
+    color: var(--color-primary-strong);
+}
+
+button {
+    font: inherit;
+}
+
+/* Visible keyboard focus everywhere */
+:focus-visible {
+    outline: 2px solid var(--color-primary-strong);
+    outline-offset: 2px;
+}
+
+/* Text only for screen readers */
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        transition: none !important;
+        animation: none !important;
+    }
+}

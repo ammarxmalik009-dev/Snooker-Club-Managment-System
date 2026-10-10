@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#070908">
+    <title>Dashboard · Snooker Club Pro</title>
+    <link rel="stylesheet" href="/css/theme.css">
+    <link rel="stylesheet" href="/css/layout.css">
+    <link rel="stylesheet" href="/css/components.css">
+</head>
+<body data-page="dashboard">
+
+    <!-- ===== Sidebar (menu items are added by js/core/layout.js) ===== -->
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+        <a href="/pages/dashboard.html" class="sidebar-brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <span>Snooker Club Pro</span>
+        </a>
+        <nav class="sidebar-nav" id="sidebar-nav"></nav>
+        <div class="sidebar-footer" id="sidebar-footer"></div>
+    </aside>
+    <div class="sidebar-overlay" id="sidebar-overlay" hidden></div>
+
+    <div class="app-main">
+        <!-- ===== Top bar ===== -->
+        <header class="topbar">
+            <button type="button" class="menu-button" id="menu-button"
+                    aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">
+                <span data-icon="menu"></span>
+            </button>
+            <h1 class="topbar-title">Dashboard</h1>
+
+            <div class="topbar-right">
+                <span class="topbar-date" id="topbar-date"></span>
+                <!-- Filled in by layout.js after calling GET /api/health -->
+                <span class="status-pill" id="server-status" role="status">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span class="status-text">Checking…</span>
+                </span>
+            </div>
+        </header>
+
+        <!-- ===== Page content ===== -->
+        <main class="page-content dashboard-page">
+            <div class="page-header">
+                <div>
+                    <p class="page-intro" id="business-day">Club overview</p>
+                    <p class="field-hint" id="last-updated" aria-live="polite"></p>
+                </div>
+                <button type="button" class="btn btn-secondary btn-small" id="refresh-button">
+                    <span data-icon="history"></span> Refresh
+                </button>
+            </div>
+
+            <!-- Shown when the dashboard data can't be loaded or refreshed -->
+            <div class="alert alert-error" id="dashboard-error" role="alert" hidden>
+                <span id="dashboard-error-text"></span>
+                <button type="button" class="btn btn-secondary btn-small" id="retry-button">Try again</button>
+            </div>
+
+            <!-- ===== Quick actions (every link goes to a working page) ===== -->
+            <nav class="quick-actions" aria-label="Quick actions">
+                <a class="quick-action" href="/pages/tables.html?action=add" data-permission="tables:manage"><span data-icon="plus"></span> Add Table</a>
+                <a class="quick-action" href="/pages/tables.html?status=available"><span data-icon="start"></span> Start Session</a>
+                <a class="quick-action" href="/pages/sessions.html"><span data-icon="timer"></span> Active Sessions</a>
+                <a class="quick-action" href="/pages/bookings.html?action=new"><span data-icon="calendar"></span> New Booking</a>
+                <a class="quick-action" href="/pages/billing.html?status=open" data-permission="payments:record"><span data-icon="money"></span> Collect Payments</a>
+                <a class="quick-action" href="/pages/billing.html"><span data-icon="receipt"></span> Bill History</a>
+                <a class="quick-action" href="/pages/reports.html" data-permission="reports:view"><span data-icon="chart"></span> View Reports</a>
+                <a class="quick-action" href="/pages/settings.html" data-permission="settings:manage"><span data-icon="settings"></span> Settings</a>
+                <a class="quick-action" href="/pages/users.html" data-permission="users:manage"><span data-icon="user"></span> Users</a>
+            </nav>
+
+            <!-- ===== Tables & play ===== -->
+            <h2 class="section-heading">Tables &amp; play</h2>
+            <section class="stat-grid stat-grid-6" aria-label="Tables and play">
+                <article class="stat-card">
+                    <div class="stat-card-header"><h3 class="stat-label">Total Tables</h3><span class="stat-icon" data-icon="table"></span></div>
+                    <p class="stat-value" data-value="tables.total">—</p>
+                </article>
+                <article class="stat-card">
+                    <div class="stat-card-header"><h3 class="stat-label">Available</h3><span class="stat-icon" data-icon="check"></span></div>
+                    <p class="stat-value" data-value="tables.available">—</p>
+                </article>
+                <article class="stat-card">
+                    <div class="stat-card-header"><h3 class="stat-label">Occupied</h3><span class="stat-icon tone-danger" data-icon="play"></span></div>
+                    <p class="stat-value" data-value="tables.occupied">—</p>
+                </article>
+                <article class="stat-card">
+                    <div class="stat-card-header"><h3 class="stat-label">Reserved</h3><span class="stat-icon tone-warning" data-icon="calendar"></span></div>
+                    <p class="stat-value" data-value="tables.reserved">—</p>
+                </article>
+                <article class="stat-card">
+                    <div class="stat-card-header"><h3 class="stat-label">Maintenance</h3><span class="stat-icon tone-info" data-icon="settings"></span></div>
+                    <p class="stat-value" data-value="tables.maintenance">—</p>
+                </article>
+                <article class="stat-card">
+                    <div class="stat-card-header"><h3 class="stat-label">Active Sessions</h3><span class="stat-icon tone-danger" data-icon="timer"></span></div>
+                    <p class="stat-value" data-value="activeSessionCount">—</p>
+                </article>
+            </section>
+
+            <!-- ===== Today's business ===== -->
+            <h2 class="section-heading">Today's business</h2>
+            <section class="stat-grid" aria-label="Today's business">
+                <article class="stat-card">
+                    <div class="stat-card-header"><h3 class="stat-label">Today's Bookings</h3><span class="stat-icon tone-info" data-icon="calendar"></span></div>
+                    <p class="stat-value" data-value="today.bookingCount">—</p>
+                    <p class="stat-hint">Booked for today, cancelled not counted</p>
+                </article>
+                <article class="stat-card">
+                    <div class="stat-card-header"><h3 class="stat-label">Today's Bills</h3><span class="stat-icon" data-icon="receipt"></span></div>
+                    <p class="stat-value" data-value="today.billCount">—</p>
+                    <p class="stat-hint" data-hint="bills">&nbsp;</p>
+                </article>
+                <article class="stat-card">
+                    <div class="stat-card-header"><h3 class="stat-label">Today's Revenue</h3><span class="stat-icon tone-warning" data-icon="money"></span></div>
+                    <p class="stat-value" data-value="today.totalBilled" data-format="money">—</p>
+                    <p class="stat-hint">Total billed, cancelled bills not counted</p>
+                </article>
+                <article class="stat-card">
+                    <div class="stat-card-header"><h3 class="stat-label">Paid</h3><span class="stat-icon" data-icon="check"></span></div>
+                    <p class="stat-value" data-value="today.totalPaid" data-format="money">—</p>
+                    <p class="stat-hint">Paid on today's bills</p>
+                </article>
+                <article class="stat-card">
+                    <div class="stat-card-header"><h3 class="stat-label">Outstanding</h3><span class="stat-icon tone-danger" data-icon="history"></span></div>
+                    <p class="stat-value" data-value="today.totalOutstanding" data-format="money">—</p>
+                    <p class="stat-hint">Still to collect on today's bills</p>
+                </article>
+            </section>
+
+            <div class="dashboard-columns">
+                <!-- ===== Today's revenue details ===== -->
+                <article class="panel">
+                    <header class="panel-header">
+                        <h2 class="panel-title">Today's revenue</h2>
+                        <a class="btn btn-ghost btn-small" href="/pages/billing.html" id="today-bills-link">Today's bills</a>
+                    </header>
+                    <div class="panel-body panel-body-list" id="revenue-panel">
+                        <div class="empty-state"><span class="spinner" aria-hidden="true"></span><p>Loading…</p></div>
+                    </div>
+                </article>
+
+                <!-- ===== Active sessions (existing live timers) ===== -->
+                <article class="panel">
+                    <header class="panel-header">
+                        <h2 class="panel-title">Active sessions</h2>
+                        <a class="btn btn-ghost btn-small" href="/pages/sessions.html">Manage</a>
+                    </header>
+                    <div class="panel-body panel-body-list" id="active-sessions">
+                        <div class="empty-state"><span class="spinner" aria-hidden="true"></span><p>Loading…</p></div>
+                    </div>
+                </article>
+            </div>
+
+            <!-- ===== Table status overview ===== -->
+            <article class="panel panel-wide">
+                <header class="panel-header">
+                    <h2 class="panel-title">Table status</h2>
+                    <ul class="legend" aria-label="Status colours">
+                        <li><span class="legend-dot status-available"></span>Available</li>
+                        <li><span class="legend-dot status-occupied"></span>Occupied</li>
+                        <li><span class="legend-dot status-reserved"></span>Reserved</li>
+                        <li><span class="legend-dot status-maintenance"></span>Maintenance</li>
+                    </ul>
+                </header>
+                <div class="panel-body panel-body-list" id="table-overview">
+                    <div class="empty-state"><span class="spinner" aria-hidden="true"></span><p>Loading…</p></div>
+                </div>
+            </article>
+
+            <!-- ===== Upcoming bookings (Phase 7) ===== -->
+            <article class="panel panel-wide">
+                <header class="panel-header">
+                    <h2 class="panel-title">Upcoming bookings today</h2>
+                    <a class="btn btn-ghost btn-small" href="/pages/bookings.html">All bookings</a>
+                </header>
+                <div class="panel-body panel-body-list" id="upcoming-bookings">
+                    <div class="empty-state"><span class="spinner" aria-hidden="true"></span><p>Loading…</p></div>
+                </div>
+            </article>
+
+            <!-- ===== Recent bills ===== -->
+            <article class="panel panel-wide">
+                <header class="panel-header">
+                    <h2 class="panel-title">Recent bills</h2>
+                    <a class="btn btn-ghost btn-small" href="/pages/billing.html">All bills</a>
+                </header>
+                <div id="recent-bills">
+                    <div class="empty-state panel-empty"><span class="spinner" aria-hidden="true"></span><p>Loading…</p></div>
+                </div>
+            </article>
+
+            <!-- ===== Recent sessions ===== -->
+            <article class="panel panel-wide">
+                <header class="panel-header">
+                    <h2 class="panel-title">Recent sessions</h2>
+                    <a class="btn btn-ghost btn-small" href="/pages/sessions.html">Session history</a>
+                </header>
+                <div id="recent-sessions">
+                    <div class="empty-state panel-empty"><span class="spinner" aria-hidden="true"></span><p>Loading…</p></div>
+                </div>
+            </article>
+        </main>
+    </div>
+
+    <!-- Order matters: api.js and ui.js are used by layout.js -->
+    <script src="/js/core/api.js"></script>
+    <script src="/js/core/ui.js"></script>
+    <script src="/js/core/format.js"></script>
+    <script src="/js/core/sessions.js"></script>
+    <script src="/js/core/cafe.js"></script>
+    <script src="/js/core/matches.js"></script>
+    <script src="/js/core/billing.js"></script>
+    <script src="/js/core/layout.js"></script>
+    <script src="/js/pages/dashboard.js"></script>
+</body>
+</html>

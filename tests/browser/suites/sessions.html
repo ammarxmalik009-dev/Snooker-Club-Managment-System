@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>sessions UI harness</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1280" height="900"></iframe>
+<script>
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+let seenToasts = [];
+
+function loadPage(url, width = 1280) {
+  frame.width = width;
+  return new Promise((resolve) => {
+    frame.onload = () => {
+      const w = frame.contentWindow;
+      // record every toast as it appears
+      new w.MutationObserver((ms) => { for (const m of ms) for (const n of m.addedNodes)
+        if (n.classList?.contains("toast")) seenToasts.push(n.querySelector(".toast-message").textContent); })
+        .observe(w.document.body, { childList: true, subtree: true });
+      resolve(w);
+    };
+    frame.src = url;
+  });
+}
+async function waitFor(check, timeout = 5000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+const api = async (method, path, body) => {
+  const r = await fetch("/api" + path, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json() };
+};
+const toSeconds = (hhmmss) => { const [h, m, s] = hhmmss.split(":").map(Number); return h * 3600 + m * 60 + s; };
+const buttonWithText = (root, text) => [...root.querySelectorAll("button")].find((b) => b.textContent.includes(text));
+// Phase 5: ending a session opens the Create Bill dialog - this test chooses "Bill later"
+async function billLater(d) {
+  const dialog = await waitFor(() => d.querySelector("dialog.bill-dialog[open]"));
+  if (dialog) buttonWithText(dialog, "Bill later").click();
+  return Boolean(dialog);
+}
+async function confirmTopDialog(d, accept = true) {
+  const box = await waitFor(() => d.querySelector("dialog.modal-small[open]"));
+  const text = box?.querySelector(".modal-text").textContent;
+  box?.querySelector(accept ? ".btn-danger" : ".btn-secondary").click();
+  return text;
+}
+// Server's view of how long the session on a table has run
+async function serverElapsed(tableNumber) {
+  const { body } = await api("GET", "/sessions/active");
+  const s = body.data.sessions.find((x) => x.tableNumber === tableNumber);
+  return Math.floor((Date.parse(body.data.serverTime) - Date.parse(s.startedAt)) / 1000);
+}
+
+(async () => {
+  try {
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
+    { const r = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: "ui-admin", password: "Ui-test-pass-123" }) }); if (r.status !== 200) throw new Error("harness login failed: " + r.status); }
+    for (const t of [{ tableNumber: 1, name: "VIP", hourlyRate: 80000 }, { tableNumber: 2, hourlyRate: 50000, status: "reserved" },
+                     { tableNumber: 3, hourlyRate: 50000, status: "maintenance" }, { tableNumber: 4, name: "Corner", hourlyRate: 50000 }]) {
+      await api("POST", "/tables", t);
+    }
+
+    // ===== A. Tables page: start a session =====
+    let w = await loadPage("/pages/tables.html"); let d = w.document;
+    const card = (n) => [...d.querySelectorAll(".table-card")].find((c) => c.querySelector(".table-number").textContent === String(n));
+    await waitFor(() => card(4));
+    ok("available tables show 'Start Session'", buttonWithText(card(1), "Start Session") && buttonWithText(card(4), "Start Session"));
+    ok("reserved/maintenance: no Start button + explanation",
+       !buttonWithText(card(2), "Start Session") && !buttonWithText(card(3), "Start Session") &&
+       card(2).querySelector(".session-note")?.textContent.includes("reserved") &&
+       card(3).querySelector(".session-note")?.textContent.includes("under maintenance"));
+
+    buttonWithText(card(1), "Start Session").click();
+    await waitFor(() => card(1)?.dataset.status === "occupied");
+    ok("toast 'Session started on Table 1'", seenToasts.includes("Session started on Table 1"), seenToasts);
+    ok("card 1 now Occupied with timer + End Session",
+       card(1).querySelector(".status-badge").textContent === "Occupied" && card(1).querySelector("[data-timer-start]") && buttonWithText(card(1), "End Session"));
+    ok("occupied chip count = 1", d.querySelector('[data-count="occupied"]').textContent === "1");
+
+    const t0 = card(1).querySelector("[data-timer-start]").textContent;
+    await sleep(2200);
+    const t1 = card(1).querySelector("[data-timer-start]").textContent;
+    ok("timer ticks without refresh (HH:MM:SS)", /^\d{2}:\d{2}:\d{2}$/.test(t1) && toSeconds(t1) > toSeconds(t0), [t0, t1]);
+
+    const dup = await api("POST", "/sessions", { tableId: card(1).dataset.id });
+    ok("second start on same table refused (409)", dup.status === 409 && dup.body.message === "Table 1 is already occupied. A session can only start on an available table.", dup);
+    const reserved = await api("POST", "/sessions", { tableId: card(2).dataset.id });
+    ok("start on reserved table refused (409)", reserved.status === 409, reserved);
+
+    buttonWithText(card(1), "Edit").click(); await sleep(150);
+    ok("edit: status locked while session runs", d.getElementById("field-status").disabled && !d.getElementById("status-hint").hidden);
+    d.getElementById("field-name").value = "VIP Gold";
+    d.getElementById("save-button").click();
+    await waitFor(() => card(1)?.querySelector(".table-card-name").textContent === "VIP Gold");
+    ok("edit name during session works, session keeps running", card(1).dataset.status === "occupied" && card(1).querySelector("[data-timer-start]"));
+
+    // ===== B. Timer accuracy after refresh =====
+    await fetch("/_backdate/1/3723"); // pretend it started 1h 02m 03s ago
+    w = await loadPage("/pages/tables.html"); d = w.document;
+    await waitFor(() => card(1)?.querySelector("[data-timer-start]"));
+    await sleep(1200);
+    const shown = toSeconds(card(1).querySelector("[data-timer-start]").textContent);
+    const truth = await serverElapsed(1);
+    ok(`after refresh timer continues from saved start (shown ${shown}s vs server ${truth}s)`, shown >= 3723 && Math.abs(shown - truth) <= 3, [shown, truth]);
+
+    // ===== C. Dashboard: active sessions =====
+    w = await loadPage("/pages/dashboard.html"); d = w.document;
+    await waitFor(() => d.querySelector(".session-row"));
+    const row = d.querySelector(".session-row");
+    ok("dashboard: Active Sessions card = 1", d.querySelector('[data-value="activeSessionCount"]').textContent === "1");
+    ok("dashboard: occupied card = 1", d.querySelector('[data-value="tables.occupied"]').textContent === "1");
+    ok("row shows table number, name, start time, status",
+       row.querySelector(".table-number").textContent === "1" && row.querySelector(".session-row-name").textContent === "VIP" &&
+       /^Started \d{1,2}:\d{2} (am|pm)$/.test(row.querySelector(".session-row-meta").textContent) && row.querySelector(".status-badge").textContent === "Active",
+       [row.querySelector(".session-row-name").textContent, row.querySelector(".session-row-meta").textContent]);
+    ok("row shows name from session start ('VIP', not renamed 'VIP Gold')", row.querySelector(".session-row-name").textContent === "VIP");
+    const dashTimer = toSeconds(row.querySelector("[data-timer-start]").textContent);
+    ok("dashboard timer ≈ 1h 02m", dashTimer >= 3723 && dashTimer < 3740, dashTimer);
+
+    // ===== D. End from dashboard (cancel first, then confirm) =====
+    buttonWithText(row, "End").click();
+    await confirmTopDialog(d, false);
+    await sleep(200);
+    ok("cancel keeps session running", d.querySelector(".session-row") && d.querySelector('[data-value="activeSessionCount"]').textContent === "1");
+    buttonWithText(d.querySelector(".session-row"), "End").click();
+    const askText = await confirmTopDialog(d, true);
+    ok("confirm text mentions play time", /has been playing for 1h 02m/.test(askText || ""), askText);
+    ok("Phase 5: bill dialog opens after ending (closed with 'Bill later')", await billLater(d));
+    await waitFor(() => !d.querySelector(".session-row"));
+    ok("toast 'Session on Table 1 ended · 1h 02m …'", seenToasts.some((t) => /^Session on Table 1 ended · 1h 02m \d{2}s$/.test(t)), seenToasts);
+    await waitFor(() => d.querySelector('[data-value="activeSessionCount"]').textContent === "0");
+    ok("dashboard: 0 active, empty state shown", d.querySelector('[data-value="activeSessionCount"]').textContent === "0" &&
+       d.querySelector("#active-sessions .empty-state-title")?.textContent === "No active sessions");
+    ok("dashboard: table available again (available = 2)", d.querySelector('[data-value="tables.available"]').textContent === "2");
+
+    // ===== E. Start + end on the Tables page =====
+    w = await loadPage("/pages/tables.html"); d = w.document;
+    await waitFor(() => card(4));
+    ok("table 1 available again with Start button", card(1).dataset.status === "available" && buttonWithText(card(1), "Start Session"));
+    buttonWithText(card(4), "Start Session").click();
+    await waitFor(() => buttonWithText(card(4), "End Session"));
+    await fetch("/_backdate/4/125");
+    buttonWithText(card(4), "End Session").click();
+    await confirmTopDialog(d, true);
+    await billLater(d);
+    await waitFor(() => card(4)?.dataset.status === "available");
+    ok("end from table card -> available + Start button back", card(4).dataset.status === "available" && buttonWithText(card(4), "Start Session"));
+
+    // ===== F. Sessions page: history & filters =====
+    w = await loadPage("/pages/sessions.html"); d = w.document;
+    const rows = () => [...d.querySelectorAll("#history-body tr")];
+    await waitFor(() => rows().length === 2);
+    ok("sidebar: Sessions link active", d.querySelector(".nav-link.active")?.textContent.includes("Sessions"));
+    ok("active list empty", d.getElementById("active-count").textContent === "0");
+    ok("history: 2 finished sessions, newest first", rows().length === 2 && rows()[0].querySelector(".table-number").textContent === "4",
+       rows().map((r) => r.textContent));
+    const cells = rows()[1].querySelectorAll("td");
+    ok("history row: table, start, end, duration",
+       cells[0].textContent.includes("VIP") && /\d{4}, \d{1,2}:\d{2} (am|pm)$/.test(cells[1].textContent) &&
+       /\d{4}, \d{1,2}:\d{2} (am|pm)$/.test(cells[2].textContent) && /^1h 02m \d{2}s$/.test(cells[3].textContent),
+       [...cells].map((c) => c.textContent));
+    ok("history duration for table 4 ≈ 2m 05s", /^2m 0[5-7]s$/.test(rows()[0].querySelectorAll("td")[3].textContent), rows()[0].querySelectorAll("td")[3].textContent);
+    ok("summary '2 sessions'", d.getElementById("history-summary").textContent === "2 sessions");
+
+    d.getElementById("filter-today").click();
+    await sleep(300); await waitFor(() => rows().length === 2 && !d.getElementById("history-wrapper").hidden);
+    ok("'Today' filter keeps both", rows().length === 2);
+
+    const fromInput = d.getElementById("filter-from"), toInput = d.getElementById("filter-to");
+    fromInput.value = "2026-09-01"; toInput.value = "2026-09-02"; toInput.dispatchEvent(new Event("change", { bubbles: true }));
+    await waitFor(() => !d.getElementById("history-empty").hidden);
+    ok("old date range -> 'No matching sessions'", d.getElementById("history-empty-title").textContent === "No matching sessions");
+
+    fromInput.value = "2026-10-05"; toInput.value = "2026-10-01"; toInput.dispatchEvent(new Event("change", { bubbles: true }));
+    await sleep(200);
+    ok("To before From -> clear error", !d.getElementById("filter-error").hidden && d.getElementById("filter-error").textContent.includes("cannot be before"));
+
+    d.getElementById("filter-clear").click();
+    await waitFor(() => rows().length === 2 && !d.getElementById("history-wrapper").hidden);
+    ok("Clear -> all sessions, error hidden", rows().length === 2 && d.getElementById("filter-error").hidden);
+
+    const search = d.getElementById("filter-search");
+    search.value = "vip"; search.dispatchEvent(new Event("input", { bubbles: true }));
+    await waitFor(() => rows().length === 1);
+    ok("search 'vip' -> 1 session", rows().length === 1 && rows()[0].textContent.includes("VIP"));
+    search.value = "4"; search.dispatchEvent(new Event("input", { bubbles: true }));
+    await waitFor(() => rows().length === 1 && rows()[0].querySelector(".table-number").textContent === "4");
+    ok("search '4' -> table 4", rows().length === 1 && rows()[0].querySelector(".table-number").textContent === "4");
+
+    // ===== G. Paging =====
+    await fetch("/_seed/25");
+    w = await loadPage("/pages/sessions.html"); d = w.document;
+    await waitFor(() => !d.getElementById("history-pagination").hidden);
+    ok("27 sessions -> 'Page 1 of 2', 20 rows", d.getElementById("page-info").textContent === "Page 1 of 2" && d.querySelectorAll("#history-body tr").length === 20);
+    ok("Previous disabled on page 1", d.getElementById("page-prev").disabled);
+    d.getElementById("page-next").click();
+    await waitFor(() => d.getElementById("page-info").textContent === "Page 2 of 2");
+    ok("Next -> page 2 with 7 rows", d.querySelectorAll("#history-body tr").length === 7 && d.getElementById("page-next").disabled);
+
+    // ===== H. Active row + responsive =====
+    await api("POST", "/sessions", { tableId: (await api("GET", "/tables?search=1")).body.data[0].id });
+    for (const [page, width] of [["sessions", 375], ["dashboard", 375], ["tables", 375], ["sessions", 820]]) {
+      w = await loadPage(`/pages/${page}.html`, width); d = w.document;
+      await waitFor(() => d.querySelector("[data-timer-start]"));
+      await sleep(300);
+      const el = d.documentElement;
+      ok(`${page} ${width}px: no horizontal overflow, timer visible`, el.scrollWidth <= el.clientWidth && d.querySelector("[data-timer-start]").getBoundingClientRect().width > 0,
+         [el.scrollWidth, el.clientWidth]);
+    }
+    ok("no localStorage used", w.localStorage.length === 0);
+  } catch (error) {
+    ok("harness crashed: " + error.message, false);
+  }
+  document.getElementById("out").textContent = log.join("\n");
+})();
+</script>
+</body></html>

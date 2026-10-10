@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#070908">
+    <title>Reports · Snooker Club Pro</title>
+    <link rel="stylesheet" href="/css/theme.css">
+    <link rel="stylesheet" href="/css/layout.css">
+    <link rel="stylesheet" href="/css/components.css">
+</head>
+<body data-page="reports" class="reports-body">
+
+    <!-- ===== Sidebar (menu items are added by js/core/layout.js) ===== -->
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+        <a href="/pages/dashboard.html" class="sidebar-brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <span>Snooker Club Pro</span>
+        </a>
+        <nav class="sidebar-nav" id="sidebar-nav"></nav>
+        <div class="sidebar-footer" id="sidebar-footer"></div>
+    </aside>
+    <div class="sidebar-overlay" id="sidebar-overlay" hidden></div>
+
+    <div class="app-main">
+        <header class="topbar">
+            <button type="button" class="menu-button" id="menu-button"
+                    aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">
+                <span data-icon="menu"></span>
+            </button>
+            <h1 class="topbar-title">Reports</h1>
+            <div class="topbar-right">
+                <span class="topbar-date" id="topbar-date"></span>
+                <span class="status-pill" id="server-status" role="status">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span class="status-text">Checking…</span>
+                </span>
+            </div>
+        </header>
+
+        <main class="page-content reports-page">
+            <!-- Only visible on paper: what was printed, for which period -->
+            <header class="print-header" id="print-header">
+                <h1>Snooker Club Pro · Report</h1>
+                <p id="print-range"></p>
+                <p id="print-meta"></p>
+            </header>
+
+            <!-- ===== Period & filters ===== -->
+            <section class="panel panel-wide report-controls" aria-label="Report period and filters">
+                <div class="report-controls-top">
+                    <div>
+                        <p class="report-range-label" id="range-label" aria-live="polite">Loading…</p>
+                        <p class="field-hint" id="range-hint">Club days in Karachi time (00:00–23:59). Every figure is calculated by the server.</p>
+                    </div>
+                    <button type="button" class="btn btn-secondary btn-small" id="print-all-button">
+                        <span data-icon="print"></span> Print report
+                    </button>
+                </div>
+
+                <div class="filter-chips preset-chips" id="preset-chips" role="group" aria-label="Period">
+                    <button type="button" class="chip" data-preset="today" aria-pressed="false">Today</button>
+                    <button type="button" class="chip" data-preset="yesterday" aria-pressed="false">Yesterday</button>
+                    <button type="button" class="chip" data-preset="last7" aria-pressed="false">Last 7 days</button>
+                    <button type="button" class="chip" data-preset="last30" aria-pressed="false">Last 30 days</button>
+                    <button type="button" class="chip" data-preset="thisMonth" aria-pressed="false">This month</button>
+                    <button type="button" class="chip" data-preset="prevMonth" aria-pressed="false">Previous month</button>
+                    <button type="button" class="chip" data-preset="custom" aria-pressed="false">Custom…</button>
+                </div>
+
+                <form class="custom-range" id="custom-range" hidden novalidate>
+                    <div class="form-field">
+                        <label for="range-from">From</label>
+                        <input type="date" id="range-from" class="input" required>
+                    </div>
+                    <div class="form-field">
+                        <label for="range-to">To</label>
+                        <input type="date" id="range-to" class="input" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary" id="custom-apply">Show</button>
+                    <p class="form-error custom-range-error" id="custom-error" role="alert" hidden></p>
+                </form>
+
+                <div class="report-filters" id="report-filters">
+                    <div class="form-field">
+                        <label for="filter-table">Table</label>
+                        <select id="filter-table" class="select" data-filter="tableId"><option value="">All tables</option></select>
+                    </div>
+                    <div class="form-field">
+                        <label for="filter-game">Game type</label>
+                        <select id="filter-game" class="select" data-filter="gameMode"><option value="">All game types</option></select>
+                    </div>
+                    <div class="form-field">
+                        <label for="filter-method">Payment method</label>
+                        <select id="filter-method" class="select" data-filter="method"><option value="">All methods</option></select>
+                    </div>
+                    <div class="form-field">
+                        <label for="filter-bill-status">Bill status</label>
+                        <select id="filter-bill-status" class="select" data-filter="billStatus"><option value="">All statuses</option></select>
+                    </div>
+                    <div class="form-field">
+                        <label for="filter-booking-status">Booking status</label>
+                        <select id="filter-booking-status" class="select" data-filter="bookingStatus"><option value="">All statuses</option></select>
+                    </div>
+                    <button type="button" class="btn btn-ghost btn-small report-filters-reset" id="reset-filters">Clear filters</button>
+                </div>
+            </section>
+
+            <nav class="report-jump" aria-label="Jump to a report">
+                <a href="#revenue">Revenue</a>
+                <a href="#payments">Payments</a>
+                <a href="#games">Game types</a>
+                <a href="#matches">Matches</a>
+                <a href="#players">Players</a>
+                <a href="#tables">Tables</a>
+                <a href="#bookings">Bookings</a>
+                <a href="#customers">Customers</a>
+                <a href="#outstanding">Outstanding</a>
+            </nav>
+
+            <!-- ===== Each report section: header with Export / Print, an error line, then the body ===== -->
+            <article class="panel panel-wide report-section" id="revenue" data-report="revenue" aria-labelledby="revenue-title">
+                <header class="panel-header report-section-header">
+                    <div>
+                        <h2 class="panel-title" id="revenue-title">Revenue</h2>
+                        <p class="field-hint section-filters">Bills by the day they were created. Filters: table, game type, bill status (payments also: method).</p>
+                    </div>
+                    <div class="report-actions">
+                        <button type="button" class="btn btn-ghost btn-small" data-export="revenue"><span data-icon="download"></span> CSV</button>
+                        <button type="button" class="btn btn-ghost btn-small" data-print="revenue"><span data-icon="print"></span> Print</button>
+                    </div>
+                </header>
+                <div class="report-body" data-body></div>
+            </article>
+
+            <article class="panel panel-wide report-section" id="payments" data-report="payments" aria-labelledby="payments-title">
+                <header class="panel-header report-section-header">
+                    <div>
+                        <h2 class="panel-title" id="payments-title">Payments</h2>
+                        <p class="field-hint section-filters">Money received in the period (real payment records). Filters: method, table, game type.</p>
+                    </div>
+                    <div class="report-actions">
+                        <button type="button" class="btn btn-ghost btn-small" data-export="payments"><span data-icon="download"></span> CSV</button>
+                        <button type="button" class="btn btn-ghost btn-small" data-print="payments"><span data-icon="print"></span> Print</button>
+                    </div>
+                </header>
+                <div class="report-body" data-body></div>
+            </article>
+
+            <article class="panel panel-wide report-section" id="games" data-report="games" aria-labelledby="games-title">
+                <header class="panel-header report-section-header">
+                    <div>
+                        <h2 class="panel-title" id="games-title">Game types</h2>
+                        <p class="field-hint section-filters">Grouped by the game types saved on the bills. Filters: table, game type, bill status.</p>
+                    </div>
+                    <div class="report-actions">
+                        <button type="button" class="btn btn-ghost btn-small" data-export="games"><span data-icon="download"></span> CSV</button>
+                        <button type="button" class="btn btn-ghost btn-small" data-print="games"><span data-icon="print"></span> Print</button>
+                    </div>
+                </header>
+                <div class="report-body" data-body></div>
+            </article>
+
+            <!-- Phase 11.7: matches and registered players -->
+            <article class="panel panel-wide report-section" id="matches" data-report="matches" aria-labelledby="matches-title">
+                <header class="panel-header report-section-header">
+                    <div>
+                        <h2 class="panel-title" id="matches-title">Matches</h2>
+                        <p class="field-hint section-filters">Matches by the day they started, with their bills. Filters: table, game type.</p>
+                    </div>
+                    <div class="report-actions">
+                        <label class="visually-hidden" for="matches-sort">Sort matches by</label>
+                        <select id="matches-sort" class="select select-small">
+                            <option value="newest">Sort: Newest first</option>
+                            <option value="oldest">Sort: Oldest first</option>
+                        </select>
+                        <button type="button" class="btn btn-ghost btn-small" data-export="matches"><span data-icon="download"></span> CSV</button>
+                        <button type="button" class="btn btn-ghost btn-small" data-print="matches"><span data-icon="print"></span> Print</button>
+                    </div>
+                </header>
+                <div class="report-body" data-body></div>
+            </article>
+
+            <article class="panel panel-wide report-section" id="players" data-report="players" aria-labelledby="players-title">
+                <header class="panel-header report-section-header">
+                    <div>
+                        <h2 class="panel-title" id="players-title">Players</h2>
+                        <p class="field-hint section-filters">Registered players: completed matches by the day they started; their own share of match bills by the day the bill was created. Filters: table, game type.</p>
+                    </div>
+                    <div class="report-actions">
+                        <label class="visually-hidden" for="players-sort">Sort players by</label>
+                        <select id="players-sort" class="select select-small">
+                            <option value="matches">Sort: Matches played</option>
+                            <option value="wins">Sort: Wins</option>
+                            <option value="billed">Sort: Billed</option>
+                            <option value="outstanding">Sort: Outstanding</option>
+                            <option value="name">Sort: Name</option>
+                        </select>
+                        <button type="button" class="btn btn-ghost btn-small" data-export="players"><span data-icon="download"></span> CSV</button>
+                        <button type="button" class="btn btn-ghost btn-small" data-print="players"><span data-icon="print"></span> Print</button>
+                    </div>
+                </header>
+                <div class="report-body" data-body></div>
+            </article>
+
+            <article class="panel panel-wide report-section" id="tables" data-report="tables" aria-labelledby="tables-title">
+                <header class="panel-header report-section-header">
+                    <div>
+                        <h2 class="panel-title" id="tables-title">Table performance</h2>
+                        <p class="field-hint section-filters">Sessions are counted on the day they started; Observed Utilization (an estimate) splits recorded time across days. Filter: table.</p>
+                    </div>
+                    <div class="report-actions">
+                        <label class="visually-hidden" for="tables-sort">Sort tables by</label>
+                        <select id="tables-sort" class="select select-small">
+                            <option value="revenue">Sort: Revenue</option>
+                            <option value="sessions">Sort: Sessions</option>
+                            <option value="billedTime">Sort: Billed time</option>
+                            <option value="tableNumber">Sort: Table number</option>
+                        </select>
+                        <button type="button" class="btn btn-ghost btn-small" data-export="tables"><span data-icon="download"></span> CSV</button>
+                        <button type="button" class="btn btn-ghost btn-small" data-print="tables"><span data-icon="print"></span> Print</button>
+                    </div>
+                </header>
+                <div class="report-body" data-body></div>
+            </article>
+
+            <article class="panel panel-wide report-section" id="bookings" data-report="bookings" aria-labelledby="bookings-title">
+                <header class="panel-header report-section-header">
+                    <div>
+                        <h2 class="panel-title" id="bookings-title">Bookings</h2>
+                        <p class="field-hint section-filters">Bookings that start in the period. Filters: table, booking status (rates only with All statuses).</p>
+                    </div>
+                    <div class="report-actions">
+                        <button type="button" class="btn btn-ghost btn-small" data-export="bookings"><span data-icon="download"></span> CSV</button>
+                        <button type="button" class="btn btn-ghost btn-small" data-print="bookings"><span data-icon="print"></span> Print</button>
+                    </div>
+                </header>
+                <div class="report-body" data-body></div>
+            </article>
+
+            <article class="panel panel-wide report-section" id="customers" data-report="customers" aria-labelledby="customers-title">
+                <header class="panel-header report-section-header">
+                    <div>
+                        <h2 class="panel-title" id="customers-title">Customers</h2>
+                        <p class="field-hint section-filters">From bookings only (customers are linked to bookings, not to bills).</p>
+                    </div>
+                    <div class="report-actions">
+                        <button type="button" class="btn btn-ghost btn-small" data-print="customers"><span data-icon="print"></span> Print</button>
+                    </div>
+                </header>
+                <div class="report-body" data-body></div>
+            </article>
+
+            <article class="panel panel-wide report-section" id="outstanding" data-report="outstanding" aria-labelledby="outstanding-title">
+                <header class="panel-header report-section-header">
+                    <div>
+                        <h2 class="panel-title" id="outstanding-title">Outstanding bills</h2>
+                        <p class="field-hint section-filters">Unpaid and partly paid bills. Filters: table, game type, bill status.</p>
+                    </div>
+                    <div class="report-actions">
+                        <label class="inline-check">
+                            <input type="checkbox" id="outstanding-all"> All dates
+                        </label>
+                        <label class="visually-hidden" for="outstanding-sort">Sort outstanding bills by</label>
+                        <select id="outstanding-sort" class="select select-small">
+                            <option value="oldest">Sort: Oldest first</option>
+                            <option value="newest">Sort: Newest first</option>
+                            <option value="balance">Sort: Largest balance</option>
+                        </select>
+                        <button type="button" class="btn btn-ghost btn-small" data-export="outstanding"><span data-icon="download"></span> CSV</button>
+                        <button type="button" class="btn btn-ghost btn-small" data-print="outstanding"><span data-icon="print"></span> Print</button>
+                    </div>
+                </header>
+                <div class="report-body" data-body></div>
+            </article>
+        </main>
+    </div>
+
+    <script src="/js/core/api.js"></script>
+    <script src="/js/core/ui.js"></script>
+    <script src="/js/core/format.js"></script>
+    <script src="/js/core/layout.js"></script>
+    <script src="/vendor/chart.umd.min.js"></script>
+    <script src="/js/pages/reports.js"></script>
+</body>
+</html>

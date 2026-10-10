@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#070908">
+    <title>Sessions · Snooker Club Pro</title>
+    <link rel="stylesheet" href="/css/theme.css">
+    <link rel="stylesheet" href="/css/layout.css">
+    <link rel="stylesheet" href="/css/components.css">
+</head>
+<body data-page="sessions">
+
+    <!-- ===== Sidebar (menu items are added by js/core/layout.js) ===== -->
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+        <a href="/pages/dashboard.html" class="sidebar-brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <span>Snooker Club Pro</span>
+        </a>
+        <nav class="sidebar-nav" id="sidebar-nav"></nav>
+        <div class="sidebar-footer" id="sidebar-footer"></div>
+    </aside>
+    <div class="sidebar-overlay" id="sidebar-overlay" hidden></div>
+
+    <div class="app-main">
+        <!-- ===== Top bar ===== -->
+        <header class="topbar">
+            <button type="button" class="menu-button" id="menu-button"
+                    aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">
+                <span data-icon="menu"></span>
+            </button>
+            <h1 class="topbar-title">Sessions</h1>
+
+            <div class="topbar-right">
+                <span class="topbar-date" id="topbar-date"></span>
+                <span class="status-pill" id="server-status" role="status">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span class="status-text">Checking…</span>
+                </span>
+            </div>
+        </header>
+
+        <!-- ===== Page content ===== -->
+        <main class="page-content">
+            <div class="page-header">
+                <p class="page-intro">Tables being played right now, and every finished session.</p>
+                <a class="btn btn-primary" href="/pages/tables.html">
+                    <span data-icon="start"></span> Start a session
+                </a>
+            </div>
+
+            <!-- Active sessions (filled in by sessions.js) -->
+            <article class="panel panel-wide">
+                <header class="panel-header">
+                    <h2 class="panel-title">Active now <span class="badge" id="active-count">0</span></h2>
+                </header>
+                <div class="panel-body panel-body-list" id="active-sessions">
+                    <div class="empty-state">
+                        <span class="spinner" aria-hidden="true"></span>
+                        <p>Loading sessions…</p>
+                    </div>
+                </div>
+            </article>
+
+            <!-- Session history -->
+            <article class="panel panel-wide">
+                <header class="panel-header">
+                    <h2 class="panel-title">Session history</h2>
+                    <span class="panel-meta" id="history-summary"></span>
+                </header>
+
+                <form class="filter-bar" id="history-filters" novalidate>
+                    <div class="form-field">
+                        <label for="filter-from">From</label>
+                        <input type="date" id="filter-from" name="from" class="input">
+                    </div>
+                    <div class="form-field">
+                        <label for="filter-to">To</label>
+                        <input type="date" id="filter-to" name="to" class="input">
+                    </div>
+                    <div class="form-field filter-search">
+                        <label for="filter-search">Table</label>
+                        <input type="search" id="filter-search" name="search" class="input"
+                               placeholder="Number or name…" maxlength="50" autocomplete="off">
+                    </div>
+                    <div class="filter-actions">
+                        <button type="button" class="btn btn-secondary" id="filter-today">Today</button>
+                        <button type="button" class="btn btn-ghost" id="filter-clear">Clear</button>
+                    </div>
+                </form>
+                <p class="form-error filter-error" id="filter-error" role="alert" hidden></p>
+
+                <div class="list-state list-state-inline" id="history-loading" role="status">
+                    <span class="spinner" aria-hidden="true"></span> Loading history…
+                </div>
+
+                <div class="list-state list-state-inline" id="history-empty" hidden>
+                    <div class="empty-state">
+                        <span class="empty-state-icon" data-icon="history"></span>
+                        <p class="empty-state-title" id="history-empty-title">No finished sessions yet</p>
+                        <p id="history-empty-text">Sessions appear here as soon as they end.</p>
+                    </div>
+                </div>
+
+                <div class="table-scroll" id="history-wrapper" hidden>
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th scope="col">Table</th>
+                                <th scope="col">Started</th>
+                                <th scope="col">Ended</th>
+                                <th scope="col" class="numeric">Duration</th>
+                                <th scope="col">Bill</th>
+                            </tr>
+                        </thead>
+                        <tbody id="history-body"></tbody>
+                    </table>
+                </div>
+
+                <nav class="pagination" id="history-pagination" aria-label="History pages" hidden>
+                    <button type="button" class="btn btn-secondary btn-small" id="page-prev">Previous</button>
+                    <span class="pagination-info" id="page-info"></span>
+                    <button type="button" class="btn btn-secondary btn-small" id="page-next">Next</button>
+                </nav>
+            </article>
+        </main>
+    </div>
+
+    <script src="/js/core/api.js"></script>
+    <script src="/js/core/ui.js"></script>
+    <script src="/js/core/format.js"></script>
+    <script src="/js/core/sessions.js"></script>
+    <script src="/js/core/cafe.js"></script>
+    <script src="/js/core/matches.js"></script>
+    <script src="/js/core/billing.js"></script>
+    <script src="/js/core/layout.js"></script>
+    <script src="/js/pages/sessions.js"></script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+{
+  "name": "snooker-club-pro",
+  "version": "0.11.0",
+  "description": "Snooker club management system: tables, sessions, billing, bookings, customers and reports.",
+  "private": true,
+  "main": "server/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "db": "node server/scripts/startDatabase.js",
+    "create-admin": "node server/scripts/createAdmin.js",
+    "reset-admin-password": "node server/scripts/resetAdminPassword.js",
+    "restore-backup": "node server/scripts/restoreBackup.js",
+    "start": "node server/server.js",
+    "dev": "nodemon --watch server --ext js,json server/server.js",
+    "test": "node --test \"server/tests/**/*.test.js\"",
+    "test:browser": "node tests/browser/run.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "chart.js": "^4.5.1",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^18.0.5",
+    "express": "^5.2.1",
+    "express-validator": "^7.3.2",
+    "fast-xml-parser": "^5.11.2",
+    "helmet": "^8.3.0",
+    "mongoose": "^9.10.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}

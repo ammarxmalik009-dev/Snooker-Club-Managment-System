@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>match bills browser suite</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1280" height="900"></iframe>
+<script>
+// Phase 11.5 browser tests: Session -> Match -> Bill -> Payment.
+// One session with Century, two Frames, Snooker Point and 4 Players matches; each completed match gets
+// its own bill from the Matches window; End Session opens the Matches window; duplicate billing refused;
+// the bill page shows the match; a session without matches still uses the old Create Bill window.
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+const PASSWORD = "Ui-test-pass-123";
+
+const win = () => frame.contentWindow;
+const doc = () => frame.contentDocument;
+const path = () => { try { return win().location.pathname + win().location.search; } catch { return ""; } };
+async function waitFor(check, timeout = 8000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+async function goto(url, width = 1280, expectPath) {
+  frame.width = width;
+  frame.src = url;
+  await sleep(150);
+  await waitFor(() => doc().readyState === "complete" && (!expectPath || path().startsWith(expectPath)));
+  await sleep(300);
+}
+const api = async (method, p, body) => {
+  const r = await fetch("/api" + p, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json().catch(() => null) };
+};
+const loginAs = async (username) => { await api("POST", "/auth/logout"); return api("POST", "/auth/login", { username, password: PASSWORD }); };
+const text = (el) => (el ? el.textContent.replace(/\s+/g, " ").trim() : "");
+const byText = (root, selector, t) => [...root.querySelectorAll(selector)].find((e) => e.textContent.includes(t));
+const toastHas = (t) => [...doc().querySelectorAll(".toast-message")].some((m) => m.textContent.includes(t));
+const type = (input, value) => { input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); };
+const choose = (input) => { input.checked = true; input.dispatchEvent(new Event("change", { bubbles: true })); };
+const noSideScroll = () => doc().documentElement.scrollWidth <= doc().documentElement.clientWidth + 1;
+
+const dlg = () => doc().querySelector("dialog.matches-dialog[open]");
+const billDlg = () => doc().querySelector("dialog.match-bill-dialog[open]");
+const matchRow = (n) => [...dlg().querySelectorAll(".match-row")].find((r) => r.querySelector(".match-title").textContent.startsWith(`#${n} `));
+const billingText = (n) => { const line = matchRow(n)?.querySelector(".match-billing"); return line ? [...line.children].map(text).join(" ") : ""; };
+const summary = () => text(billDlg()?.querySelector(".bill-summary"));
+const sharesText = () => [...billDlg().querySelectorAll(".summary-shares li")].map((li) => text(li)).join("|");
+const fact = (label) => { const dt = [...billDlg().querySelectorAll(".match-bill-facts dt")].find((d) => d.textContent === label); return text(dt?.nextElementSibling); };
+
+async function openBill(n) {
+  matchRow(n).querySelector(".match-create-bill").click();
+  await waitFor(() => billDlg() && summary().includes("Grand total"));
+  return billDlg();
+}
+async function previewAfter(change, expectInSummary) {
+  change();
+  return waitFor(() => summary().includes(expectInSummary));
+}
+async function createBill(n) {
+  billDlg().querySelector('button[type="submit"]').click();
+  return waitFor(() => !billDlg() && billingText(n).startsWith("Billing: Bill B-"));
+}
+
+(async () => {
+  try {
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
+    if ((await loginAs("ui-admin")).status !== 200) throw new Error("admin login failed");
+    const table = (await api("POST", "/tables", { tableNumber: 1, name: "VIP", hourlyRate: 60000 })).body.data;
+    await api("POST", "/tables", { tableNumber: 2, name: "Corner", hourlyRate: 60000 });
+    const ali = (await api("POST", "/players", { name: "Ali" })).body.data;
+    const ahmed = (await api("POST", "/players", { name: "Ahmed" })).body.data;
+    const drinks = (await api("POST", "/categories", { name: "Drinks" })).body.data;
+    const cola = (await api("POST", "/products", { name: "Cola", categoryId: drinks.id, price: 8000, stockQuantity: 5 })).body.data;
+
+    // ================= Test A: Century match through the UI =================
+    await goto("/pages/tables.html", 1280, "/pages/tables.html");
+    const card = (n) => [...doc().querySelectorAll(".table-card")].find((c) => c.querySelector(".table-number").textContent === String(n));
+    await waitFor(() => card(1) && byText(card(1), "button", "Start Session"));
+    byText(card(1), "button", "Start Session").click();
+    await waitFor(() => card(1)?.querySelector(".matches-button"));
+    card(1).querySelector(".matches-button").click();
+    await waitFor(() => dlg() && dlg().querySelector(".match-empty"));
+    byText(dlg(), "button", "Start New Match").click();
+    const form = await waitFor(() => dlg().querySelector(".match-start-form"));
+    form.querySelectorAll(".match-walkin-name").forEach((input, i) => type(input, ["Zaid", "Guest"][i]));
+    form.requestSubmit();
+    await waitFor(() => matchRow(1));
+    byText(matchRow(1), "button", "Complete Match").click();
+    const resultForm = await waitFor(() => matchRow(1).querySelector(".match-result-form"));
+    choose([...resultForm.querySelectorAll(".match-choice")].find((c) => c.textContent === "Zaid").querySelector("input"));
+    resultForm.requestSubmit();
+    await waitFor(() => text(matchRow(1)?.querySelector(".status-badge")) === "Completed");
+    ok("running session: completed match is 'Not billed', billing waits for the session to end",
+       billingText(1).startsWith("Billing: Not billed") && billingText(1).includes("End the session to bill") && !matchRow(1).querySelector(".match-create-bill"));
+    dlg().querySelector(".modal-actions .btn-secondary").click();
+    await waitFor(() => !dlg());
+
+    // ================= Tests B-D: more matches in the SAME session (API), café tab, then End Session =================
+    const sessionId = (await api("GET", "/sessions/active")).body.data.sessions[0].id;
+    const start = async (gameMode, players, result) => {
+      const m = (await api("POST", `/sessions/${sessionId}/matches`, { gameMode, players })).body.data;
+      if (result) await api("POST", `/matches/${m.id}/complete`, result);
+      return m;
+    };
+    await start("frame", [{ playerId: ali.id }, { playerId: ahmed.id }], { winnerSeat: 1 });           // #2 Ahmed lost
+    await start("frame", [{ playerId: ali.id }, { playerId: ahmed.id }], { winnerSeat: 2 });           // #3 Ali lost
+    await start("snooker_point", [{ name: "A" }, { name: "B" }, { name: "C" }], { winnerSeat: 2 });     // #4
+    await start("four_player", [{ name: "Saad", team: 1 }, { name: "Umar", team: 1 }, { name: "Kamran", team: 2 }, { name: "Danish", team: 2 }], { winningTeam: 1 }); // #5
+    const sixth = await start("frame", [{ name: "X" }, { name: "Y" }], { winnerSeat: 1 });              // #6 (duplicate test)
+    await start("frame", [{ name: "P" }, { name: "Q" }]);                                               // #7 stays in progress
+    await api("POST", `/sessions/${sessionId}/cafe-items`, { productId: cola.id, quantity: 1, consumer: "Guest" });
+    await fetch("/_backdate/1/2830"); // 47m10s -> 50 billed minutes
+
+    await goto("/pages/tables.html", 1280, "/pages/tables.html");
+    await waitFor(() => card(1) && byText(card(1), "button", "End Session"));
+    byText(card(1), "button", "End Session").click();
+    (await waitFor(() => doc().querySelector("dialog.modal-small[open] .btn-danger"))).click();
+    await waitFor(() => dlg() && matchRow(7));
+    ok("End Session on a session with matches opens its Matches window (not the session bill window)",
+       Boolean(dlg()) && !doc().querySelector("dialog.bill-dialog") && text(dlg().querySelector(".modal-subtitle")).includes("session ended"));
+    ok("billing states: Not billed + Create Bill / Not ready — match in progress",
+       billingText(1) === "Billing: Not billed Create Bill" && billingText(7) === "Billing: Not ready — match in progress", [billingText(1), billingText(7)]);
+
+    // --- A: Century bill ---
+    await openBill(1);
+    ok("century bill window: match, game type, players and winner from the match (not editable)",
+       fact("Game type") === "Century" && fact("Winner") === "Zaid" && fact("Players") === "Zaid vs Guest" && !billDlg().querySelector('input[name="gameMode"], .stepper'));
+    ok("century preview: Rs 10.00 / minute × 50 billed minutes = Rs 500 + café Rs 80", summary().includes("RateRs 10.00 / minute") && summary().includes("Billed minutes50")
+       && summary().includes("Century minutes × 50 @ Rs 10.00") && summary().includes("Café totalRs 80.00") && summary().includes("Grand totalRs 580.00"), summary());
+    ok("café tab listed, 'who had it' prefilled from the tab (Guest)", text(billDlg().querySelector(".match-tab-item")).startsWith("Cola × 1") && billDlg().querySelector(".match-tab-item select").value === "Guest");
+    ok("loser pays: Guest pays all", sharesText() === "Zaid (Winner)Rs 0.00|Guest (Loser)Rs 580.00", sharesText());
+    await createBill(1);
+    ok("century billed: toast + 'Bill … · Unpaid' + View Bill", toastHas("created for match #1") && /^Billing: Bill B-\d{8}-\d{4} · Unpaid View Bill$/.test(billingText(1)) && matchRow(1).querySelector("a.match-view-bill"), billingText(1));
+
+    // --- B: two Frames = two matches = two bills ---
+    await openBill(2);
+    ok("frame #2: Rs 250, quantity 1", summary().includes("RateRs 250.00") && summary().includes("Quantity1") && summary().includes("Grand totalRs 250.00") && !summary().includes("Café totalRs 80"), summary());
+    ok("frame #2: the café tab is no longer offered (it is on bill #1)", !billDlg().querySelector(".match-tab-item"));
+    await createBill(2);
+    await openBill(3);
+    ok("frame #3: Ali lost and pays", sharesText() === "Ali (Loser)Rs 250.00|Ahmed (Winner)Rs 0.00", sharesText());
+    await createBill(3);
+    const numbers = [1, 2, 3].map((n) => /B-\d{8}-\d{4}/.exec(billingText(n))[0]);
+    ok("three different bills for #1, #2, #3", new Set(numbers).size === 3, numbers);
+
+    // --- C: Snooker Point ---
+    await openBill(4);
+    ok("snooker point: Rs 350, the two losers share it", summary().includes("Grand totalRs 350.00") && sharesText() === "A (Loser)Rs 175.00|B (Winner)Rs 0.00|C (Loser)Rs 175.00", sharesText());
+    await createBill(4);
+
+    // --- D: 4 Players, all three payer rules ---
+    await openBill(5);
+    ok("4 Players: winning team shown, Rs 500", fact("Winning Team").startsWith("Team 1") && summary().includes("Grand totalRs 500.00"));
+    ok("loser pays: the losing team (Kamran, Danish) pays", sharesText() === "Saad (Winner)Rs 0.00|Umar (Winner)Rs 0.00|Kamran (Loser)Rs 250.00|Danish (Loser)Rs 250.00", sharesText());
+    await previewAfter(() => choose(billDlg().querySelector('input[name="matchPayerRule"][value="winner"]')), "Winner Pays");
+    ok("winner pays: Saad and Umar", sharesText() === "Saad (Winner)Rs 250.00|Umar (Winner)Rs 250.00|Kamran (Loser)Rs 0.00|Danish (Loser)Rs 0.00", sharesText());
+    await previewAfter(() => choose(billDlg().querySelector('input[name="matchPayerRule"][value="split"]')), "Both Pay");
+    ok("'Both Pay' (new label): all four Rs 125", sharesText() === "Saad (Winner)Rs 125.00|Umar (Winner)Rs 125.00|Kamran (Loser)Rs 125.00|Danish (Loser)Rs 125.00"
+       && [...billDlg().querySelectorAll(".segment-label")].map((s) => s.textContent).join() === "Loser Pays,Winner Pays,Both Pay");
+    choose(billDlg().querySelector('input[name="matchPayerRule"][value="loser"]'));
+    await sleep(300);
+    await createBill(5);
+
+    // --- F: duplicate billing from two places ---
+    await openBill(6);
+    const other = await api("POST", `/matches/${sixth.id}/bill`, { payerRule: "loser" }); // another cashier, meanwhile
+    ok("another cashier billed #6 first", other.status === 201);
+    billDlg().querySelector('button[type="submit"]').click();
+    const dupError = await waitFor(() => { const e = billDlg()?.querySelector(".form-error"); return e && !e.hidden && e.textContent; });
+    ok("duplicate refused in the window: 'Match #6 already has bill …'", dupError === `Match #6 already has bill ${other.body.data.billNumber}`, dupError);
+    billDlg().querySelector(".modal-actions .btn-secondary").click();
+    ok("server: exactly one bill for match #6", (await api("GET", "/bills?limit=100")).body.data.bills.filter((b) => b.matchNumber === 6).length === 1);
+
+    // ================= Test E: many bills, one session =================
+    const list = (await api("GET", `/sessions/${sessionId}/matches`)).body.data;
+    ok("server: matches #1-#6 each have their own bill, #7 none", list.filter((m) => m.billInfo).map((m) => m.number).join() === "1,2,3,4,5,6"
+       && new Set(list.filter((m) => m.billInfo).map((m) => m.billInfo.id)).size === 6 && !list[6].billInfo);
+    const bills = (await api("GET", "/bills?limit=100")).body.data.bills;
+    ok("server: bills carry their match and the match's game type", bills.map((b) => `${b.matchNumber}:${b.gameMode}`).sort().join()
+       === "1:century,2:frame,3:frame,4:snooker_point,5:four_player,6:frame");
+    ok("cola stock taken once (5 -> 4)", (await api("GET", `/products/${cola.id}`)).body.data.stockQuantity === 4);
+    dlg().querySelector(".modal-actions .btn-secondary").click();
+
+    await goto("/pages/sessions.html", 1280, "/pages/sessions.html");
+    const historyCell = await waitFor(() => doc().querySelector("#history-body .match-bill-summary"));
+    ok("session history: 'Billed per match: 6 of 7 · 1 in progress' (no session bill, no Create bill)",
+       text(historyCell) === "Billed per match: 6 of 7 · 1 in progress" && !byText(doc().querySelector("#history-body"), "button", "Create bill"), text(historyCell));
+
+    // ================= Bill page shows the match =================
+    const centuryBill = bills.find((b) => b.matchNumber === 1);
+    await goto(`/pages/billing.html?bill=${centuryBill.id}`, 1280, "/pages/billing.html");
+    const detail = await waitFor(() => doc().getElementById("bill-dialog")?.open && doc().getElementById("bill-detail"));
+    await waitFor(() => detail.textContent.includes("Record payment"));
+    ok("bill detail: 'Match #1 · Century', Loser Pays, Century minutes line",
+       detail.textContent.includes("Match#1 · Century") && detail.textContent.includes("Who paysLoser Pays") && detail.textContent.includes("Century minutes"), text(detail.querySelector(".fact-grid")));
+    const listRow = [...doc().querySelectorAll("#bills-body tr")].find((r) => r.textContent.includes(centuryBill.billNumber));
+    ok("bill list: 'Century · match #1'", listRow && listRow.querySelectorAll("td")[2].textContent === "Century · match #1");
+    // Payment on a match bill works as before
+    doc().getElementById("pay-amount").value = "580";
+    detail.querySelector(".payment-form").requestSubmit();
+    await waitFor(() => detail.querySelector(".bill-detail-header .status-badge")?.textContent === "Paid");
+    ok("payment on a match bill: Guest pays Rs 580 -> Paid", detail.querySelector(".bill-detail-header .status-badge").textContent === "Paid");
+
+    // ================= A session WITHOUT matches still uses the session bill window =================
+    await goto("/pages/tables.html", 1280, "/pages/tables.html");
+    await waitFor(() => card(2) && byText(card(2), "button", "Start Session"));
+    byText(card(2), "button", "Start Session").click();
+    await waitFor(() => card(2) && byText(card(2), "button", "End Session"));
+    byText(card(2), "button", "End Session").click();
+    (await waitFor(() => doc().querySelector("dialog.modal-small[open] .btn-danger"))).click();
+    const old = await waitFor(() => doc().querySelector("dialog.bill-dialog[open]"));
+    ok("no matches -> the old Create Bill window opens, with 'Both Pay'", Boolean(old) && !dlg()
+       && [...old.querySelectorAll('input[name="payerRule"]')].map((i) => i.closest(".segment").textContent.trim()).join() === "Loser Pays,Winner Pays,Both Pay");
+    byText(old, "button", "Bill later").click();
+
+    // ================= Phase 11.8: the café tab on the last billable match; cancelled bills aren't "billed" =================
+    const side = (await api("POST", "/tables", { tableNumber: 3, name: "Side", hourlyRate: 60000 })).body.data;
+    const s3 = (await api("POST", "/sessions", { tableId: side.id })).body.data;
+    for (const winnerSeat of [1, 2]) {
+      const m = (await api("POST", `/sessions/${s3.id}/matches`, { gameMode: "frame", players: [{ name: "Faraz" }, { name: "Hamid" }] })).body.data;
+      await api("POST", `/matches/${m.id}/complete`, { winnerSeat });
+    }
+    await api("POST", `/sessions/${s3.id}/cafe-items`, { productId: cola.id, quantity: 1, consumer: "Hamid" });
+    await api("POST", `/sessions/${s3.id}/end`);
+    const sideMatches = (await api("GET", `/sessions/${s3.id}/matches`)).body.data;
+    await goto("/pages/sessions.html", 1280, "/pages/sessions.html");
+    (await waitFor(() => [...doc().querySelectorAll("#history-body .matches-button")].find((b) => b.closest("tr").textContent.includes("Side")))).click();
+    await waitFor(() => dlg() && matchRow(2));
+    const tabBox = () => billDlg().querySelector(".bill-section input[type=\"checkbox\"]");
+    const tabHint = () => text(billDlg().querySelector(".match-tab-hint"));
+    await openBill(1);
+    ok("café tab, match #1 (match #2 can still be billed): checkbox can be unticked", tabBox().checked && !tabBox().disabled && tabHint().startsWith("Untick to leave it open"), tabHint());
+    tabBox().checked = false; tabBox().dispatchEvent(new Event("change", { bubbles: true }));
+    await waitFor(() => !summary().includes("Café totalRs 80"));
+    await createBill(1);
+    ok("match #1 billed without the café tab (left for match #2)", (await api("GET", `/sessions/${s3.id}/cafe-items`)).body.data.items.every((i) => i.status === "open"));
+    await openBill(2);
+    ok("café tab, match #2 (the last billable match): checkbox ticked and locked, with the reason",
+       tabBox().checked && tabBox().disabled && tabHint() === "This is the last match of this session that can be billed, so its café tab must go on this bill (otherwise it would never be billed)."
+       && billDlg().querySelector(".match-tab-hint").classList.contains("is-warning"), tabHint());
+    const refusedLeave = await api("POST", `/matches/${sideMatches[1].id}/bill`, { payerRule: "loser", includeCafeTab: false });
+    ok("server refuses leaving the tab on the last billable match (409), even without the window", refusedLeave.status === 409 && /must go on this bill/.test(refusedLeave.body.message), refusedLeave.body);
+    ok("the preview includes the café (Rs 80)", summary().includes("Café totalRs 80.00"));
+    await createBill(2);
+    ok("match #2 billed with the café tab: tab billed, stock taken once", (await api("GET", `/sessions/${s3.id}/cafe-items`)).body.data.items.every((i) => i.status === "billed")
+       && (await api("GET", `/products/${cola.id}`)).body.data.stockQuantity === 3);
+    dlg().querySelector(".modal-actions .btn-secondary").click();
+    const firstSideBill = (await api("GET", `/sessions/${s3.id}/matches`)).body.data[0].billInfo;
+    await api("POST", `/bills/${firstSideBill.id}/cancel`, {});
+    await goto("/pages/sessions.html", 1280, "/pages/sessions.html");
+    const sideSummary = await waitFor(() => [...doc().querySelectorAll("#history-body tr")].find((tr) => tr.textContent.includes("Side"))?.querySelector(".match-bill-summary"));
+    ok("'Billed per match' doesn't count a cancelled bill: 1 of 2", text(sideSummary) === "Billed per match: 1 of 2", text(sideSummary));
+    ok("sidebar shows the version: v0.11 · Phase 11", text(doc().querySelector(".app-version")) === "v0.11 · Phase 11", text(doc().querySelector(".app-version")));
+
+    // ================= Phone width =================
+    await goto("/pages/sessions.html", 375, "/pages/sessions.html");
+    const historyMatches = await waitFor(() => [...doc().querySelectorAll("#history-body .matches-button")].find((b) => b.closest("tr").textContent.includes("Billed per match")));
+    historyMatches.click();
+    await waitFor(() => dlg() && matchRow(7));
+    ok("375px: Matches window with billing lines, no sideways scroll", noSideScroll() && dlg().getBoundingClientRect().right <= doc().documentElement.clientWidth + 1,
+       { scroll: doc().documentElement.scrollWidth, width: doc().documentElement.clientWidth });
+  } catch (e) {
+    log.push("FAIL suite crashed: " + e.message + " " + e.stack);
+  }
+  const fails = log.filter((l) => l.startsWith("FAIL")).length;
+  document.getElementById("out").textContent = log.join("\n") + `\n\nTOTAL ${log.length - fails} passed, ${fails} failed`;
+})();
+</script>
+</body></html>

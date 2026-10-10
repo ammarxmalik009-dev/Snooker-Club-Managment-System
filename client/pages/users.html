@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#070908">
+    <title>Users · Snooker Club Pro</title>
+    <link rel="stylesheet" href="/css/theme.css">
+    <link rel="stylesheet" href="/css/layout.css">
+    <link rel="stylesheet" href="/css/components.css">
+</head>
+<body data-page="users">
+
+    <!-- ===== Sidebar (menu items are added by js/core/layout.js) ===== -->
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+        <a href="/pages/dashboard.html" class="sidebar-brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <span>Snooker Club Pro</span>
+        </a>
+        <nav class="sidebar-nav" id="sidebar-nav"></nav>
+        <div class="sidebar-footer" id="sidebar-footer"></div>
+    </aside>
+    <div class="sidebar-overlay" id="sidebar-overlay" hidden></div>
+
+    <div class="app-main">
+        <header class="topbar">
+            <button type="button" class="menu-button" id="menu-button"
+                    aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">
+                <span data-icon="menu"></span>
+            </button>
+            <h1 class="topbar-title">Users</h1>
+            <div class="topbar-right">
+                <span class="topbar-date" id="topbar-date"></span>
+                <span class="status-pill" id="server-status" role="status">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span class="status-text">Checking…</span>
+                </span>
+            </div>
+        </header>
+
+        <main class="page-content">
+            <div class="page-header">
+                <p class="page-intro">Who can log in, and what they may do. Only admins see this page.</p>
+                <button type="button" class="btn btn-primary" id="add-user-button">
+                    <span data-icon="plus"></span> Add User
+                </button>
+            </div>
+
+            <!-- What each role may do (same rules the server enforces) -->
+            <details class="panel panel-wide roles-help">
+                <summary class="panel-header"><h2 class="panel-title">What can each role do?</h2></summary>
+                <div class="table-scroll">
+                    <table class="data-table role-matrix">
+                        <thead><tr><th scope="col">Feature</th><th scope="col">Admin</th><th scope="col">Staff</th><th scope="col">Cashier</th></tr></thead>
+                        <tbody>
+                            <tr><td>Dashboard, Tables, Sessions, Customers, Bookings</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+                            <tr><td>Create and view bills, print receipts</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+                            <tr><td>View payments</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+                            <tr><td>Record payments, cancel bills</td><td>Yes</td><td>No</td><td>Yes</td></tr>
+                            <tr><td>Settings (rates, tax, time rule, no-show)</td><td>Yes</td><td>No</td><td>No</td></tr>
+                            <tr><td>Users (this page)</td><td>Yes</td><td>No</td><td>No</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </details>
+
+            <article class="panel panel-wide">
+                <header class="panel-header">
+                    <h2 class="panel-title">Accounts</h2>
+                    <span class="panel-meta" id="users-summary"></span>
+                </header>
+                <div class="toolbar toolbar-padded">
+                    <div class="search-field">
+                        <span data-icon="search"></span>
+                        <label for="user-search" class="visually-hidden">Search users</label>
+                        <input type="search" id="user-search" class="input" placeholder="Name or username…" maxlength="50" autocomplete="off">
+                    </div>
+                    <div class="filter-chips" id="role-filter" role="group" aria-label="Filter by role">
+                        <button type="button" class="chip" data-role="" aria-pressed="true">All</button>
+                        <button type="button" class="chip" data-role="admin" aria-pressed="false">Admins</button>
+                        <button type="button" class="chip" data-role="staff" aria-pressed="false">Staff</button>
+                        <button type="button" class="chip" data-role="cashier" aria-pressed="false">Cashiers</button>
+                    </div>
+                </div>
+                <div id="users-list">
+                    <div class="empty-state panel-empty"><span class="spinner" aria-hidden="true"></span><p>Loading…</p></div>
+                </div>
+            </article>
+        </main>
+    </div>
+
+    <!-- ===== Add / edit user ===== -->
+    <dialog class="modal" id="user-dialog" aria-labelledby="user-dialog-title">
+        <form class="modal-content" id="user-form" novalidate>
+            <h2 class="modal-title" id="user-dialog-title">Add user</h2>
+            <p class="form-error" id="user-form-error" role="alert" hidden></p>
+            <div class="form-field">
+                <label for="user-name">Full name</label>
+                <input type="text" id="user-name" name="name" class="input" maxlength="60" autocomplete="off">
+                <p class="field-error" data-error-for="name" hidden></p>
+            </div>
+            <div class="form-field" id="username-field">
+                <label for="user-username">Username</label>
+                <input type="text" id="user-username" name="username" class="input" maxlength="30" autocomplete="off" autocapitalize="none" spellcheck="false">
+                <p class="field-hint">3–30 characters: letters, numbers, dot, dash, underscore. Not case-sensitive.</p>
+                <p class="field-error" data-error-for="username" hidden></p>
+            </div>
+            <div class="form-field">
+                <label for="user-role">Role</label>
+                <select id="user-role" name="role" class="select">
+                    <option value="staff">Staff</option>
+                    <option value="cashier">Cashier</option>
+                    <option value="admin">Admin</option>
+                </select>
+                <p class="field-error" data-error-for="role" hidden></p>
+            </div>
+            <div id="password-fields">
+                <div class="form-field">
+                    <label for="user-password">Password</label>
+                    <input type="password" id="user-password" name="password" class="input" maxlength="128" autocomplete="new-password">
+                    <p class="field-hint">At least 10 characters, with letters and numbers, not containing the username.</p>
+                    <p class="field-error" data-error-for="password" hidden></p>
+                </div>
+                <div class="form-field">
+                    <label for="user-password2">Repeat password</label>
+                    <input type="password" id="user-password2" class="input" maxlength="128" autocomplete="new-password">
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" id="user-cancel">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="user-save">Save User</button>
+            </div>
+        </form>
+    </dialog>
+
+    <!-- ===== Set a new password ===== -->
+    <dialog class="modal modal-small" id="password-dialog" aria-labelledby="password-dialog-title">
+        <form class="modal-content" id="password-form" novalidate>
+            <h2 class="modal-title" id="password-dialog-title">Set a new password</h2>
+            <p class="modal-text" id="password-dialog-text"></p>
+            <p class="form-error" id="password-form-error" role="alert" hidden></p>
+            <div class="form-field">
+                <label for="new-password">New password</label>
+                <input type="password" id="new-password" class="input" maxlength="128" autocomplete="new-password">
+            </div>
+            <div class="form-field">
+                <label for="new-password2">Repeat new password</label>
+                <input type="password" id="new-password2" class="input" maxlength="128" autocomplete="new-password">
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" id="password-cancel">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="password-save">Set Password</button>
+            </div>
+        </form>
+    </dialog>
+
+    <script src="/js/core/api.js"></script>
+    <script src="/js/core/ui.js"></script>
+    <script src="/js/core/format.js"></script>
+    <script src="/js/core/layout.js"></script>
+    <script src="/js/pages/users.js"></script>
+</body>
+</html>

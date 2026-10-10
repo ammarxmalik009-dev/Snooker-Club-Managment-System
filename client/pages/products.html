@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#070908">
+    <title>Café Products · Snooker Club Pro</title>
+    <link rel="stylesheet" href="/css/theme.css">
+    <link rel="stylesheet" href="/css/layout.css">
+    <link rel="stylesheet" href="/css/components.css">
+</head>
+<body data-page="products">
+
+    <!-- ===== Sidebar (menu items are added by js/core/layout.js) ===== -->
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+        <a href="/pages/dashboard.html" class="sidebar-brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <span>Snooker Club Pro</span>
+        </a>
+        <nav class="sidebar-nav" id="sidebar-nav"></nav>
+        <div class="sidebar-footer" id="sidebar-footer"></div>
+    </aside>
+    <div class="sidebar-overlay" id="sidebar-overlay" hidden></div>
+
+    <div class="app-main">
+        <header class="topbar">
+            <button type="button" class="menu-button" id="menu-button"
+                    aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">
+                <span data-icon="menu"></span>
+            </button>
+            <h1 class="topbar-title">Café Products</h1>
+            <div class="topbar-right">
+                <span class="topbar-date" id="topbar-date"></span>
+                <span class="status-pill" id="server-status" role="status">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span class="status-text">Checking…</span>
+                </span>
+            </div>
+        </header>
+
+        <main class="page-content">
+            <div class="page-header">
+                <p class="page-intro">What the café sells, prices and stock. Stock goes down when a bill is created.</p>
+                <button type="button" class="btn btn-primary" id="add-product-button" data-permission="products:manage">
+                    <span data-icon="plus"></span> Add Product
+                </button>
+            </div>
+
+            <!-- Shown when products are at or below their low-stock limit -->
+            <p class="alert alert-warning" id="low-stock-alert" role="status" hidden></p>
+
+            <article class="panel panel-wide">
+                <header class="panel-header">
+                    <h2 class="panel-title">Products</h2>
+                    <span class="panel-meta" id="products-summary"></span>
+                </header>
+                <div class="toolbar toolbar-padded product-toolbar">
+                    <div class="search-field">
+                        <span data-icon="search"></span>
+                        <label for="product-search" class="visually-hidden">Search products</label>
+                        <input type="search" id="product-search" class="input" placeholder="Product name…" maxlength="50" autocomplete="off">
+                    </div>
+                    <label class="visually-hidden" for="category-filter">Category</label>
+                    <select id="category-filter" class="select select-small"><option value="">All categories</option></select>
+                    <div class="filter-chips" id="status-filter" role="group" aria-label="Status">
+                        <button type="button" class="chip" data-status="active" aria-pressed="true">Active</button>
+                        <button type="button" class="chip" data-status="inactive" aria-pressed="false">Inactive</button>
+                        <button type="button" class="chip" data-status="all" aria-pressed="false">All</button>
+                    </div>
+                    <label class="inline-check"><input type="checkbox" id="low-stock-only"> Low stock only</label>
+                </div>
+                <div id="products-list">
+                    <div class="empty-state panel-empty"><span class="spinner" aria-hidden="true"></span><p>Loading…</p></div>
+                </div>
+            </article>
+
+            <article class="panel panel-wide" data-permission="stock:view" hidden>
+                <header class="panel-header">
+                    <h2 class="panel-title">Recent stock changes</h2>
+                    <span class="panel-meta">Restocks, sales, adjustments and waste</span>
+                </header>
+                <div id="recent-movements">
+                    <div class="empty-state panel-empty"><span class="spinner" aria-hidden="true"></span><p>Loading…</p></div>
+                </div>
+            </article>
+        </main>
+    </div>
+
+    <!-- ===== Add / edit product (admin) ===== -->
+    <dialog class="modal" id="product-dialog" aria-labelledby="product-dialog-title">
+        <form class="modal-content" id="product-form" novalidate>
+            <h2 class="modal-title" id="product-dialog-title">Add product</h2>
+            <p class="form-error" id="product-form-error" role="alert" hidden></p>
+            <div class="form-field">
+                <label for="product-name">Name</label>
+                <input type="text" id="product-name" name="name" class="input" maxlength="100" autocomplete="off">
+                <p class="field-error" data-error-for="name" hidden></p>
+            </div>
+            <div class="form-field">
+                <label for="product-category">Category</label>
+                <select id="product-category" name="categoryId" class="select"></select>
+                <p class="field-error" data-error-for="categoryId" hidden></p>
+            </div>
+            <div class="form-field">
+                <label for="product-price">Price (Rs)</label>
+                <input type="text" id="product-price" name="price" class="input" inputmode="decimal" placeholder="e.g. 80 or 80.50">
+                <p class="field-hint">A new price is used for new sales only. Old bills keep their price.</p>
+                <p class="field-error" data-error-for="price" hidden></p>
+            </div>
+            <label class="switch-field" for="product-track">
+                <input type="checkbox" id="product-track" name="trackStock" checked>
+                <span class="switch-text"><strong>Count stock</strong> <span class="field-hint">Switch off for items made to order (tea, coffee).</span></span>
+            </label>
+            <div class="form-field" id="initial-stock-field">
+                <label for="product-stock">Stock now</label>
+                <input type="number" id="product-stock" name="stockQuantity" class="input" min="0" max="1000000" value="0">
+                <p class="field-hint">Later changes go through Restock or Adjust, so every change is recorded.</p>
+                <p class="field-error" data-error-for="stockQuantity" hidden></p>
+            </div>
+            <div class="form-field" id="low-limit-field">
+                <label for="product-low">Low-stock warning at</label>
+                <input type="number" id="product-low" name="lowStockLimit" class="input" min="0" max="1000000" value="5">
+                <p class="field-error" data-error-for="lowStockLimit" hidden></p>
+            </div>
+            <div class="form-field">
+                <label for="product-status">Status</label>
+                <select id="product-status" name="status" class="select">
+                    <option value="active">Active (on sale)</option>
+                    <option value="inactive">Inactive (not on sale)</option>
+                </select>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" id="product-cancel">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="product-save">Save Product</button>
+            </div>
+        </form>
+    </dialog>
+
+    <!-- ===== Restock / adjust ===== -->
+    <dialog class="modal modal-small" id="stock-dialog" aria-labelledby="stock-dialog-title">
+        <form class="modal-content" id="stock-form" novalidate>
+            <h2 class="modal-title" id="stock-dialog-title">Restock</h2>
+            <p class="modal-text" id="stock-dialog-text"></p>
+            <p class="form-error" id="stock-form-error" role="alert" hidden></p>
+            <div class="segmented" id="adjust-type" role="radiogroup" aria-label="Kind of change" hidden>
+                <label class="segment"><input type="radio" name="type" value="adjustment" checked><span class="segment-label">Correction</span><span class="segment-note">after counting (+ or −)</span></label>
+                <label class="segment"><input type="radio" name="type" value="waste"><span class="segment-label">Waste</span><span class="segment-note">broken / expired</span></label>
+            </div>
+            <div class="form-field">
+                <label for="stock-quantity" id="stock-quantity-label">Quantity received</label>
+                <input type="number" id="stock-quantity" name="quantity" class="input" step="1">
+            </div>
+            <div class="form-field">
+                <label for="stock-reason" id="stock-reason-label">Note <span class="optional">(optional)</span></label>
+                <input type="text" id="stock-reason" name="reason" class="input" maxlength="200">
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" id="stock-cancel">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="stock-save">Save</button>
+            </div>
+        </form>
+    </dialog>
+
+    <!-- ===== Stock history of one product ===== -->
+    <dialog class="modal modal-wide" id="history-dialog" aria-labelledby="history-title">
+        <div class="modal-content" id="history"></div>
+    </dialog>
+
+    <script src="/js/core/api.js"></script>
+    <script src="/js/core/ui.js"></script>
+    <script src="/js/core/format.js"></script>
+    <script src="/js/core/layout.js"></script>
+    <script src="/js/core/cafe.js"></script>
+    <script src="/js/pages/products.js"></script>
+</body>
+</html>

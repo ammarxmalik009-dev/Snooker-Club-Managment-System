@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>reports UI harness</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1280" height="900"></iframe>
+<script>
+// Phase 9 browser tests: the Reports page with known data in a past period (10-11 Sep 2026).
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+const PASSWORD = "Ui-test-pass-123";
+const SECTIONS = ["revenue", "payments", "games", "matches", "players", "tables", "bookings", "customers", "outstanding"]; // matches, players: Phase 11.7
+
+const win = () => frame.contentWindow;
+const doc = () => frame.contentDocument;
+const path = () => { try { return win().location.pathname + win().location.search; } catch { return ""; } };
+async function waitFor(check, timeout = 8000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+async function goto(url, width = 1280, expectPath) {
+  frame.width = width;
+  frame.src = url;
+  await sleep(150);
+  await waitFor(() => doc().readyState === "complete" && (!expectPath || path().startsWith(expectPath)));
+  await sleep(150);
+}
+const api = async (method, p, body) => {
+  const r = await fetch("/api" + p, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json().catch(() => null) };
+};
+const loginAs = (username) => api("POST", "/auth/login", { username, password: PASSWORD });
+const k = (local) => new Date(`${local}+05:00`).toISOString(); // Karachi time -> ISO
+const setDate = (collection, id, field, local) => fetch(`/_setdate/${collection}/${id}/${field}/${encodeURIComponent(k(local))}`);
+
+const sec = (name) => doc().getElementById(name);
+const bodyOf = (name) => sec(name).querySelector("[data-body]");
+const text = (el) => (el ? el.textContent.replace(/\s+/g, " ").trim() : "");
+const sectionsSettled = () => SECTIONS.every((n) => !sec(n).classList.contains("is-loading") && !bodyOf(n).querySelector(".spinner"));
+async function settle() { await sleep(100); await waitFor(sectionsSettled); await sleep(100); }
+const card = (name, label) => [...sec(name).querySelectorAll(".report-stat")].find((c) => text(c.querySelector(".stat-label")) === label);
+const cardValue = (name, label) => text(card(name, label)?.querySelector(".stat-value"));
+const rowsOf = (name) => [...sec(name).querySelectorAll(".report-table tbody tr")];
+const cellText = (row, label) => text(row.querySelector(`td[data-label="${label}"]`));
+const noSideScroll = () => doc().documentElement.scrollWidth <= doc().documentElement.clientWidth + 1;
+const setSelect = (id, value) => { const s = doc().getElementById(id); s.value = value; s.dispatchEvent(new Event("change", { bubbles: true })); };
+const toastHas = (t) => [...doc().querySelectorAll(".toast-message")].some((m) => m.textContent.includes(t));
+const byText = (root, selector, t) => [...root.querySelectorAll(selector)].find((e) => e.textContent.includes(t));
+
+// Capture CSV downloads: the page clicks a link to a blob: URL
+let downloads = [];
+function captureDownloads() {
+  downloads = [];
+  const w = win();
+  // The page's security policy doesn't allow fetch() of blob: URLs, so keep the Blob itself
+  const blobs = new Map();
+  const realCreate = w.URL.createObjectURL.bind(w.URL);
+  w.URL.createObjectURL = (blob) => { const url = realCreate(blob); blobs.set(url, blob); return url; };
+  w.HTMLAnchorElement.prototype.click = function () {
+    if (this.download) downloads.push({ name: this.download, href: this.href, blob: blobs.get(this.href) });
+  };
+}
+async function csvText(i) { return (await downloads[i].blob.text()).replace(/^﻿/, ""); }
+
+(async () => {
+  try {
+    // ================= Data (through the real API) =================
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
+    await fetch("/_failreport/payments/off"); await fetch("/_failreport/games/off");
+    if ((await loginAs("ui-admin")).status !== 200) throw new Error("admin login failed");
+    // Phase 11.3: Century is per billed minute. Rs 5/min: the 2 h VIP game = Rs 600 and the 1 h one = Rs 300,
+    // the amounts this suite was written with (section 7b sets its own rate for its 30 s sessions).
+    await api("PATCH", "/settings", { gameRates: { century: 500 }, framePrice: 15000 });
+    const vip = (await api("POST", "/tables", { tableNumber: 1, name: "VIP", hourlyRate: 99900 })).body.data;
+    const corner = (await api("POST", "/tables", { tableNumber: 2, name: "Corner", hourlyRate: 99900 })).body.data;
+    for (const t of [vip, corner]) await setDate("tables", t.id, "createdAt", "2026-01-01T00:00:00");
+
+    async function playAndBill(table, startLocal, endLocal, bill, billLocal) {
+      const s = (await api("POST", "/sessions", { tableId: table.id })).body.data;
+      await fetch(`/_backdate/${table.tableNumber}/${(new Date(k(endLocal)) - new Date(k(startLocal))) / 1000}`);
+      await api("POST", `/sessions/${s.id}/end`);
+      await setDate("sessions", s.id, "startedAt", startLocal);
+      await setDate("sessions", s.id, "endedAt", endLocal);
+      const b = (await api("POST", "/bills", { sessionId: s.id, payerRule: "loser", ...bill })).body.data;
+      await setDate("bills", b.id, "createdAt", billLocal);
+      return b;
+    }
+    // VIP: century x2 = Rs 600, Rs 200 paid cash  (10 Sep)
+    const b1 = await playAndBill(vip, "2026-09-10T08:00:00", "2026-09-10T10:00:00",
+      { gameMode: "century", quantity: 2, players: [{ name: "Ali" }, { name: "=Evil, Name", result: "loser" }] }, "2026-09-10T10:00:00");
+    const p1 = (await api("POST", `/bills/${b1.id}/payments`, { amount: 20000, method: "cash", payerName: "=Evil, Name" })).body.data.payment;
+    await setDate("payments", p1.id, "paidAt", "2026-09-10T11:00:00");
+    // Corner: frame x3 = Rs 450, fully paid by card (11 Sep)
+    const b2 = await playAndBill(corner, "2026-09-11T10:00:00", "2026-09-11T11:00:00",
+      { gameMode: "frame", quantity: 3, players: [{ name: "Usman", result: "loser" }, { name: "Bilal" }] }, "2026-09-11T12:00:00");
+    const p2 = (await api("POST", `/bills/${b2.id}/payments`, { amount: 45000, method: "card", payerName: "Usman" })).body.data.payment;
+    await setDate("payments", p2.id, "paidAt", "2026-09-11T12:05:00");
+    // VIP: a cancelled bill (10 Sep)
+    const b3 = await playAndBill(vip, "2026-09-10T14:00:00", "2026-09-10T15:00:00",
+      { gameMode: "century", quantity: 1, players: [{ name: "X", result: "loser" }, { name: "Y" }] }, "2026-09-10T15:00:00");
+    await api("POST", `/bills/${b3.id}/cancel`, {});
+    // Bookings: one left pending in the past (-> automatic no-show), one cancelled
+    const future = new Date(Date.now() + 3 * 86400e3).toISOString().slice(0, 10);
+    const bk1 = (await api("POST", "/bookings", { newCustomer: { name: "Reema", phone: "0300-1111111" }, tableId: corner.id, date: future, startTime: "18:00", durationMinutes: 60 })).body.data;
+    const bk2 = (await api("POST", "/bookings", { customerId: bk1.customer, tableId: corner.id, date: future, startTime: "20:00", durationMinutes: 60 })).body.data;
+    await api("POST", `/bookings/${bk2.id}/cancel`, {});
+    await setDate("customers", bk1.customer, "createdAt", "2026-09-01T00:00:00"); // not a "new customer" today
+    for (const [b, start] of [[bk1, "2026-09-10T18:00:00"], [bk2, "2026-09-11T20:00:00"]]) {
+      await setDate("bookings", b.id, "startAt", start);
+      await setDate("bookings", b.id, "endAt", start.replace(/T(\d\d)/, (m, h) => `T${Number(h) + 1}`));
+    }
+    ok("setup: data created through the API", b1.total === 60000 && b2.total === 45000 && bk1.id && bk2.id, { b1: b1.total, b2: b2.total });
+
+    // ================= 1. Page, period label, every section =================
+    await goto("/pages/reports.html?from=2026-09-10&to=2026-09-11", 1280, "/pages/reports.html");
+    await settle();
+    let d = doc();
+    ok("page: Reports link active in the sidebar", d.querySelector(".nav-link.active")?.getAttribute("href") === "/pages/reports.html");
+    ok("period label: '10 September 2026 – 11 September 2026'", text(d.getElementById("range-label")) === "10 September 2026 – 11 September 2026 (Custom, 2 days)", text(d.getElementById("range-label")));
+    ok("custom chip pressed and the dates filled in", d.querySelector('[data-preset="custom"]').getAttribute("aria-pressed") === "true"
+       && d.getElementById("range-from").value === "2026-09-10" && d.getElementById("range-to").value === "2026-09-11");
+
+    // Revenue
+    ok("revenue: total billed Rs 1,050.00 (cancelled bill not counted)", cardValue("revenue", "Total billed") === "Rs 1,050.00", cardValue("revenue", "Total billed"));
+    ok("revenue: paid Rs 650.00, outstanding Rs 400.00, 61.9% collected",
+       cardValue("revenue", "Total paid") === "Rs 650.00" && cardValue("revenue", "Outstanding") === "Rs 400.00" && cardValue("revenue", "Collected") === "61.9%");
+    ok("revenue: 2 bills (1 paid · 1 partly paid · 0 unpaid), 1 cancelled",
+       cardValue("revenue", "Bills") === "2" && text(card("revenue", "Bills").querySelector(".stat-hint")) === "1 paid · 1 partly paid · 0 unpaid" && cardValue("revenue", "Cancelled") === "1");
+    const canvas = sec("revenue").querySelector("canvas");
+    const chart = canvas && win().Chart.getChart(canvas);
+    ok("revenue chart: drawn with Chart.js, one bar per day", Boolean(chart) && chart.data.labels.join("|") === ["2026-09-10", "2026-09-11"].map((x) => new Date(`${x}T12:00:00Z`).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" })).join("|"), chart?.data.labels);
+    ok("revenue chart: paid / outstanding / received values come from the server",
+       JSON.stringify(chart.data.datasets.map((ds) => ds.data)) === JSON.stringify([[200, 450], [400, 0], [200, 450]]), chart?.data.datasets.map((ds) => ds.data));
+    ok("revenue chart: has a visible size", canvas.clientHeight > 150 && canvas.clientWidth > 300);
+    const revRows = rowsOf("revenue");
+    ok("revenue: daily table has the 2 days + a total row", revRows.length === 2 && text(sec("revenue").querySelector(".report-total td")) === "Total");
+    ok("revenue: 10 Sep row = billed Rs 600, paid Rs 200, outstanding Rs 400, 1 cancelled",
+       cellText(revRows[0], "Billed") === "Rs 600.00" && cellText(revRows[0], "Paid") === "Rs 200.00" && cellText(revRows[0], "Outstanding") === "Rs 400.00" && cellText(revRows[0], "Cancelled") === "1");
+
+    // Payments
+    const payRows = rowsOf("payments");
+    const payRow = (m) => payRows.find((r) => cellText(r, "Method") === m);
+    ok("payments: Cash 1 × Rs 200, Card 1 × Rs 450", cellText(payRow("Cash"), "Payments") === "1" && cellText(payRow("Cash"), "Amount") === "Rs 200.00"
+       && cellText(payRow("Card"), "Amount") === "Rs 450.00", payRows.map((r) => text(r)));
+    ok("payments: all six methods listed (JazzCash, Easypaisa, Bank transfer, Other at 0)", ["JazzCash", "Easypaisa", "Bank transfer", "Other"].every((m) => cellText(payRow(m), "Payments") === "0"));
+    ok("payments: total Rs 650.00 from 2 payments", cardValue("payments", "Total amount") === "Rs 650.00" && cardValue("payments", "Payments received") === "2");
+
+    // Games
+    const gameRows = rowsOf("games");
+    ok("games: only Century and Frame (the stored game types)", gameRows.map((r) => cellText(r, "Game type")).join(",") === "Century,Frame", gameRows.map((r) => cellText(r, "Game type")));
+    ok("games: Century 1 bill, 2 games, Rs 600; Frame 1 bill, 3 frames, Rs 450",
+       cellText(gameRows[0], "Played") === "2 games" && cellText(gameRows[0], "Total billed") === "Rs 600.00" && cellText(gameRows[0], "Cancelled") === "1"
+       && cellText(gameRows[1], "Played") === "3 frames" && cellText(gameRows[1], "Average bill") === "Rs 450.00", gameRows.map((r) => text(r)));
+
+    // Tables
+    let tableRows = rowsOf("tables");
+    ok("tables: VIP first by revenue (Rs 600), then Corner (Rs 450)", tableRows.map((r) => cellText(r, "Table")).join(",").startsWith("1VIP,2Corner")
+       && cellText(tableRows[0], "Revenue") === "Rs 600.00" && cellText(tableRows[1], "Revenue") === "Rs 450.00", tableRows.map((r) => cellText(r, "Table")));
+    ok("tables: VIP 2 sessions, 3 h played, avg 1h 30m, billed 2h 00m (cancelled bill not counted)",
+       cellText(tableRows[0], "Sessions") === "2" && cellText(tableRows[0], "Played") === "3h 00m" && cellText(tableRows[0], "Avg session") === "1h 30m"
+       && cellText(tableRows[0], "Billed time") === "2h 00m", text(tableRows[0])); // the cancelled bill's time is not billed
+    const OBSERVED_HELP = "Percentage of the selected period represented by recorded table use. This is an estimate because club opening hours and maintenance/closure time are not stored.";
+    const obsHeading = [...sec("tables").querySelectorAll("th")].find((th) => th.textContent.startsWith("Observed Utilization"));
+    ok("tables: column is called 'Observed Utilization' (not plain 'Utilization')", Boolean(obsHeading) && ![...sec("tables").querySelectorAll("th")].some((th) => th.textContent.trim() === "Utilization"));
+    const SPLIT_HELP = "Recorded table-use time is split across calendar days. A session crossing midnight contributes time to both days.";
+    const SESSIONS_HELP = "Counted on the day the session started.";
+    ok("tables: Observed Utilization tooltip = estimate + split across calendar days",
+       obsHeading?.title === `${OBSERVED_HELP} ${SPLIT_HELP}` && obsHeading.querySelector(".help-mark")?.getAttribute("aria-label") === `${OBSERVED_HELP} ${SPLIT_HELP}`, obsHeading?.title);
+    const sessHeading = [...sec("tables").querySelectorAll("th")].find((th) => th.textContent.startsWith("Sessions"));
+    ok("tables: Sessions tooltip says start day", sessHeading?.title === SESSIONS_HELP && sessHeading.querySelector(".help-mark")?.getAttribute("aria-label") === SESSIONS_HELP);
+    ok("tables: note explains why the two can differ", text(sec("tables")).includes("Sessions: Each session is counted once, on the club day (Karachi time) it started")
+       && text(sec("tables")).includes(`Observed Utilization: ${SPLIT_HELP} The two can therefore differ for the same day.`));
+    ok("tables: section hint names both rules", text(sec("tables").querySelector(".section-filters")).includes("counted on the day they started") && text(sec("tables").querySelector(".section-filters")).includes("splits recorded time across days"));
+    ok("tables: Observed Utilization shown with a %, explained as an estimate", /\d+(\.\d)?%/.test(cellText(tableRows[0], "Observed Utilization"))
+       && text(sec("tables")).includes("Observed Utilization (an estimate)") && !text(sec("tables")).includes("24-hour"));
+    setSelect("tables-sort", "tableNumber"); await settle();
+    ok("tables: sort by table number", rowsOf("tables").map((r) => cellText(r, "Sessions")).join(",") === "2,1");
+    setSelect("tables-sort", "sessions"); await settle();
+    ok("tables: sort by sessions keeps VIP first", cellText(rowsOf("tables")[0], "Sessions") === "2");
+    ok("tables: sort is kept in the address", path().includes("tsort=sessions"));
+
+    // Bookings
+    ok("bookings: 2 bookings: 1 cancelled, 1 automatic no-show", cardValue("bookings", "Total bookings") === "2" && cardValue("bookings", "Cancelled") === "1" && cardValue("bookings", "No-show") === "1",
+       [cardValue("bookings", "Total bookings"), cardValue("bookings", "No-show")]);
+    ok("bookings: rates 0% check-in / 50% no-show / 50% cancelled",
+       cardValue("bookings", "Check-in rate") === "0%" && cardValue("bookings", "No-show rate") === "50%" && cardValue("bookings", "Cancellation rate") === "50%");
+    ok("bookings: one row per day with bookings", rowsOf("bookings").length === 2);
+
+    // Customers
+    ok("customers: 1 customer with bookings, 0 checked in", cardValue("customers", "With bookings") === "1" && cardValue("customers", "Checked in") === "0");
+    ok("customers: top by bookings lists Reema (2)", text(rowsOf("customers")[0]).includes("Reema") && cellText(rowsOf("customers")[0], "Bookings") === "2");
+    ok("customers: limitation explained (no customer revenue)", text(sec("customers")).includes("not linked to customers") && !text(sec("customers")).includes("0300"));
+
+    // Outstanding
+    const outRows = rowsOf("outstanding");
+    ok("outstanding: 1 bill, Rs 400.00 remaining, players listed", outRows.length === 1 && cellText(outRows[0], "Remaining") === "Rs 400.00"
+       && cellText(outRows[0], "Players") === "Ali, =Evil, Name" && cardValue("outstanding", "Total outstanding") === "Rs 400.00");
+    ok("outstanding: bill number links to the bill on the Billing page", outRows[0].querySelector("a").getAttribute("href") === `/pages/billing.html?bill=${b1.id}`);
+
+    // ================= 2. Filters (processed by the server) =================
+    setSelect("filter-table", corner.id); await settle();
+    ok("filter table=Corner: billed Rs 450.00 only", cardValue("revenue", "Total billed") === "Rs 450.00", cardValue("revenue", "Total billed"));
+    ok("filter table=Corner: payments only the card payment", cardValue("payments", "Total amount") === "Rs 450.00");
+    ok("filter table=Corner: tables report shows only Corner", rowsOf("tables").length === 1);
+    ok("filter table=Corner: no outstanding bills -> empty state", text(bodyOf("outstanding")).includes("No outstanding bills."));
+    ok("filter kept in the address", path().includes(`tableId=${corner.id}`));
+    d.getElementById("reset-filters").click(); await settle();
+    ok("clear filters: back to Rs 1,050.00", cardValue("revenue", "Total billed") === "Rs 1,050.00" && d.getElementById("filter-table").value === "");
+    setSelect("filter-method", "cash"); await settle();
+    ok("filter method=cash: payments table shows only Cash", rowsOf("payments").map((r) => cellText(r, "Method")).join(",") === "Cash");
+    setSelect("filter-method", ""); setSelect("filter-game", "frame"); await settle();
+    ok("filter game=frame: games shows only Frame, revenue Rs 450", rowsOf("games").length === 1 && cardValue("revenue", "Total billed") === "Rs 450.00");
+    setSelect("filter-game", ""); setSelect("filter-bill-status", "partially_paid"); await settle();
+    ok("filter bill status=partly paid: 1 bill, outstanding 1 bill", cardValue("revenue", "Bills") === "1" && rowsOf("outstanding").length === 1);
+    setSelect("filter-bill-status", ""); setSelect("filter-booking-status", "no_show"); await settle();
+    // Booking status: the summary, the daily rows and the CSV are all narrowed; rates are not shown
+    const RATES_HINT = "Rates are shown only when All statuses is selected.";
+    const rateCards = () => ["Check-in rate", "No-show rate", "Cancellation rate"].map((l) => [cardValue("bookings", l), text(card("bookings", l)?.querySelector(".stat-hint"))]);
+    const banner = () => text(bodyOf("bookings").querySelector(".report-filter-banner"));
+    ok("booking status=No-show: total = no-show bookings only (1)", cardValue("bookings", "No-show bookings") === "1" && !card("bookings", "Total bookings"), cardValue("bookings", "No-show bookings"));
+    ok("booking status=No-show: only the No-show status card", cardValue("bookings", "No-show") === "1" && !card("bookings", "Cancelled") && !card("bookings", "Pending"));
+    ok("booking status=No-show: rates are '—' (not 100%) with the explanation",
+       rateCards().every(([v, h]) => v === "—" && h === RATES_HINT) && !text(sec("bookings")).includes("100%"), rateCards());
+    ok("booking status=No-show: 'Filtered' notice shown", banner().startsWith("Filtered:") && banner().includes('"No-show"'));
+    ok("booking status=No-show: daily rows only that status", rowsOf("bookings").length === 1
+       && [...sec("bookings").querySelectorAll("th")].map((th) => text(th)).join(",") === "Date,No-show" && cellText(rowsOf("bookings")[0], "No-show") === "1");
+    captureDownloads();
+    sec("bookings").querySelector('[data-export="bookings"]').click();
+    await waitFor(() => downloads.length === 1);
+    const noShowCsv = (await csvText(0)).trim().split("\r\n");
+    ok("booking status=No-show: CSV only no-show rows, no phone", noShowCsv.length === 2 && noShowCsv[1].includes(",no_show,") && !noShowCsv.join("").includes("0300"), noShowCsv);
+
+    setSelect("filter-booking-status", "cancelled"); await settle();
+    ok("booking status=Cancelled: total 1, rates '—', rows only cancelled", cardValue("bookings", "Cancelled bookings") === "1"
+       && rateCards().every(([v]) => v === "—") && rowsOf("bookings").length === 1 && cellText(rowsOf("bookings")[0], "Cancelled") === "1");
+    sec("bookings").querySelector('[data-export="bookings"]').click();
+    await waitFor(() => downloads.length === 2);
+    const cancelledCsv = (await csvText(1)).trim().split("\r\n");
+    ok("booking status=Cancelled: CSV only cancelled rows", cancelledCsv.length === 2 && cancelledCsv[1].includes(",cancelled,"), cancelledCsv);
+
+    for (const [status, label] of [["pending", "Pending"], ["confirmed", "Confirmed"], ["completed", "Checked in"]]) {
+      setSelect("filter-booking-status", status); await settle();
+      ok(`booking status=${label}: none in the period -> clear empty message, no percentages`,
+         text(bodyOf("bookings")).includes(`No "${label}" bookings in the selected period.`) && banner().includes(`"${label}"`) && !/\d%/.test(text(bodyOf("bookings"))), text(bodyOf("bookings")).slice(0, 120));
+    }
+    setSelect("filter-booking-status", "no_show"); setSelect("filter-table", vip.id); await settle();
+    ok("booking status + table filter together: No-show on VIP = none", text(bodyOf("bookings")).includes('No "No-show" bookings'));
+    setSelect("filter-table", corner.id); await settle();
+    ok("booking status + table filter together: No-show on Corner = 1", cardValue("bookings", "No-show bookings") === "1");
+    setSelect("filter-table", ""); setSelect("filter-booking-status", ""); await settle();
+    ok("booking status=All: full summary and real rates again", cardValue("bookings", "Total bookings") === "2"
+       && rateCards().map(([v]) => v).join(",") === "0%,50%,50%" && !banner() && rowsOf("bookings").length === 2, rateCards());
+    ok("booking status=All: all status columns in the daily rows", [...sec("bookings").querySelectorAll("th")].map((th) => text(th)).join(",") === "Date,Total,Pending,Confirmed,Checked in,Cancelled,No-show");
+
+    // ================= 3. CSV export (same filters) =================
+    captureDownloads();
+    sec("revenue").querySelector('[data-export="revenue"]').click();
+    await waitFor(() => downloads.length === 1);
+    ok("CSV revenue: file name has the period", downloads[0]?.name === "revenue_2026-09-10_to_2026-09-11.csv", downloads[0]?.name);
+    let csv = await csvText(0);
+    ok("CSV revenue: 2 days + total, amounts in rupees", csv.trim().split("\r\n").length === 4 && csv.includes("2026-09-10,1,1,600.00,200.00,400.00,200.00,1") && csv.includes("Total,2,1,1050.00,650.00,400.00,650.00,2"), csv);
+    ok("CSV export: success message shown", await waitFor(() => toastHas("Downloaded revenue_")));
+    setSelect("filter-table", corner.id); await settle();
+    sec("payments").querySelector('[data-export="payments"]').click();
+    await waitFor(() => downloads.length === 2);
+    csv = await csvText(1);
+    ok("CSV payments with table filter: only Corner's card payment", csv.trim().split("\r\n").length === 2 && csv.includes(",card,450.00,Ui Admin"), csv);
+    d.getElementById("reset-filters").click(); await settle();
+    for (const name of ["outstanding", "tables", "bookings", "games", "payments"]) sec(name).querySelector(`[data-export="${name}"]`).click();
+    await waitFor(() => downloads.length === 7);
+    const files = {};
+    for (let i = 2; i < downloads.length; i++) files[downloads[i].name.split("_")[0]] = await csvText(i);
+    ok("CSV outstanding: players with a comma are quoted", files.outstanding?.includes(`"Ali, =Evil, Name"`), files.outstanding);
+    ok("CSV payments: a payer name starting with = is made harmless", files.payments?.includes(`,"'=Evil, Name",cash,200.00,`), files.payments);
+    ok("CSV tables: header + 2 tables", files.tables?.trim().split("\r\n").length === 3);
+    ok("CSV bookings: no phone numbers", files.bookings?.includes("Reema") && !files.bookings.includes("0300"));
+    ok("CSV games: Century and Frame rows", files.games?.includes("century,1,1,2,600.00") && files.games.includes("frame,1,0,3,450.00"), files.games);
+    ok("CSV: no password hashes or tokens", !Object.values(files).join("").match(/scrypt|passwordHash|scp_session/));
+
+    // ================= 4. Print =================
+    let printed = null;
+    win().print = () => {
+      printed = {
+        visible: [...doc().querySelectorAll(".report-section")].filter((s) => !s.classList.contains("print-skip")).map((s) => s.id),
+        range: text(doc().getElementById("print-range")), meta: text(doc().getElementById("print-meta")),
+        detailsOpen: [...doc().querySelectorAll(".report-details")].every((x) => x.open),
+      };
+    };
+    sec("tables").querySelector('[data-print="tables"]').click();
+    ok("print one section: only Table performance is printed", printed?.visible.join(",") === "tables", printed);
+    ok("print header: period and who printed it", printed?.range === "Period: 10 September 2026 – 11 September 2026 (Karachi time)" && printed.meta.includes("by Ui Admin"), printed);
+    win().dispatchEvent(new Event("afterprint"));
+    ok("after printing: all sections back on screen", doc().querySelectorAll(".print-skip").length === 0);
+    printed = null;
+    doc().getElementById("print-all-button").click();
+    await waitFor(() => printed); // the complete Outstanding list is fetched first, then the print window opens
+    ok("print whole report: all 9 sections, daily list opened", printed?.visible.length === 9 && printed.detailsOpen, printed);
+    win().dispatchEvent(new Event("afterprint"));
+
+    // ================= 5. API failure + Retry =================
+    await fetch("/_failreport/payments/on");
+    setSelect("filter-method", "card"); await settle();
+    let alert = sec("payments").querySelector(".report-error");
+    ok("API failure: clear error in the Payments section", alert && !alert.hidden && text(alert).includes("The database is not available.") && text(alert).includes("still for 10 September 2026"), text(alert));
+    ok("API failure: previous good figures kept (not zeros), marked old", bodyOf("payments").classList.contains("is-stale") && cardValue("payments", "Total amount") === "Rs 650.00");
+    ok("API failure: other sections still updated", rowsOf("payments").length === 6 && cardValue("revenue", "Total billed") === "Rs 1,050.00");
+    ok("API failure: no stack trace or internals shown", !/Error:|Mongo|stack|\.js:/i.test(text(alert)));
+    alert.querySelector("button").click(); await settle();
+    ok("Retry while still failing: error stays", !sec("payments").querySelector(".report-error").hidden);
+    await fetch("/_failreport/payments/off");
+    sec("payments").querySelector(".report-error button").click(); await settle();
+    ok("Retry after recovery: error gone, new figures (card only)", sec("payments").querySelector(".report-error").hidden
+       && cardValue("payments", "Total amount") === "Rs 450.00" && !bodyOf("payments").classList.contains("is-stale"));
+    setSelect("filter-method", ""); await settle();
+
+    // First load fails -> "could not load", never zeros
+    await fetch("/_failreport/games/on");
+    await goto("/pages/reports.html?from=2026-09-10&to=2026-09-11", 1280, "/pages/reports.html"); await settle();
+    alert = sec("games").querySelector(".report-error");
+    ok("first-load failure: 'couldn't be loaded' + Retry, no fake table", alert && text(alert).includes("This report couldn't be loaded.") && text(bodyOf("games")).includes("Could not load") && rowsOf("games").length === 0);
+    ok("first-load failure: other reports loaded normally", cardValue("revenue", "Total billed") === "Rs 1,050.00");
+    await fetch("/_failreport/games/off");
+    alert.querySelector("button").click(); await settle();
+    ok("first-load failure: Retry loads the report", rowsOf("games").length === 2 && alert.hidden);
+
+    // ================= 6. Presets & custom range =================
+    const today = (await api("GET", "/reports/options")).body.data.today;
+    const long = (t) => new Date(`${t}T12:00:00Z`).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "UTC" });
+    doc().querySelector('[data-preset="today"]').click(); await settle();
+    ok("preset Today: label is the club's today", text(doc().getElementById("range-label")) === `${long(today)} (Today, 1 day)`, text(doc().getElementById("range-label")));
+    ok("preset Today: chip pressed, custom form hidden", doc().querySelector('[data-preset="today"]').getAttribute("aria-pressed") === "true" && doc().getElementById("custom-range").hidden);
+    ok("empty period: 'No data for the selected period.'", text(bodyOf("revenue")).includes("No data for the selected period.") && !sec("revenue").querySelector("canvas"));
+    ok("empty period: every section shows an empty message (no fake charts)",
+       ["No payments in the selected period.", "No bills in the selected period.", "No matches in the selected period.", "No player activity in the selected period.", "No sessions in the selected period.", "No bookings in the selected period.", "No customer activity in the selected period.", "No outstanding bills."]
+         .every((msg, i) => text(bodyOf(SECTIONS[i + 1])).includes(msg)), SECTIONS.slice(1).map((n) => text(bodyOf(n)).slice(0, 50)));
+    doc().querySelector('[data-preset="last7"]').click(); await settle();
+    ok("preset Last 7 days: '(Last 7 days, 7 days)'", text(doc().getElementById("range-label")).endsWith("(Last 7 days, 7 days)"));
+    doc().querySelector('[data-preset="yesterday"]').click(); await settle();
+    ok("preset Yesterday", text(doc().getElementById("range-label")).endsWith("(Yesterday, 1 day)"));
+    doc().querySelector('[data-preset="last30"]').click(); await settle();
+    ok("preset Last 30 days", text(doc().getElementById("range-label")).endsWith("(Last 30 days, 30 days)"));
+    doc().querySelector('[data-preset="thisMonth"]').click(); await settle();
+    ok("preset This month starts on the 1st", text(doc().getElementById("range-label")).startsWith(`1 ${long(today).split(" ").slice(1).join(" ")}`));
+    doc().querySelector('[data-preset="prevMonth"]').click(); await settle();
+    ok("preset Previous month", text(doc().getElementById("range-label")).includes("(Previous month,"));
+    doc().querySelector('[data-preset="custom"]').click(); await sleep(150);
+    ok("custom: form opens with the current period", !doc().getElementById("custom-range").hidden && doc().getElementById("range-from").value.endsWith("-01"));
+    doc().getElementById("range-from").value = "2026-09-11"; doc().getElementById("range-to").value = "2026-09-10";
+    doc().getElementById("custom-range").requestSubmit(); await sleep(150);
+    ok("custom: To before From is refused before asking the server", !doc().getElementById("custom-error").hidden && text(doc().getElementById("custom-error")).includes("can't be before"));
+    doc().getElementById("range-from").value = "2026-09-10"; doc().getElementById("range-to").value = "2026-09-10";
+    doc().getElementById("custom-range").requestSubmit(); await settle();
+    ok("custom: single day 10 September 2026, billed Rs 600", text(doc().getElementById("range-label")) === "10 September 2026 (Custom, 1 day)" && cardValue("revenue", "Total billed") === "Rs 600.00");
+
+    // Outstanding: sort + all dates
+    setSelect("outstanding-sort", "balance"); await settle();
+    doc().getElementById("outstanding-all").click(); await settle();
+    ok("outstanding: 'All dates' still 1 open bill, sort kept", rowsOf("outstanding").length === 1 && path().includes("oall=1") && path().includes("osort=balance"));
+
+    // ================= 7. Responsive =================
+    for (const width of [375, 820]) {
+      await goto("/pages/reports.html?from=2026-09-10&to=2026-09-11", width, "/pages/reports.html"); await settle();
+      const c = sec("revenue").querySelector("canvas");
+      ok(`${width}px: no sideways page scroll`, noSideScroll(), { scroll: doc().documentElement.scrollWidth, client: doc().documentElement.clientWidth });
+      ok(`${width}px: chart fits and is readable`, c.clientWidth <= doc().documentElement.clientWidth && c.clientWidth > 250 && c.clientHeight >= 200, { w: c.clientWidth, h: c.clientHeight });
+      ok(`${width}px: wide tables stay inside their box`, [...doc().querySelectorAll(".report-section")].every((s) => s.getBoundingClientRect().right <= doc().documentElement.clientWidth + 1));
+      if (width === 375) {
+        ok("375px: tables become labelled cards", getComputedStyle(rowsOf("tables")[0]).display === "block");
+        ok("375px: filters in two columns", getComputedStyle(doc().getElementById("report-filters")).gridTemplateColumns.split(" ").length === 2);
+      }
+    }
+    await goto("/pages/reports.html?from=2026-09-10&to=2026-09-11", 1440, "/pages/reports.html"); await settle();
+    ok("1440px: no sideways page scroll", noSideScroll());
+    // Booking status selected + Observed Utilization column, at every width
+    for (const width of [375, 820, 1280, 1440]) {
+      await goto("/pages/reports.html?from=2026-09-10&to=2026-09-11&bookingStatus=no_show", width, "/pages/reports.html"); await settle();
+      const rates = ["Check-in rate", "No-show rate", "Cancellation rate"].map((l) => cardValue("bookings", l));
+      ok(`${width}px, booking status=No-show: rates '—', notice visible, no sideways scroll`,
+         rates.every((v) => v === "—") && bodyOf("bookings").querySelector(".report-filter-banner").getBoundingClientRect().width > 0 && noSideScroll(), { rates, scroll: doc().documentElement.scrollWidth });
+      if (width >= 1280) {
+        const box = sec("tables").querySelector(".table-scroll");
+        ok(`${width}px: the whole Table performance grid fits (Observed Utilization column not cut off)`, box.scrollWidth <= box.clientWidth + 1, { scroll: box.scrollWidth, client: box.clientWidth });
+        const marks = [...sec("tables").querySelectorAll("th .help-mark")].map((m) => m.getBoundingClientRect());
+        ok(`${width}px: both heading help marks visible inside the table`, marks.length === 2 && marks.every((r) => r.width > 0 && r.right <= box.getBoundingClientRect().right + 1));
+      } else {
+        // Phones/tablets: headings become labels on each card; the explanation note stays readable
+        const noteBox = [...sec("tables").querySelectorAll(".report-note")].find((n) => n.textContent.startsWith("Sessions:"));
+        ok(`${width}px: the Sessions / Observed Utilization explanation is visible and wraps`, noteBox && noteBox.getBoundingClientRect().right <= doc().documentElement.clientWidth + 1);
+      }
+      const obs = [...sec("tables").querySelectorAll('td[data-label="Observed Utilization"]')];
+      ok(`${width}px: Observed Utilization values inside the page`, obs.length >= 2 && obs.every((td) => td.getBoundingClientRect().right <= sec("tables").getBoundingClientRect().right + 1 || width > 640));
+    }
+
+    // ================= 7b. Outstanding: Print has EVERY matching bill, not just the page on screen =================
+    // 28 unpaid bills on 12 Sep: 20 on VIP, 8 on Corner (more than one page of 25)
+    const sep12 = [];
+    await api("PATCH", "/settings", { gameRates: { century: 2000 } }); // 30 s sessions = 15 billed min × Rs 20 = Rs 300 each
+    for (let n = 0; n < 28; n += 1) {
+      const table = n < 20 ? vip : corner;
+      const minute = String(n).padStart(2, "0");
+      sep12.push(await playAndBill(table, `2026-09-12T09:${minute}:00`, `2026-09-12T09:${minute}:30`,
+        { gameMode: "century", quantity: 1, players: [{ name: `P${n}` }, { name: "Loser", result: "loser" }] }, `2026-09-12T10:${minute}:00`));
+    }
+    await goto("/pages/reports.html?from=2026-09-12&to=2026-09-12", 1280, "/pages/reports.html"); await settle();
+    ok("outstanding screen: page 1 has 25 bills", rowsOf("outstanding").length === 25 && text(sec("outstanding").querySelector(".pager-text")) === "Page 1 of 2");
+    const page1Numbers = rowsOf("outstanding").map((r) => cellText(r, "Bill"));
+    byText(sec("outstanding"), ".pager button", "Next").click(); await settle();
+    const page2Numbers = rowsOf("outstanding").map((r) => cellText(r, "Bill"));
+    ok("outstanding screen: page 2 has the other 3", page2Numbers.length === 3 && text(sec("outstanding").querySelector(".pager-text")) === "Page 2 of 2");
+
+    let printCalls = 0;
+    let snapshot = null;
+    win().print = () => {
+      printCalls += 1;
+      const block = doc().querySelector("#outstanding .outstanding-print");
+      snapshot = block && {
+        complete: sec("outstanding").classList.contains("has-complete-print"),
+        heading: text(block.querySelector("h3")),
+        summary: text(block.querySelector(".report-note")),
+        rows: [...block.querySelectorAll("tbody tr")].map((r) => cellText(r, "Bill")),
+        statuses: [...block.querySelectorAll("tbody tr")].map((r) => cellText(r, "Status")),
+        totalRow: text(block.querySelector(".report-total")),
+        meta: text(doc().getElementById("print-meta")),
+        range: text(doc().getElementById("print-range")),
+      };
+    };
+    const outPrint = sec("outstanding").querySelector('[data-print="outstanding"]');
+    outPrint.click();
+    ok("print: button shows a loading state while the full list is fetched", outPrint.disabled && text(outPrint).includes("Preparing"));
+    await waitFor(() => printCalls === 1);
+    ok("print: all 28 bills, not just the page on screen", snapshot?.rows.length === 28, snapshot?.rows.length);
+    ok("print: includes page 1 AND page 2 bills, in the screen order", JSON.stringify(snapshot?.rows) === JSON.stringify([...page1Numbers, ...page2Numbers]));
+    ok("print: heading with the count; total outstanding Rs 8,400.00", snapshot?.heading === "Outstanding bills: 28 bills (12 September 2026)"
+       && snapshot.summary.startsWith("Total outstanding Rs 8,400.00") && snapshot.totalRow.includes("Total (28)") && snapshot.totalRow.includes("Rs 8,400.00"), snapshot);
+    ok("print: only unpaid / partly paid bills", snapshot?.statuses.every((s) => s === "Unpaid" || s === "Partially paid"));
+    ok("print: period, print time and who printed it", snapshot?.range === "Period: 12 September 2026 (Karachi time)" && /Printed .* by Ui Admin$/.test(snapshot.meta), snapshot);
+    ok("print: the on-screen page is replaced on paper only", snapshot?.complete === true);
+    ok("print: button back to normal", !outPrint.disabled && text(outPrint) === "Print");
+    win().dispatchEvent(new Event("afterprint"));
+    ok("after printing: screen still shows page 2 (3 bills), print list removed", rowsOf("outstanding").length === 3 && !doc().querySelector(".outstanding-print") && !sec("outstanding").classList.contains("has-complete-print"));
+
+    // With a filter: only Corner's 8 bills
+    setSelect("filter-table", corner.id); await settle();
+    sec("outstanding").querySelector('[data-print="outstanding"]').click();
+    await waitFor(() => printCalls === 2);
+    ok("print with table filter: only Corner's 8 bills, total Rs 2,400.00", snapshot?.rows.length === 8 && snapshot.summary.startsWith("Total outstanding Rs 2,400.00") && snapshot.meta.includes("Table 2 · Corner"), snapshot);
+    win().dispatchEvent(new Event("afterprint"));
+    // Whole report: the outstanding part is complete too
+    setSelect("filter-table", ""); await settle();
+    doc().getElementById("print-all-button").click();
+    await waitFor(() => printCalls === 3);
+    ok("Print report (all sections): Outstanding part has all 28", snapshot?.rows.length === 28);
+    win().dispatchEvent(new Event("afterprint"));
+    // Nothing matches: a clear sentence, not an empty table
+    setSelect("filter-bill-status", "paid"); await settle();
+    sec("outstanding").querySelector('[data-print="outstanding"]').click();
+    await waitFor(() => printCalls === 4);
+    ok("print with no matching bills: empty message, no table", snapshot?.heading === "Outstanding bills: 0 bills (12 September 2026)" && snapshot.rows.length === 0
+       && text(doc().querySelector(".outstanding-print")).includes("No outstanding bills match the selected period and filters."), snapshot);
+    win().dispatchEvent(new Event("afterprint"));
+    setSelect("filter-bill-status", ""); await settle();
+    // Server failure: clear error, NOTHING printed
+    await fetch("/_failreport/outstanding-print/on");
+    sec("outstanding").querySelector('[data-print="outstanding"]').click();
+    ok("print failure: error shown", await waitFor(() => toastHas("Nothing was printed. The database is not available.")));
+    ok("print failure: the print window was NOT opened", printCalls === 4 && !doc().querySelector(".outstanding-print"));
+    await fetch("/_failreport/outstanding-print/off");
+    // Safety limit: 2,001 outstanding bills on one day -> refused with advice, not shortened
+    await fetch(`/_bulkbills/2001/${encodeURIComponent(k("2026-09-13T12:00:00"))}`);
+    await goto("/pages/reports.html?from=2026-09-13&to=2026-09-13", 1280, "/pages/reports.html"); await settle();
+    win().print = () => { printCalls += 1; };
+    ok("2,001 bills: the screen still pages normally (81 pages)", rowsOf("outstanding").length === 25 && text(sec("outstanding").querySelector(".pager-text")) === "Page 1 of 81");
+    sec("outstanding").querySelector('[data-print="outstanding"]').click();
+    ok("print limit: 'too many to print' message recommending filters or CSV",
+       await waitFor(() => toastHas("There are too many outstanding bills to print at once (more than 2,000). Narrow the period or the filters, or use CSV export.")));
+    ok("print limit: nothing printed", printCalls === 4);
+    // Print controls stay usable on a phone
+    await goto("/pages/reports.html?from=2026-09-12&to=2026-09-12", 375, "/pages/reports.html"); await settle();
+    const phonePrint = sec("outstanding").querySelector('[data-print="outstanding"]').getBoundingClientRect();
+    ok("375px: Outstanding Print/CSV buttons visible and inside the screen, no sideways scroll", phonePrint.width > 0 && phonePrint.right <= doc().documentElement.clientWidth && noSideScroll());
+
+    // ================= 8. Roles =================
+    await goto("/pages/dashboard.html", 1280, "/pages/dashboard.html");
+    await waitFor(() => doc().querySelector(".user-name"));
+    ok("admin dashboard: 'View Reports' quick action", !doc().querySelector('.quick-action[href="/pages/reports.html"]').hidden);
+    await api("POST", "/auth/logout");
+    await loginAs("ui-staff");
+    await goto("/pages/reports.html?from=2026-09-10&to=2026-09-11", 1280, "/pages/reports.html"); await settle();
+    ok("staff: can open Reports and see the figures", path().startsWith("/pages/reports.html") && cardValue("revenue", "Total billed") === "Rs 1,050.00");
+    ok("staff: Reports in the sidebar", [...doc().querySelectorAll("#sidebar-nav a")].some((a) => a.getAttribute("href") === "/pages/reports.html"));
+    await api("POST", "/auth/logout");
+    await loginAs("ui-cashier");
+    await goto("/pages/reports.html", 1280, "/pages/dashboard.html");
+    ok("cashier: Reports page refused by the server -> dashboard", path().startsWith("/pages/dashboard.html"), path());
+    await waitFor(() => doc().querySelector(".user-name"));
+    ok("cashier: no Reports link and no 'View Reports' action", ![...doc().querySelectorAll("#sidebar-nav a")].some((a) => a.getAttribute("href") === "/pages/reports.html")
+       && doc().querySelector('.quick-action[href="/pages/reports.html"]').hidden);
+    const cashierApi = await api("GET", "/reports/revenue?from=2026-09-10&to=2026-09-11");
+    ok("cashier: direct API call -> 403", cashierApi.status === 403 && cashierApi.body.message === "You don't have permission to do this.");
+    const cashierCsv = await fetch("/api/reports/export/revenue?from=2026-09-10&to=2026-09-11");
+    ok("cashier: direct CSV export -> 403", cashierCsv.status === 403);
+    await api("POST", "/auth/logout");
+    ok("logged out: reports API -> 401", (await api("GET", "/reports/revenue")).status === 401);
+    await loginAs("ui-admin");
+  } catch (e) {
+    log.push("FAIL harness crashed: " + e.message + " " + e.stack);
+  }
+  const fails = log.filter((l) => l.startsWith("FAIL")).length;
+  document.getElementById("out").textContent = log.join("\n") + `\n\nTOTAL ${log.length - fails} passed, ${fails} failed`;
+})();
+</script>
+</body></html>
