@@ -845,8 +845,14 @@ a.btn {
     font-size: 13px;
 }
 
-/* Phones: number + name on top, the timer below, then the buttons (Matches, Café, End) on their own row */
-@media (max-width: 640px) {
+/* Narrow lists (phones, and the half-width Active sessions panel on the dashboard): number + name on top,
+   the timer below, then the buttons (Matches, Café, End) on their own row. Measured on the list itself,
+   not the screen, so a wide screen with a narrow panel never squeezes the table name to one letter per line. */
+.panel-body-list {
+    container-type: inline-size;
+}
+
+@container (max-width: 720px) {
     .session-row {
         grid-template-columns: auto minmax(0, 1fr) auto;
         grid-template-areas:

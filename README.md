@@ -5,6 +5,25 @@ customers, payments, reports, and optional inventory and matches.
 
 **Stack:** HTML · CSS · JavaScript · Node.js · Express · MongoDB (Mongoose) · Chart.js
 
+![Dashboard](docs/screenshots/dashboard.png)
+
+## Screenshots
+
+*All screenshots use demo data.*
+
+| | |
+|---|---|
+| **Tables:** live timers, start and end sessions<br>![Tables](docs/screenshots/tables.png) | **Sessions:** running sessions and history<br>![Sessions](docs/screenshots/sessions.png) |
+| **Billing:** bills, payments and balances<br>![Billing](docs/screenshots/billing.png) | **Bookings:** day view and check-in<br>![Bookings](docs/screenshots/bookings.png) |
+| **Reports:** revenue, payments, charts, CSV<br>![Reports](docs/screenshots/reports.png) | **Café Products:** prices, stock, low-stock warning<br>![Café Products](docs/screenshots/cafe.png) |
+| **Players:** registered players and history<br>![Players](docs/screenshots/players.png) | **Settings:** rate list, time rule, tax<br>![Settings](docs/screenshots/settings.png) |
+| **Backup (XML):** every N hours, Backup Now, download<br>![Backup](docs/screenshots/backup.png) | **Login**<br>![Login](docs/screenshots/login.png) |
+
+<p align="center">
+  <img src="docs/screenshots/mobile-dashboard.png" alt="Dashboard on a phone" width="260"><br>
+  <em>Works on phones and tablets too</em>
+</p>
+
 ## Status
 
 | Phase | | Status |
