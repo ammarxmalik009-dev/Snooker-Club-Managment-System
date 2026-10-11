@@ -1,0 +1,129 @@
+# PostgreSQL Migration & Online Deployment
+
+Goal: move Snooker Club Pro from MongoDB (Mongoose) to PostgreSQL, host the backend API on
+**Railway** and the frontend (`client/`) on **Vercel** — without changing the app's behaviour,
+API contract (JSON shapes, string IDs, status codes, error messages) or business rules.
+
+This file is the plan **and** the progress log. Update the checklist after every step.
+
+## Ground rules
+
+- `main` keeps the working MongoDB app until the PostgreSQL version is fully tested.
+  Phases 2–4 happen on a separate `postgres` branch.
+- Never delete, overwrite or "migrate in place" the club's real database or backups.
+- Never commit `.env`, passwords, connection strings or `AUTH_SECRET`.
+- Never weaken login, roles, the origin check, validation or security headers to make deployment work.
+- Never remove or skip a failing test; never claim a step is done without real test output.
+- Small commits, one logical change each.
+
+## Baseline (before any Phase 1 change)
+
+Recorded on 2026-10-11 at commit `a0ce843` (`main`), MongoDB via `npm run db`:
+
+| Suite | Command | Result |
+|---|---|---|
+| Server tests (25 files) | `npm.cmd test` | **265 passed, 0 failed** |
+| Browser suites (14) | `npm.cmd run test:browser` | **741 passed, 0 failed** |
+
+These numbers are the floor: later runs must not have fewer tests or any failures.
+
+## Target architecture
+
+```
+Browser ──► https://<app>.vercel.app            (static files from client/)
+              │  /api/*  rewrite (server-side, same origin for the browser)
+              ▼
+            https://<api>.up.railway.app/api/*   (Express, NODE_ENV=production)
+              │
+              ▼
+            Railway PostgreSQL (DATABASE_URL)    + volume /data/backups (BACKUP_DIR)
+```
+
+Because Vercel **rewrites** `/api/*` to Railway, the browser only ever talks to the Vercel
+domain: the login cookie stays first-party, `SameSite=Strict` keeps working and no CORS is needed.
+The Express server then sees `Origin: https://<app>.vercel.app` with `Host: <api>.up.railway.app`,
+so the origin check must accept an explicit allow-list (`ALLOWED_ORIGINS`) — never "any origin".
+
+## Phases
+
+### Phase 1 — Deployment readiness (on `main`, MongoDB untouched)
+
+| # | Step | Files |
+|---|---|---|
+| 1.1 | This document + baseline results | `docs/POSTGRES_MIGRATION.md` |
+| 1.2 | `TRUST_PROXY` setting → `app.set("trust proxy", …)`, so `req.ip` (login throttle) is the real client IP behind Railway/Vercel | `server/config/env.js`, `server/app.js`, tests |
+| 1.3 | `ALLOWED_ORIGINS`: the origin check accepts the same host **or** an exact allow-listed origin; everything else stays 403 | `server/config/env.js`, `server/middleware/auth.js`, tests |
+| 1.4 | Vendored Chart.js: a committed copy in `client/vendor/`, so Vercel can serve it (no `node_modules` there) | `client/vendor/chart.umd.min.js`, `server/app.js`, tests |
+| 1.5 | Client-side page-role guard (user experience only — the API's `requirePermission` stays the real protection) | `client/js/core/layout.js`, tests |
+| 1.6 | `client/vercel.json` (API rewrite with a placeholder Railway URL, `/` → dashboard, security headers) + `client/404.html` | `client/vercel.json`, `client/404.html`, tests |
+| 1.7 | Docs + `.env.example`; full server + browser test runs | `README.md`, `docs/ARCHITECTURE.md`, `.env.example` |
+
+### Phase 2 — PostgreSQL foundation (branch `postgres`)
+
+- `pg` pool from `DATABASE_URL`, query + transaction helpers, row mappers that keep today's JSON (UUIDs as strings).
+- Numbered SQL migrations with a `schema_migrations` table; tables, foreign keys, indexes, unique and check constraints.
+- Check Railway's PostgreSQL version and extensions (e.g. `btree_gist` for booking overlap) **before** relying on them; otherwise use a tested alternative (row locks inside a transaction).
+- Local PostgreSQL on Windows (portable, like `npm run db` today) and throw-away test databases whose name must contain `test` (same safety rule as `server/tests/helpers/testDb.js`).
+- Mongoose stays installed.
+
+### Phase 3 — Port services, one at a time (tests after each)
+
+Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
+café orders → bookings → matches → bills/payments → player history → dashboard → reports → backup/restore.
+
+Parameterised SQL only. Real transactions for money, stock and sessions. Special care:
+concurrent payments (no overpaying), booking overlaps, one active session per table, stock
+deduct/restore, duplicate bills, match/bill numbers, last-admin protection, report day edges in
+`Asia/Karachi`, foreign keys during restore.
+
+### Phase 4 — Tests and data import
+
+- Port server and browser tests to PostgreSQL; add concurrency, rollback and constraint tests.
+- `importMongoBackup.js`: read the existing XML backup, map ObjectIds → deterministic UUIDs, keep all
+  references (embedded players, bill lines, actor fields), import in one transaction, then compare
+  counts and sample bills, payments, player histories, reports, settings and stock.
+- Try it on a separate local PostgreSQL database first. The MongoDB database is only read.
+- Remove Mongoose only after all of the above passes.
+
+### Phase 5 — Deploy
+
+- **Railway:** PostgreSQL service; Node service from GitHub; start command runs migrations, then the server;
+  env vars `DATABASE_URL`, `NODE_ENV=production`, `AUTH_SECRET`, `COOKIE_SECURE=true`, `TRUST_PROXY`,
+  `ALLOWED_ORIGINS`, `CLUB_TIMEZONE=Asia/Karachi`, `BACKUP_DIR=/data/backups` (volume); health check
+  `/api/health`; **one replica** (the no-show and backup timers in `server/server.js` run in every replica).
+- **Vercel:** root directory `client/`, no build step, real Railway URL in `client/vercel.json`.
+- Verify live: login through the Vercel domain, secure cookie, origin check, real client IP in the
+  login throttle, roles and page access, full workflow, backups survive a redeploy.
+
+## Environment variables (new or changed)
+
+| Name | Phase | Example (placeholders only) | Meaning |
+|---|---|---|---|
+| `TRUST_PROXY` | 1 | `1` | how many proxies sit in front of the app (empty/`false` = none, the club-PC default) |
+| `ALLOWED_ORIGINS` | 1 | `https://<app>.vercel.app` | extra origins allowed to send changes (comma-separated, exact match) |
+| `DATABASE_URL` | 2 | *(set in Railway / `.env`, never in Git)* | PostgreSQL connection string |
+
+## Known risks
+
+- Which header carries the real client IP through Vercel → Railway, and how many hops to trust, must be
+  checked on the live deployment (Phase 5). A wrong value either locks everyone out together (all share
+  the proxy IP) or lets a client fake its IP. `TRUST_PROXY` is therefore configurable, not hard-coded.
+- Pages on Vercel are plain static files: the server's `pageGuard` does not run there. Data stays
+  protected because every `/api` route checks the login and role on the server.
+- Railway volumes: confirm the plan supports a persistent volume for `/data/backups`.
+
+## Progress checklist
+
+- [x] Inspection of repo, tests, backups (2026-10-11)
+- [x] Baseline tests recorded (265 server / 741 browser)
+- [x] 1.1 Migration document
+- [ ] 1.2 `TRUST_PROXY`
+- [ ] 1.3 `ALLOWED_ORIGINS` origin check
+- [ ] 1.4 Vendored Chart.js
+- [ ] 1.5 Client-side page-role guard
+- [ ] 1.6 `client/vercel.json` + `client/404.html`
+- [ ] 1.7 Docs + full test runs
+- [ ] Phase 2 — PostgreSQL foundation
+- [ ] Phase 3 — Services ported
+- [ ] Phase 4 — Tests + Mongo import verified
+- [ ] Phase 5 — Live on Railway + Vercel, verified
