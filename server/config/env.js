@@ -2,6 +2,7 @@
 // Every other file imports settings from here instead of using process.env directly.
 
 const path = require("node:path");
+const net = require("node:net");
 const dotenv = require("dotenv");
 
 dotenv.config({ path: path.join(__dirname, "..", "..", ".env"), quiet: true });
@@ -52,6 +53,38 @@ function readNumber(value, fallback, min, max, name) {
   return number;
 }
 
+// Which proxies in front of the app may tell us the visitor's real IP (X-Forwarded-For).
+// The IP is used by the login throttle, so trusting too much lets anyone fake their IP,
+// and trusting too little makes every visitor look like the proxy (one lock for everybody).
+//   empty / false / 0       no proxy: the club PC (default) - X-Forwarded-For is ignored
+//   1 to 5                  the number of proxies in front of the app (hosting, e.g. Railway)
+//   loopback, 10.0.0.0/8    a comma list of trusted proxy addresses (IP, IP/prefix or loopback/linklocal/uniquelocal)
+// "true" (trust every proxy) is refused: then any visitor could send a fake X-Forwarded-For.
+const PROXY_NAMES = ["loopback", "linklocal", "uniquelocal"];
+
+function isProxyAddress(item) {
+  if (PROXY_NAMES.includes(item)) return true;
+  const [address, prefix, extra] = item.split("/");
+  const version = net.isIP(address);
+  if (!version || extra !== undefined) return false;
+  if (prefix === undefined) return true;
+  const bits = Number(prefix);
+  return /^\d+$/.test(prefix) && bits >= 0 && bits <= (version === 4 ? 32 : 128);
+}
+
+function readTrustProxy(value) {
+  const text = (value || "").trim().toLowerCase();
+  if (text === "" || text === "false" || text === "0") return false;
+  if (/^\d+$/.test(text)) {
+    const hops = Number(text);
+    if (hops >= 1 && hops <= 5) return hops;
+  } else if (text !== "true") {
+    const items = text.split(",").map((item) => item.trim());
+    if (items.every(isProxyAddress)) return items;
+  }
+  throw new Error(`TRUST_PROXY must be empty, false, a number of proxies from 1 to 5, or a comma list of proxy addresses (got "${value}")`);
+}
+
 const env = {
   nodeEnv,
   isProduction,
@@ -65,6 +98,8 @@ const env = {
   sessionTtlHours: readNumber(process.env.SESSION_TTL_HOURS, 12, 1, 24 * 30, "SESSION_TTL_HOURS"),
   // true = the login cookie is only sent over HTTPS. Turn on when the app is served with HTTPS.
   cookieSecure: (process.env.COOKIE_SECURE || (isProduction ? "true" : "false")).toLowerCase() === "true",
+  // Proxies trusted for the visitor's IP (see readTrustProxy). Default false: the club PC has none.
+  trustProxy: readTrustProxy(process.env.TRUST_PROXY),
 
   // ---- Backups (XML) ----
   // Folder for the XML backups. Put it OUTSIDE the C: drive (D:, a USB drive or a OneDrive folder),

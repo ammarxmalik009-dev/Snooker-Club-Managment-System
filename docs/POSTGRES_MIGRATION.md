@@ -58,6 +58,40 @@ so the origin check must accept an explicit allow-list (`ALLOWED_ORIGINS`) — n
 | 1.6 | `client/vercel.json` (API rewrite with a placeholder Railway URL, `/` → dashboard, security headers) + `client/404.html` | `client/vercel.json`, `client/404.html`, tests |
 | 1.7 | Docs + `.env.example`; full server + browser test runs | `README.md`, `docs/ARCHITECTURE.md`, `.env.example` |
 
+#### 1.2 `TRUST_PROXY` — done
+
+- `server/config/env.js` → `readTrustProxy()` checks the value at start-up:
+  - empty, `false` or `0` → `false` (**default**, the club PC: `X-Forwarded-For` is ignored)
+  - `1`–`5` → that many proxies in front of the app
+  - comma list of `loopback` / `linklocal` / `uniquelocal` / IP / IP/prefix → only those proxies are trusted
+  - `true` and anything else → the server refuses to start with a clear message. `true` would take the
+    left-most `X-Forwarded-For` entry, which any visitor can type in themselves.
+- `server/app.js` → `app.set("trust proxy", env.trustProxy)`. `createApp({ trustProxy })` accepts an override
+  for tests only. Nothing else changed: login, cookies, the throttle limits and MongoDB are untouched.
+- `server/tests/trustProxy.test.js` (7 tests, own database `snooker_club_pro_test_proxy`):
+  - the accepted and refused values
+  - off: `req.ip` is the direct connection, and a faked `X-Forwarded-For` can't dodge the IP lock
+  - on (1): `req.ip` is the address the proxy appended, not one the visitor typed in
+  - on: one visitor's failures lock only that visitor; the username lock still works from any IP
+
+**Production value (to verify in Phase 5, not guessed now):**
+
+| How the request arrives | Expected `TRUST_PROXY` |
+|---|---|
+| Browser → Railway domain directly | `1` (Railway's edge proxy) |
+| Browser → Vercel → (rewrite) → Railway | `2` (Vercel + Railway's edge proxy) |
+
+How to verify after deploying:
+1. Log in through the Vercel URL. Look up your own public IP (any "what is my IP" site).
+2. Check the `ip` stored with your newest login session (Mongo: `authsessions`; PostgreSQL: the auth
+   sessions table). It must equal your public IP.
+3. If it shows a Vercel/Railway address → the number is too low (everyone shares one lock).
+   Send a login with a fake header (`curl -H "X-Forwarded-For: 1.2.3.4" …`): if `1.2.3.4` is stored,
+   the number is too high (visitors can fake their IP). Adjust and repeat until step 2 is right.
+
+Test results after 1.2: `npm.cmd test` **272 passed, 0 failed** (265 + 7 new);
+`npm.cmd run test:browser` **741 passed, 0 failed** (14 suites).
+
 ### Phase 2 — PostgreSQL foundation (branch `postgres`)
 
 - `pg` pool from `DATABASE_URL`, query + transaction helpers, row mappers that keep today's JSON (UUIDs as strings).
@@ -99,7 +133,7 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 
 | Name | Phase | Example (placeholders only) | Meaning |
 |---|---|---|---|
-| `TRUST_PROXY` | 1 | `1` | how many proxies sit in front of the app (empty/`false` = none, the club-PC default) |
+| `TRUST_PROXY` | 1 | `2` | how many proxies sit in front of the app (empty/`false` = none, the club-PC default; `true` is refused) |
 | `ALLOWED_ORIGINS` | 1 | `https://<app>.vercel.app` | extra origins allowed to send changes (comma-separated, exact match) |
 | `DATABASE_URL` | 2 | *(set in Railway / `.env`, never in Git)* | PostgreSQL connection string |
 
@@ -117,7 +151,7 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Inspection of repo, tests, backups (2026-10-11)
 - [x] Baseline tests recorded (265 server / 741 browser)
 - [x] 1.1 Migration document
-- [ ] 1.2 `TRUST_PROXY`
+- [x] 1.2 `TRUST_PROXY` (272 server / 741 browser)
 - [ ] 1.3 `ALLOWED_ORIGINS` origin check
 - [ ] 1.4 Vendored Chart.js
 - [ ] 1.5 Client-side page-role guard

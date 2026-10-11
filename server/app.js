@@ -6,6 +6,7 @@ const express = require("express");
 const helmet = require("helmet");
 const cookieParser = require("cookie-parser");
 
+const env = require("./config/env");
 const apiRoutes = require("./routes");
 const { pageGuard } = require("./middleware/auth");
 const { apiNotFound, pageNotFound } = require("./middleware/notFound");
@@ -14,8 +15,13 @@ const errorHandler = require("./middleware/errorHandler");
 const CLIENT_DIR = path.join(__dirname, "..", "client");
 const CHART_JS_FILE = path.join(__dirname, "..", "node_modules", "chart.js", "dist", "chart.umd.min.js");
 
-function createApp() {
+// options.trustProxy: only for tests; the app always uses the checked TRUST_PROXY from .env
+function createApp({ trustProxy = env.trustProxy } = {}) {
   const app = express();
+
+  // Behind a hosting proxy (TRUST_PROXY), req.ip is the visitor's IP from X-Forwarded-For,
+  // counting only the trusted proxies. Default false: req.ip is the direct connection (club PC).
+  app.set("trust proxy", trustProxy);
 
   // Security headers. All our scripts, styles and fonts are local files, so the
   // default Content-Security-Policy works. "upgrade-insecure-requests" is switched off,
