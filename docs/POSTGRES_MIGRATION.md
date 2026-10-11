@@ -53,7 +53,7 @@ so the origin check must accept an explicit allow-list (`ALLOWED_ORIGINS`) — n
 | 1.1 | This document + baseline results | `docs/POSTGRES_MIGRATION.md` |
 | 1.2 | `TRUST_PROXY` setting → `app.set("trust proxy", …)`, so `req.ip` (login throttle) is the real client IP behind Railway/Vercel | `server/config/env.js`, `server/app.js`, tests |
 | 1.3 | `ALLOWED_ORIGINS`: the origin check accepts the same host **or** an exact allow-listed origin; everything else stays 403 | `server/config/env.js`, `server/middleware/auth.js`, tests |
-| 1.4 | Vendored Chart.js: a committed copy in `client/vendor/`, so Vercel can serve it (no `node_modules` there) | `client/vendor/chart.umd.min.js`, `server/app.js`, tests |
+| 1.4 | Vendored Chart.js: a committed copy in `client/vendor/`, so Vercel can serve it (no `node_modules` there) | `client/vendor/` (file, licenses, README), `server/app.js`, `.gitattributes`, tests |
 | 1.5 | Client-side page-role guard (user experience only — the API's `requirePermission` stays the real protection) | `client/js/core/layout.js`, tests |
 | 1.6 | `client/vercel.json` (API rewrite with a placeholder Railway URL, `/` → dashboard, security headers) + `client/404.html` | `client/vercel.json`, `client/404.html`, tests |
 | 1.7 | Docs + `.env.example`; full server + browser test runs | `README.md`, `docs/ARCHITECTURE.md`, `.env.example` |
@@ -149,6 +149,32 @@ Shared helper `server/tests/helpers/envSetting.js` (also used by `trustProxy.tes
 Test results after 1.3: `npm.cmd test` **283 passed, 0 failed** (272 + 11 new);
 `npm.cmd run test:browser` **741 passed, 0 failed** (14 suites).
 
+#### 1.4 Vendored Chart.js — done
+
+- **Version:** Chart.js **4.5.1** (installed in `node_modules` and pinned in `package-lock.json`; nothing
+  downloaded or upgraded). The UMD file bundles `@kurkle/color` 0.3.2 (its notice is inside the file).
+- **Asset:** `client/vendor/chart.umd.min.js` — a byte-for-byte copy of `node_modules/chart.js/dist/chart.umd.min.js`
+  (208,522 bytes, SHA-256 `48444A82…C9F54A`). The page already loaded `/vendor/chart.umd.min.js`, so
+  `client/pages/reports.html` and the chart code are **unchanged**; the path now works both locally
+  (Express static) and on Vercel (`client/` is the site root).
+- **License:** the copyright header at the top of the file is kept as published; `client/vendor/chart.js.LICENSE.md`
+  and `client/vendor/kurkle-color.LICENSE.md` are the packages' own MIT license files. `client/vendor/README.md`
+  says where the files came from and how to update them.
+- `server/app.js`: the special route that sent the file from `node_modules` is removed; `express.static(client/)` serves it.
+- `.gitattributes`: `client/vendor/** -text`, so Git (here `core.autocrlf=true`) never changes the files' line endings.
+- `chart.js` stays in `package.json` as the source of the copy; `npm test` fails if the copy and the package differ.
+- `docs/ARCHITECTURE.md`: the two lines that said "served from node_modules" are corrected.
+
+Tests: `server/tests/vendor.test.js` (4 tests, no database): same version as `package-lock.json` and same bytes
+as the package, header and `@kurkle/color` notice kept; both license files match the packages; every local
+`<script src>` / `<link href>` on every page is a file under `client/` and Chart.js is loaded once, only on
+`reports.html`; Express serves the file from `client/vendor` as JavaScript. The existing `app.test.js` check of
+`/vendor/chart.umd.min.js` and the browser check "revenue chart: drawn with Chart.js" (reports suite) pass
+unchanged. **Not verified on Vercel yet** (Phase 5): the path is only checked against the `client/` files.
+
+Test results after 1.4: `npm.cmd test` **287 passed, 0 failed** (283 + 4 new);
+`npm.cmd run test:browser` **741 passed, 0 failed** (14 suites).
+
 ### Phase 2 — PostgreSQL foundation (branch `postgres`)
 
 - `pg` pool from `DATABASE_URL`, query + transaction helpers, row mappers that keep today's JSON (UUIDs as strings).
@@ -210,7 +236,7 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] 1.1 Migration document
 - [x] 1.2 `TRUST_PROXY` (272 server / 741 browser)
 - [x] 1.3 `ALLOWED_ORIGINS` origin check (283 server / 741 browser; live rewrite check pending Phase 5)
-- [ ] 1.4 Vendored Chart.js
+- [x] 1.4 Vendored Chart.js 4.5.1 (287 server / 741 browser; Vercel load check pending Phase 5)
 - [ ] 1.5 Client-side page-role guard
 - [ ] 1.6 `client/vercel.json` + `client/404.html`
 - [ ] 1.7 Docs + full test runs

@@ -89,7 +89,7 @@ Snooker-Club-Pro/
 │   │                           billing.js (Create Bill window), matches.js (Matches window),
 │   │                           cafe.js (café tab), sessions.js
 │   └── js/pages/               one script per page
-│                               (Chart.js is served from node_modules at /vendor/chart.umd.min.js)
+│                               (Chart.js: a copy of the npm file in client/vendor/, see its README)
 │
 ├── tests/browser/              browser tests: run.js, server.js (test server), suites/*.html
 ├── docs/                       ARCHITECTURE.md (this file), API.md (every endpoint)
@@ -545,4 +545,4 @@ Each phase ended with a **testing checklist**; the next phase started only after
 | `nodemon` *(dev)* | restart the server automatically when you save a file | 2 |
 | `express-validator` | checking request input | 3 |
 | `cookie-parser` | reading the login cookie (hashing, tokens and rate limiting use Node's built-in `crypto`; see section 6) | 8 |
-| `chart.js` | the revenue chart. Served by the app at `/vendor/chart.umd.min.js` straight from `node_modules`, so it is a local file (the security policy allows only this server's scripts) | 9 |
+| `chart.js` | the revenue chart. An unchanged copy of the npm file is kept in `client/vendor/chart.umd.min.js` (with its MIT licenses), served at `/vendor/chart.umd.min.js` locally and on Vercel, so it is a local file (the security policy allows only this site's scripts) | 9 |

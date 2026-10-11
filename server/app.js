@@ -13,7 +13,6 @@ const { apiNotFound, pageNotFound } = require("./middleware/notFound");
 const errorHandler = require("./middleware/errorHandler");
 
 const CLIENT_DIR = path.join(__dirname, "..", "client");
-const CHART_JS_FILE = path.join(__dirname, "..", "node_modules", "chart.js", "dist", "chart.umd.min.js");
 
 // options.trustProxy / options.allowedOrigins: only for tests; the app always uses the
 // checked TRUST_PROXY and ALLOWED_ORIGINS from .env
@@ -47,14 +46,11 @@ function createApp({ trustProxy = env.trustProxy, allowedOrigins = env.allowedOr
   // Home page -> dashboard (the page guard sends visitors who aren't logged in to the login page)
   app.get("/", (req, res) => res.redirect("/pages/dashboard.html"));
 
-  // Chart.js (Phase 9 charts) is served from the installed npm package, so it is a local
-  // file (the security policy only allows scripts from this server) and updates with npm
-  app.get("/vendor/chart.umd.min.js", (req, res) => res.sendFile(CHART_JS_FILE));
-
   // Pages need a login (and some need a role) - checked on the server before the page is sent
   app.use(pageGuard);
 
-  // Frontend: serve files from client/ (HTML, CSS, JS)
+  // Frontend: serve files from client/ (HTML, CSS, JS, and Chart.js in client/vendor -
+  // a copy of the npm package, so Vercel can serve the same files without node_modules)
   app.use(express.static(CLIENT_DIR));
   app.use(pageNotFound); // unknown page -> HTML 404
 

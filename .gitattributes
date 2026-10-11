@@ -1,0 +1,3 @@
+# Third-party files are kept byte-for-byte as published (no line-ending conversion),
+# so they stay identical to the npm package (checked by server/tests/vendor.test.js).
+client/vendor/** -text
