@@ -6,26 +6,17 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const path = require("node:path");
-const { spawnSync } = require("node:child_process");
 const mongoose = require("mongoose");
 const { dropTestDatabase } = require("./helpers/testDb"); // refuses any database without "test" in its name
 const { createApp } = require("../app");
 const { loginAs, TEST_PASSWORD } = require("./helpers/auth");
+const { readEnvSetting } = require("./helpers/envSetting");
 const throttle = require("../services/loginThrottle");
 
 const TEST_DB_URI = process.env.MONGODB_PROXY_TEST_URI || "mongodb://127.0.0.1:27017/snooker_club_pro_test_proxy";
-const ENV_FILE = path.join(__dirname, "..", "config", "env.js");
 
 // Loads config/env.js in a fresh Node process with this TRUST_PROXY, like a real start-up
-function readSetting(value) {
-  const result = spawnSync(process.execPath, ["-e", `console.log(JSON.stringify(require(${JSON.stringify(ENV_FILE)}).trustProxy))`], {
-    env: { ...process.env, TRUST_PROXY: value, NODE_ENV: "development" },
-    encoding: "utf8",
-  });
-  if (result.status !== 0) return { error: result.stderr };
-  return { value: JSON.parse(result.stdout.trim().split("\n").pop()) };
-}
+const readSetting = (value) => readEnvSetting("TRUST_PROXY", "trustProxy", value);
 
 // Starts the app with a trust proxy setting; returns { baseUrl, close }
 async function startApp(trustProxy) {

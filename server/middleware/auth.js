@@ -91,20 +91,35 @@ async function pageGuard(req, res, next) {
 }
 
 // Extra protection against cross-site requests: if the browser says the request came from
-// another website (Origin header), refuse to change anything. (The SameSite=Strict cookie
-// already stops most of these; this is a second layer.)
+// another website, refuse to change anything. (The SameSite=Strict cookie already stops most
+// of these; this is a second layer.) Rules for POST/PATCH/DELETE (GET/HEAD/OPTIONS change nothing):
+//  - Origin present: allowed if its host is this server's Host (the app's own pages), or it is
+//    exactly one of ALLOWED_ORIGINS (the pages hosted on Vercel, reaching us through the /api rewrite).
+//    Anything else - another site, "null", an unreadable value - is refused.
+//  - Origin missing: browsers send Origin with these requests, so this is a script, a test or a
+//    very old browser. Refused if the browser's Sec-Fetch-Site says another site sent it;
+//    allowed otherwise (such a client has no logged-in user's cookie unless it was given one).
+// The allowed list is set on the app by createApp (from ALLOWED_ORIGINS in .env).
 function sameOriginOnly(req, res, next) {
   if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  const refuse = () => next(new AppError("Requests from other websites are not allowed.", 403));
+
   const origin = req.get("origin");
-  if (!origin) return next();
-  let originHost;
-  try {
-    originHost = new URL(origin).host;
-  } catch {
-    originHost = null;
+  if (!origin) {
+    const fetchSite = (req.get("sec-fetch-site") || "").toLowerCase();
+    return fetchSite === "cross-site" || fetchSite === "same-site" ? refuse() : next();
   }
-  if (originHost !== req.get("host")) return next(new AppError("Requests from other websites are not allowed.", 403));
-  next();
+  let url;
+  try {
+    url = new URL(origin);
+  } catch {
+    return refuse();
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return refuse();
+  if (url.host === req.get("host")) return next();
+  const allowedOrigins = req.app.get("allowed origins") || [];
+  if (origin === url.origin && allowedOrigins.includes(origin)) return next(); // exact, as browsers send it
+  refuse();
 }
 
 module.exports = { loadUser, requireAuth, requirePermission, pageGuard, sameOriginOnly, canonicalPagePath };

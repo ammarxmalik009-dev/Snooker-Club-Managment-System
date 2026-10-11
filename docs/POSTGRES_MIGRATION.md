@@ -92,6 +92,63 @@ How to verify after deploying:
 Test results after 1.2: `npm.cmd test` **272 passed, 0 failed** (265 + 7 new);
 `npm.cmd run test:browser` **741 passed, 0 failed** (14 suites).
 
+#### 1.3 `ALLOWED_ORIGINS` — done
+
+- `server/config/env.js` → `readAllowedOrigins()`: a comma list of exact `http(s)://host[:port]` addresses.
+  Empty (default) = `[]`, nothing extra allowed (the club PC behaves exactly as before). A wildcard (`*`),
+  a path, query, `#`, user/password, another scheme or an empty entry stops the start-up with a clear message.
+  Values are stored the way browsers send `Origin` (lower case, default port dropped; one trailing `/` is accepted).
+- `server/app.js` → `app.set("allowed origins", …)` from the checked setting (`createApp({ allowedOrigins })` only for tests).
+- `server/middleware/auth.js` → `sameOriginOnly` (still on every `/api` route after `/health`, before login).
+
+**The policy (POST / PUT / PATCH / DELETE; GET, HEAD and OPTIONS change nothing and pass):**
+
+| Request | Result |
+|---|---|
+| `Origin` host equals the `Host` header (the app's own pages, unchanged) | allowed |
+| `Origin` is exactly one of `ALLOWED_ORIGINS` (pages on Vercel through the rewrite) | allowed |
+| any other `Origin`: another site, look-alike domain, other Vercel app, `http` instead of `https`, other port, upper case, with a path | **403** "Requests from other websites are not allowed." |
+| `Origin` is `null`, not a URL, or not `http(s)` (`file:`, `ftp:`, `chrome-extension:`) | **403** |
+| no `Origin`, and `Sec-Fetch-Site` is `cross-site` or `same-site` (a browser says another site sent it) | **403** |
+| no `Origin`, and `Sec-Fetch-Site` is missing, `same-origin` or `none` (scripts, tests, old browsers) | allowed |
+
+Why a missing `Origin` is not simply trusted or simply refused: current browsers always send `Origin` on
+these requests, so its absence means a non-browser client. Such a client has no visitor's login cookie
+(that is what a cross-site attack needs), and the `SameSite=Strict` cookie is a second layer. Refusing it would
+break server-side scripts and tests. The `Sec-Fetch-Site` check catches a browser that leaves `Origin` out.
+`X-Forwarded-Host` is never used for this check (a client could fake it); an allowed origin is never a login —
+`requireAuth` and the role checks still run afterwards.
+
+**Configuration (placeholders):**
+
+```
+# Railway (backend) - the Vercel address the pages are served from
+ALLOWED_ORIGINS=https://<your-app>.vercel.app
+# more than one (e.g. a custom domain later)
+ALLOWED_ORIGINS=https://<your-app>.vercel.app,https://<club-domain>
+# club PC: leave empty
+ALLOWED_ORIGINS=
+```
+
+**Not verified yet (needs the live deployment, Phase 5):** the tests *simulate* the rewrite
+(`Host: <api>.up.railway.app`, `Origin: https://<app>.vercel.app`). That Vercel's external rewrite forwards
+the browser's `Origin` unchanged and sends the Railway address as `Host` is an assumption, not something the
+code can prove. It works in every likely case: Host = Railway → allowed by `ALLOWED_ORIGINS`; Host = Vercel →
+allowed as same host; `Origin` removed → allowed by the missing-Origin rule (`Sec-Fetch-Site: same-origin`).
+It would only fail if Vercel *replaced* `Origin` with another value. Phase 5 check: log in and save a change
+through the Vercel URL; then `curl -X POST -H "Origin: https://evil.example" https://<app>.vercel.app/api/auth/logout`
+must return 403.
+
+Tests: `server/tests/allowedOrigins.test.js` (11 tests, own database `snooker_club_pro_test_origins`):
+setting values; club PC same-host allowed and other sites refused; rewrite allowed only for the exact origin;
+faked `X-Forwarded-Host`; malformed and missing `Origin` with `Sec-Fetch-Site`; no cookie → 401 and wrong role → 403
+even from an allowed origin; refused-origin logins never count towards the login lock, and the lock still works.
+The existing test `requests from another website can't change anything` (`auth.test.js`) passes unchanged.
+Shared helper `server/tests/helpers/envSetting.js` (also used by `trustProxy.test.js` now).
+
+Test results after 1.3: `npm.cmd test` **283 passed, 0 failed** (272 + 11 new);
+`npm.cmd run test:browser` **741 passed, 0 failed** (14 suites).
+
 ### Phase 2 — PostgreSQL foundation (branch `postgres`)
 
 - `pg` pool from `DATABASE_URL`, query + transaction helpers, row mappers that keep today's JSON (UUIDs as strings).
@@ -134,7 +191,7 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 | Name | Phase | Example (placeholders only) | Meaning |
 |---|---|---|---|
 | `TRUST_PROXY` | 1 | `2` | how many proxies sit in front of the app (empty/`false` = none, the club-PC default; `true` is refused) |
-| `ALLOWED_ORIGINS` | 1 | `https://<app>.vercel.app` | extra origins allowed to send changes (comma-separated, exact match) |
+| `ALLOWED_ORIGINS` | 1 | `https://<app>.vercel.app` | extra origins allowed to send changes (comma-separated, exact match, no wildcard; empty on the club PC) |
 | `DATABASE_URL` | 2 | *(set in Railway / `.env`, never in Git)* | PostgreSQL connection string |
 
 ## Known risks
@@ -152,7 +209,7 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Baseline tests recorded (265 server / 741 browser)
 - [x] 1.1 Migration document
 - [x] 1.2 `TRUST_PROXY` (272 server / 741 browser)
-- [ ] 1.3 `ALLOWED_ORIGINS` origin check
+- [x] 1.3 `ALLOWED_ORIGINS` origin check (283 server / 741 browser; live rewrite check pending Phase 5)
 - [ ] 1.4 Vendored Chart.js
 - [ ] 1.5 Client-side page-role guard
 - [ ] 1.6 `client/vercel.json` + `client/404.html`

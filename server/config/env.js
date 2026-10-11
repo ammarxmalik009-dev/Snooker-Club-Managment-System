@@ -85,6 +85,33 @@ function readTrustProxy(value) {
   throw new Error(`TRUST_PROXY must be empty, false, a number of proxies from 1 to 5, or a comma list of proxy addresses (got "${value}")`);
 }
 
+// Other websites (origins) whose pages may send changes (POST/PATCH/DELETE) to this API, on top of
+// the app's own address. Needed when the pages are hosted elsewhere and reach the API through a
+// rewrite (Vercel -> Railway): the browser's Origin is then the Vercel address, not this server's.
+// Empty (default) = only the app's own address, as on the club PC. Each entry must be exactly
+// http(s)://host[:port] - no wildcard, no path - so only the named sites are allowed.
+function readAllowedOrigins(value) {
+  const text = (value || "").trim();
+  if (!text) return [];
+  return text.split(",").map((item) => {
+    const entry = item.trim();
+    let url = null;
+    try {
+      url = new URL(entry);
+    } catch {
+      url = null;
+    }
+    const valid = url && !entry.includes("*")
+      && (url.protocol === "https:" || url.protocol === "http:")
+      && !url.username && !url.password && url.pathname === "/" && !url.search && !url.hash
+      && /^https?:\/\/[^/?#]+\/?$/i.test(entry);
+    if (!valid) {
+      throw new Error(`ALLOWED_ORIGINS must be a comma list of addresses like https://club.example.com (no wildcard, no path) - "${entry}" is not valid`);
+    }
+    return url.origin; // lower case, default port removed: compared with the browser's Origin the same way
+  });
+}
+
 const env = {
   nodeEnv,
   isProduction,
@@ -100,6 +127,8 @@ const env = {
   cookieSecure: (process.env.COOKIE_SECURE || (isProduction ? "true" : "false")).toLowerCase() === "true",
   // Proxies trusted for the visitor's IP (see readTrustProxy). Default false: the club PC has none.
   trustProxy: readTrustProxy(process.env.TRUST_PROXY),
+  // Extra websites allowed to send changes (see readAllowedOrigins). Default []: only the app itself.
+  allowedOrigins: readAllowedOrigins(process.env.ALLOWED_ORIGINS),
 
   // ---- Backups (XML) ----
   // Folder for the XML backups. Put it OUTSIDE the C: drive (D:, a USB drive or a OneDrive folder),
