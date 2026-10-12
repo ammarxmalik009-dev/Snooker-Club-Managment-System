@@ -984,6 +984,103 @@ not redirected or modified.
   `lockAppSchema`/`unlockAppSchema` (`server/tests/helpers/testDb.pg.js`), or it will race the
   same way these did before the fix.
 
+#### Step 2.6 — Bills repository pilot (the hardest model) — done
+
+**Scope, stated up front:** `server/services/bills.pg.service.js` is a **repository**, not a
+port of `bills.service.js`'s business logic. It takes an *already-calculated* bill (the exact
+shape `prepareBill()` produces - every number worked out, every snapshot copied) and only saves
+or reads it. It does **not** generate bill numbers (`Counter.js`), resolve café tabs, claim
+stock, or know Matches' own rules (`loadBillableMatch`, `anotherBillableMatch`) - those each need
+their own, still-unported service (Sessions, Matches, Payments, Café), exactly the dependency the
+task asked to be documented rather than worked around. What it DOES use for real: **`billing.calculator.js`'s
+`calculateBill()` and `billableMinutes()`, unmodified** - a pure function with no MongoDB
+dependency at all - so every number this pilot saves is genuinely what the real business rule
+would produce for the same input, not invented.
+
+##### Bills field mapping (`server/db/rowMappers.js` conventions, applied to `app.bills`/`bill_line_items`/`bill_players`)
+
+Every field from `Bill.js` maps straight across (full column list: `server/db/migrations/0001_initial_schema.sql`,
+written in step 2.3); the pilot only had to decide how to carry them through a repository:
+- Money (`unitPrice`, `subtotal`, `taxAmount`, `total`, `amountPaid`, line `unitPrice`/`amount`,
+  player `shareAmount`/`paidAmount`/`gameShare`/`cafeShare`) - all through `toMoney` (step 2.4's
+  bigint-string fix), confirmed exact for a real calculated total (30 billed minutes × Rs 10 =
+  exactly 30000 paisa, verified against `calculateBill()`'s own output, not hand-computed).
+- `match`/`matchNumber`/`winningTeam`/`losingTeam`/`pricingType` - absent (`undefined`) on a
+  whole-session bill, exactly like a Mongoose document that never had the field, not `null` and
+  never `0`.
+- `gameShare`/`cafeShare` on a player with no café split - `null`, matching Bill.js's own
+  `default: undefined` fields (absent in Mongo, `NULL` here - same meaning, "not applicable").
+- `balanceDue` - the schema's `GENERATED ALWAYS AS` column (step 2.3), read back, not recomputed
+  here; confirmed equal to `total - amountPaid` for an unpaid bill.
+- "Who did it" (`createdBy`/`cancelledBy`) - the same flattened columns and the same
+  `user: null, name, username` state (Users not yet ported) as every earlier pilot.
+
+##### What was verified
+
+Against the real local PostgreSQL, using **minimal fixture rows only** (one table, a few
+sessions, two matches - inserted with plain SQL in the test file; no Matches/Sessions service
+exists):
+1. **Create and retrieve**: a bill made from a real `calculateBill()` result round-trips exactly.
+2. **Field mapping**: every field above, checked directly.
+3. **Line items keep their order**: a game line plus three café lines, inserted via `calculateBill()`'s
+   own output order - read back (both from the fresh insert AND a separate re-read from the
+   database) as `["Frames", "Cola", "Chips", "Water"]`, never reordered.
+4. **Players keep their order**: four players inserted as `["Dee", "Charlie", "Bilal", "Alice"]`
+   - read back in that exact order, not alphabetical or insertion-id order.
+5. **Monetary/null/missing values**: covered above.
+6-7. **Foreign keys**: a real session succeeds; an unknown or malformed `session_id` is refused.
+8. **Uniqueness, all three partial indexes from step 2.3, each actually triggered**:
+   - a second session-only bill for the same session → *"This session already has a bill"*
+   - a duplicate `bill_number` (different session) → *"A bill with this number already exists"*
+   - the same match billed twice → *"This match already has a bill"*
+   - a second Century (`per_minute`) match bill for a session that already has one → the same
+     message `bills.service.js` gives: *"...A session can have only one Century bill."*
+9. **Permitted nullable combinations**: a *different* session's session-only bill is unaffected
+   by another session already having one - the uniqueness is correctly scoped per session, not global.
+10. **Transaction rollback**: a deliberately invalid player (a `result` value the `CHECK`
+    constraint refuses) rolls back the **whole** transaction - the bill row and its line items
+    from the same attempt are both gone, confirmed by row counts and an orphan check.
+11. **Consistency with MongoDB's billing rules**: not re-implemented and compared, but
+    **literally the same calculation function** feeding both paths - the numbers can't disagree
+    because they come from the one place that decides them.
+
+Isolation: confirmed (no `mongoose`/`server/models/` in the pilot service's full require tree).
+
+##### Regression checks
+
+| Command | With PostgreSQL configured (run twice) | Without (the ordinary state) |
+|---|---|---|
+| `npm.cmd test` | **358 passed, 0 failed, 0 skipped**, both times | 307 passed, 0 failed, **7 skipped** (cleanly) |
+| `npm.cmd run test:browser` | **780 passed, 0 failed** (15 suites) | unaffected either way |
+
+All six `postgres*.test.js` files (now including this one) run together, **three times**, with
+no deadlocks or races - the step 2.5 advisory-lock fix holds with a sixth file sharing the schema.
+
+Confirmed: MongoDB remains the application's only active database; no route or controller reads
+this pilot; every MongoDB test still uses its own throw-away database, untouched; no production
+data was changed; nothing was deployed.
+
+##### Remaining payment/session/match/user dependencies, and other open risks
+
+- **Payments** (the `payments` table, step 2.3) remain completely unexercised - no pilot has
+  inserted a `Payment` row yet, so the overpayment-prevention atomic update
+  (`payments.service.js`'s `findOneAndUpdate` pattern) has not been reproduced or tested in
+  PostgreSQL at all.
+- **A real Sessions/Matches service** still does not exist - this and step 2.5 both reached their
+  target tables with raw fixture SQL. Porting the actual `sessions.service.js`/`matches.service.js`
+  business rules (claim-table atomicity, one-open-session-per-table race test, match number
+  generation) is still fully ahead.
+- **Users has still not been ported** - every `*_user_id` column across every pilot so far
+  (Settings, Categories, Products, Bills) stores `null` for a real actor; this is accepted and
+  documented, not a defect, but it means the foreign keys to `app.users` have never been tested
+  with an id that actually resolves to a real row.
+- **Railway's `btree_gist` availability is still unconfirmed** (carried over from step 2.3) -
+  this step didn't touch bookings.
+- **`auth_sessions` has no TTL equivalent** (carried over from step 2.3) - still open.
+- **Bill number generation** (`Counter.js`'s atomic upsert-and-increment, already designed for
+  PostgreSQL in step 2.3's own notes) has not actually been built or tested yet - this pilot's
+  tests supply plain string bill numbers directly.
+
 ### Phase 3 — Port services, one at a time (tests after each)
 
 Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
@@ -1047,7 +1144,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Phase 2, Step 2.3 — full schema (20 tables) + migration runner, tested against the real local PostgreSQL (312 server / 780 browser with it configured; 9 new tests, 0 skipped); Railway `btree_gist` still unconfirmed
 - [x] Phase 2, Step 2.4 — row-mapper layer + standalone Settings service pilot, tested against the real local PostgreSQL (328 server / 780 browser with it configured, 16 new tests, 0 skipped); found and fixed a real actor-mapping edge case; the Users FK gap is documented, not worked around
 - [x] Phase 2, Step 2.5 — Categories/Products (real FK + unique constraints) + match_players/match_teams fixture-only ordered-row proof (348 server / 780 browser with PostgreSQL configured, 19 new tests, 0 skipped); found and fixed a genuine test-concurrency bug (shared schema raced across parallel test files - advisory lock with a dedicated client)
-- [ ] Phase 2, Step 2.6 — Bills (the hardest model: both ordered arrays AND the partial-unique session/match rules), or Bookings (the btree_gist EXCLUDE constraint, still unverified against a service), per the Phase 3 order above
+- [x] Phase 2, Step 2.6 — Bills repository pilot: ordered line items/players, all three partial-unique rules, FK, rollback, real calculateBill() numbers (358 server / 780 browser with PostgreSQL configured, 10 new tests, 0 skipped); confirmed the step 2.5 lock fix holds with a sixth test file
+- [ ] Phase 2, Step 2.7 — Payments (the overpayment-prevention atomic update) or Bookings (the btree_gist EXCLUDE constraint against a real service), per the Phase 3 order above
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
