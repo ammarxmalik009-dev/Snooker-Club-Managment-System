@@ -341,11 +341,87 @@ Test results after 1.7 (no code changed - documentation and `.env.example` only)
 
 ### Phase 2 — PostgreSQL foundation (branch `postgres`)
 
-- `pg` pool from `DATABASE_URL`, query + transaction helpers, row mappers that keep today's JSON (UUIDs as strings).
-- Numbered SQL migrations with a `schema_migrations` table; tables, foreign keys, indexes, unique and check constraints.
-- Check Railway's PostgreSQL version and extensions (e.g. `btree_gist` for booking overlap) **before** relying on them; otherwise use a tested alternative (row locks inside a transaction).
-- Local PostgreSQL on Windows (portable, like `npm run db` today) and throw-away test databases whose name must contain `test` (same safety rule as `server/tests/helpers/testDb.js`).
-- Mongoose stays installed.
+#### Step 2.1 — Inspection and foundation plan (planning only, no code changed) — done
+
+**Branch:** created `postgres` from `main` at commit `34138b3` (the verified end of Phase 1).
+All of Phase 2 happens here until it is fully tested; `main` is untouched.
+
+**What database the app uses today, with evidence:**
+- `dependencies.mongoose` in `package.json` (`^9.10.3`); no `pg` or any other SQL driver is installed.
+- `server/config/db.js` connects with `mongoose.connect(env.mongoUri, …)` and calls
+  `mongoose.connection.syncIndexes()` on start-up.
+- `server/config/env.js`: `mongoUri` (default `mongodb://127.0.0.1:27017/snooker_club_pro`).
+- `npm run db` (`server/scripts/startDatabase.js`) starts a **portable, local** `mongod.exe` -
+  no cloud database is involved today.
+- A repo-wide search for `postgres`, `require("pg")` and `DATABASE_URL` found **nothing** in
+  `server/`, `client/` or `tests/` except this document and one string in a test's "never print
+  this word" check (`server/tests/vercelConfig.test.js`) - confirming PostgreSQL work has not started.
+
+**The 16 models (`server/models/*.js`) and how they relate** (every reference below is a plain
+`ObjectId` with a Mongoose `ref:` - a **hint for population, not an enforced foreign key**;
+nothing stops an orphaned reference today):
+
+```
+User ──< AuthSession                     Table ──< Session ──< Match ──< Bill ──< Payment
+Customer ──< Booking ──< Session                              Session ──< Bill
+Category ──< Product ──< StockMovement                        Session ──< CafeOrder ──< Bill
+                          Product ──< CafeOrder, Bill.lineItems[], StockMovement
+Player ──< Match.players[], Bill.players[], Bill.lineItems[].consumerPlayer
+Counter (standalone: running numbers)     Setting (standalone: one row per key)
+```
+
+**Patterns the current (MongoDB) implementation uses that a PostgreSQL design must reproduce
+(same outcomes), not just "add a database":**
+
+| Pattern | Where (file:line) | What it does | PostgreSQL equivalent |
+|---|---|---|---|
+| Atomic conditional update | `payments.service.js` `recordPayment` | `Bill.findOneAndUpdate({ status: …, amountPaid: { $lte: … }, players.$elemMatch: … }, { $inc: … })` - overpayment is impossible because the check and the write are the same database step | `UPDATE bills SET amount_paid = amount_paid + $1 WHERE id = $2 AND amount_paid <= total - $1 …` inside a transaction; `0` rows updated = the same rule failed |
+| Atomic conditional update | `stock.service.js` `increase`/`decrease` | stock changes with `$inc`, guarded by `stockQuantity: { $gte: n }` | same `UPDATE … WHERE stock_quantity >= $1` pattern - this one is **simpler** in Postgres, no change in behaviour needed |
+| Atomic "claim" + unique index (two layers) | `sessions.service.js` `claimTable`/`startSession`; `Session.js:51` (`one_open_session_per_table`, `partialFilterExpression: { isOpen: true }`) | an atomic `Table` status change, backed by a **partial unique index** so MongoDB itself refuses a second open session even if the first check races | Postgres: the atomic update + a **partial unique index** (`CREATE UNIQUE INDEX … ON sessions (table_id) WHERE is_open`) - directly supported, no behaviour change |
+| Sequence counter | `models/Counter.js` `nextSequence` (`findOneAndUpdate({ _id: name }, { $inc: { seq: 1 } }, { upsert: true })`) | race-free running numbers (bill numbers, etc.) | a Postgres `SEQUENCE` (or the same upsert-and-increment pattern on a small table) - Postgres makes this simpler, not harder |
+| **No DB-level overlap constraint (optimistic insert-and-verify)** | `bookings.service.js` `createBooking` (lines ~111-142): check for a clash, insert anyway, check again, and if the *other* booking's `_id` sorts first, **delete the one just created** and return 409 | MongoDB has no range-exclusion constraint, so the app invents one with a "second check decides who loses, loser self-deletes" dance. `docs/ARCHITECTURE.md` §5.5 already documents this as a known, accepted gap ("a local MongoDB without a replica set can't lock two collections at once") | **This is the one real risk** (see "Known risks" below): Postgres *can* do this properly with `EXCLUDE USING gist (table_id WITH =, tsrange(start_at, end_at) WITH &&)`, but that needs the `btree_gist` extension, which must be confirmed on Railway (not guessed) before relying on it. A tested fallback that needs no extension: `SELECT … FOR UPDATE` on the table's own row (or a dedicated per-table lock row) inside a transaction, serializing booking creation for that table, then the same overlap check - genuinely stronger than today's optimistic dance, not just a copy of it |
+| No multi-document transactions anywhere | confirmed by `grep -rn "mongoose.startSession\|startTransaction"` across `server/` → **no matches** | every multi-step write today is either one atomic document update, or (for money: `payments.service.js` step 3) a **manual compensation** - record the `Payment`, and if that fails, "take the money back off the bill" | Postgres gives real `BEGIN`/`COMMIT` transactions "for free" (no replica set needed, unlike MongoDB). Phase 3 should use a genuine transaction for bills+payments and session+stock+café steps - a straightforward **improvement**, not a risk, as already noted in the Phase 3 plan above |
+| String ids in every API response | `models/plugins/cleanJson.js`: `toJSON` transform turns Mongo's `_id` (ObjectId) into `id` (string), drops `__v` | the API's documented contract (`docs/API.md`) already promises string ids - nothing to change there | PostgreSQL tables use `uuid` primary keys (`gen_random_uuid()` or app-generated v4/v7); the row mapper layer (Phase 2.2) converts `uuid` → `string` the same way `cleanJson` does today, so the JSON shape is identical |
+| "Who did it", embedded | `models/schemas/actor.js` (`actorSchema`): `{ user, name, username }` embedded on bills, payments, bookings, sessions, settings, users via `actorFrom(req.user)` | a denormalized copy (so history reads correctly even if the account is later renamed), not a live join | becomes plain `actor_user_id / actor_name / actor_username` columns on each table - same denormalization, same reason, just flattened instead of embedded |
+| Embedded arrays as the hard case | `models/Bill.js`: `lineItems[]` (`lineItemSchema`) and `players[]` (`playerSchema`), both `{ _id: false }` sub-documents, with a `balanceDue` virtual and 5 indexes (2 of them partial/conditional) | the most complex model in the app | becomes two real child tables (`bill_line_items`, `bill_players`) with a foreign key to `bills.id` and their own rows - this is genuinely more work, which is exactly why the Phase 3 plan above puts "Bills and payments" near the end (step 11 of 15), after the simpler models are proven |
+| Tests use a throw-away database per file | `server/tests/helpers/testDb.js` (`assertTestDatabase`: the name must contain `"test"`, or nothing is dropped); every `*.test.js` connects to its own `snooker_club_pro_test_<area>` database | this is the safety rule that stops a mistyped test URI from ever deleting the club's real data | the same rule, same enforcement, must exist for the PostgreSQL test databases (Step 2.2/2.3) before any test touches a real connection |
+
+**Money, dates and other "easy" parts** (confirmed, not assumed): every amount is already stored as
+an **integer paisa** (`money` schema type, `validate: Number.isInteger`) - maps directly to Postgres
+`BIGINT`, no precision work needed. Every date is already stored as a UTC `Date` - maps directly to
+`timestamptz`. Enums (`status`, `role`, `gameMode`, …) map to Postgres `CHECK (… IN (…))` constraints
+or native `ENUM` types - the same fixed value lists already defined in each model file.
+
+**What must stay unchanged (the API contract, already documented and tested):** JSON shapes,
+string ids, HTTP status codes and the exact error messages in `docs/API.md` and the 300 passing
+server tests - `server/tests/*.test.js` is itself the acceptance test a PostgreSQL implementation
+must keep passing (per model/service, ported one at a time per the Phase 3 order above).
+
+**Recommended Step 2.2 scope (the smallest safe next step - not started in 2.1):**
+1. Add `pg` as a dependency (justification: it is the standard, officially supported Node.js
+   PostgreSQL driver; no ORM is proposed, to keep the same explicit, parameterized-query style the
+   codebase already uses in its services).
+2. `server/config/db.pg.js` (new, separate file - `server/config/db.js`/Mongoose is **not touched**):
+   a `pg.Pool` built from `DATABASE_URL`, plus small `query()`/`withTransaction()` helpers.
+3. `DATABASE_URL` is added to `.env.example` **at that point** (not now - Step 2.1 adds no code
+   that reads it, and `.env.example` should only list variables the app actually uses).
+4. A local, portable PostgreSQL for Windows (mirroring `npm run db`'s approach), and a test helper
+   that refuses to touch any database whose name doesn't contain `"test"` (mirroring
+   `server/tests/helpers/testDb.js` exactly).
+5. One smoke test only: connect, run `SELECT 1`, confirm the pool and the transaction helper work -
+   **no schema, no migrations, no repositories yet**. Those are Step 2.3+, informed by this
+   inspection (settings → users → tables → … , the Phase 3 order above).
+6. Before Step 2.3 relies on any PostgreSQL 15+ feature or the `btree_gist` extension (for the
+   booking-overlap case above), confirm Railway actually provides it - do not assume.
+
+No application code, dependency, environment variable or test was changed in Step 2.1 - this is
+documentation only, matching the instruction not to add a database connection merely to make
+progress while the next step owns implementation.
+
+No application code changed in Step 2.1, so no regression was expected; both suites were still run
+in full on the new `postgres` branch as a safety check, confirming the branch genuinely behaves like
+`main`: `npm.cmd test` **300 passed, 0 failed**; `npm.cmd run test:browser` **780 passed, 0 failed**
+(15 suites) - identical to the numbers reported at the end of Phase 1.
 
 ### Phase 3 — Port services, one at a time (tests after each)
 
@@ -404,7 +480,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] 1.5 Client-side page-role guard (294 server / 780 browser; live Vercel check pending Phase 5)
 - [x] 1.6 `client/vercel.json` + `client/404.html` (300 server / 780 browser; live Vercel check and real backend URL still pending Phase 5)
 - [x] 1.7 Docs + `.env.example` + full test runs (300 server / 780 browser) — **Phase 1 complete in code and docs; live deployment unverified (see "Phase 1 status" above)**
-- [ ] Phase 2 — PostgreSQL foundation
+- [x] Phase 2, Step 2.1 — inspection + foundation plan (docs only, `postgres` branch created from `34138b3`; 300 server / 780 browser re-run clean)
+- [ ] Phase 2, Step 2.2 — `pg` dependency, connection pool, transaction helpers, local test PostgreSQL, one smoke test
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
