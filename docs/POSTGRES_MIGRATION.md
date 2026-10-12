@@ -1486,6 +1486,99 @@ was deployed.
 - **Players, CafeOrder, StockMovement, Matches and Counter still have no PostgreSQL pilot** -
   completely untouched by Phase 2 so far.
 
+#### Step 2.11 — Customers pilot: search, pagination, archive-not-delete — done
+
+**Scope chosen:** a standalone Customers repository, following the same `*.pg.service.js`
+pattern as every earlier pilot. Not wired into any route; does not call and is not called by
+`server/services/customers.service.js` (MongoDB), which stays the application's only active path.
+
+##### Customers (`server/services/customers.pg.service.js`)
+
+- **No actor columns, no uniqueness on phone** - `app.customers` (step 2.3's schema) matches
+  `models/Customer.js` exactly: no "who did it" tracking, and phone is deliberately **not**
+  unique (`models/Customer.js`'s own comment: "family members may share one number"). No unique
+  check was added here either - that would have contradicted an explicit, documented rule.
+- **Length rules enforced in code, not by a CHECK constraint**: name (2-60 chars), phone (≤20
+  chars), notes (≤200 chars) - `customers.service.js`'s own Mongoose schema limits, with no
+  matching database constraint in step 2.3's schema. Validated here the same way step 2.10's
+  Tables pilot validates its status enum in code rather than letting a raw constraint error leak
+  through.
+- **Implemented**: create, get-by-id, update (partial, `phoneDigits` kept in step with a changed
+  `phone` the same way `models/Customer.js`'s own `pre("validate")` hook does), list/search (name,
+  case-insensitive; or phone digits when the search text has ≥3 digits - the same two conditions
+  `customers.service.js`'s own `searchFilter` checks), pagination, archived-customer filtering,
+  and a real per-customer booking count + last-booking date computed with a SQL aggregate against
+  `app.bookings` (step 2.9's own table) in place of Mongo's separate aggregation pipeline. Delete:
+  no bookings → really deleted; has bookings → archived (`is_active = false`, booking history
+  stays complete) - the exact rule `customers.service.js`'s own `deleteCustomer` enforces.
+- **Explicitly out of scope** (recorded, not silently dropped): `getCustomerWithHistory` -
+  `customers.service.js`'s full profile view, which joins booking history with session info; a
+  report-like read, not a repository operation, and not required by this step's narrow goal.
+
+##### What was verified - against the real local PostgreSQL
+
+1. **Create and retrieve**: name trimmed, `phoneDigits` correctly derived from `phone`.
+2. **Invalid input refused cleanly** (400, before any `INSERT` is attempted): name below 2 or
+   above 60 characters, phone above 20 characters, notes above 200 characters - confirmed with a
+   `COUNT(*)` that none of the refused attempts left a row behind.
+3. **Phone is genuinely not unique**: two different customers created with the identical phone
+   number both succeed, as the existing rule requires.
+4. **Missing customer id** refused with 404, for both a read and an update.
+5. **Update**: a partial change (phone + notes) applies without touching the untouched name field;
+   `phoneDigits` stays in step with the new phone; a refused update (name too short) leaves the
+   row completely unchanged.
+6. **List/search**: name search (case-insensitive), phone-digit search, default archived-hidden
+   behaviour, `includeArchived` adding exactly the expected row, and pagination (two pages of 2
+   return disjoint customer ids, `totalPages` matches the real count).
+7. **Real booking stats**: two real `app.bookings` rows inserted for one customer - `listCustomers`
+   reports `bookingCount: 2` and the later of the two `start_at` values as `lastBookingAt`,
+   computed by an actual SQL aggregate, not a canned value.
+8. **Delete**: a customer with no bookings is really deleted (404 afterward); a customer with real
+   bookings (from test 7) is archived instead (`isActive: false`, row still exists).
+9. **The real foreign key backs this up**: bypassing the service entirely, a raw SQL `DELETE`
+   against the same customer-with-bookings is refused by the database itself (`23503`,
+   `app.bookings.customer_id REFERENCES app.customers(id)`, no `ON DELETE CASCADE` declared in
+   step 2.3) - the archive rule is not the only thing preventing data loss here.
+10. **Transaction rollback, the real guarantee**: inside one `withTransaction`, a real `UPDATE`
+    runs and succeeds, then a second statement fails (duplicate primary key) - the whole
+    transaction rolls back, and the row is confirmed completely unchanged afterward.
+- **Isolation**: confirmed (no `mongoose`/`server/models/` anywhere in the pilot's full require
+  tree, checked recursively).
+
+No schema change was needed or made - the committed step 2.3 schema (no unique index on phone, by
+design; the default-`RESTRICT` foreign key from `app.bookings`) was already adequate for every
+rule above.
+
+##### Regression checks
+
+| Command | With PostgreSQL configured (run twice) | Without (the ordinary state) |
+|---|---|---|
+| `npm.cmd test` | **421 passed, 0 failed, 0 skipped**, both times | 307 passed, 0 failed, **12 skipped** (cleanly) |
+| `npm.cmd run test:browser` | **780 passed, 0 failed** (15 suites) - identical to every prior baseline | unaffected either way |
+
+All eleven `postgres*.test.js` files (now including this one) run together, **three times** -
+121/121 every time, no deadlocks or races (the step 2.5 advisory-lock fix holds with an eleventh
+file). This file alone run **three times** in isolation too - the same 12/12 result every time.
+After every run, the test database (`snooker_club_pro_test`) was confirmed left clean - no `app`
+schema, no leftover tables. No unrelated failure occurred during this step's verification (unlike
+step 2.10's one observed flaky MongoDB test, not seen again here).
+
+Confirmed: MongoDB remains the application's only active database; `customers.service.js`, its
+routes and controller are unchanged; no route or controller reads the new pilot; every MongoDB
+test still uses its own throw-away database, untouched; no production data was changed; nothing
+was deployed.
+
+##### Unverified behaviour and remaining risks
+
+- **`getCustomerWithHistory`** was not built (explicitly out of scope above) - a report-like,
+  multi-table join view; a future step if Customers is ever fully cut over in Phase 3.
+- **Login/cookie/middleware flow, and the customers routes/controller themselves, are untouched** -
+  this step proves the data-layer rules only; wiring Customers into the actual app is Phase 3 work.
+- **Sessions still has no PostgreSQL pilot of its own** - only fixture rows in tests, same as
+  before this step (explicitly out of scope per this step's safety rules).
+- **Players, CafeOrder, StockMovement, Matches and Counter still have no PostgreSQL pilot** -
+  completely untouched by Phase 2 so far.
+
 ### Phase 3 — Port services, one at a time (tests after each)
 
 Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
@@ -1554,7 +1647,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Phase 2, Step 2.8 — Users + AuthSession pilot: real password-hash verification, last-admin transaction rollback, and the first real foreign keys to a real user row (closing step 2.7's gap) (384 server / 780 browser with PostgreSQL configured, 13 new tests, 0 skipped)
 - [x] Phase 2, Step 2.9 — Bookings pilot: the real EXCLUDE overlap guarantee against a real service, proven with 6 genuinely concurrent requests for the identical slot (396 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped); Railway's PostgreSQL version and `btree_gist` availability remain unconfirmed - no Railway project exists yet (manual steps recorded above)
 - [x] Phase 2, Step 2.10 — Tables pilot: CRUD, uniqueness, status/session/booking restrictions, real FK compatibility with bookings, transaction rollback (409 server / 780 browser with PostgreSQL configured, 13 new tests, 0 skipped)
-- [ ] Phase 2, Step 2.11 — Customers or Sessions pilot, per the Phase 3 order above (not started; awaiting approval)
+- [x] Phase 2, Step 2.11 — Customers pilot: search/pagination with real booking stats, archive-not-delete, FK-backed deletion restriction (421 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped)
+- [ ] Phase 2, Step 2.12 — Sessions pilot, per the Phase 3 order above (not started; awaiting approval)
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
