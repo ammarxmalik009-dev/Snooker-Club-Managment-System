@@ -1272,6 +1272,116 @@ uses its own throw-away database, untouched; no production data was changed; not
   bare SQL fixture rows in tests (no repository of their own); Player, CafeOrder, StockMovement
   and Counter have **never** been touched by anything in Phase 2 at all.
 
+#### Step 2.9 — Bookings pilot: the real EXCLUDE overlap guarantee against a real service — done
+
+**Railway compatibility check (done first, as required):** no Railway project exists yet for this
+app - no `railway` CLI on PATH, no `.railway` directory, no `RAILWAY_*` environment variables, and
+`client/vercel.json`'s backend rewrite still holds the literal placeholder `<RAILWAY_BACKEND_URL>`.
+This is not "unsafe to check" - there is genuinely nothing to check yet. **No compatibility result
+is claimed.** Manual verification steps for whenever a Railway PostgreSQL service is actually
+provisioned:
+
+1. `railway connect postgres` (or copy `DATABASE_URL` from the Railway dashboard) and run
+   `SELECT version();` - confirm it is PostgreSQL 13 or newer (required for `gen_random_uuid()`
+   without an extra extension; the local dev database is 18.6, Railway's managed image is commonly
+   15/16/17 at the time of writing, all of which qualify).
+2. `SELECT * FROM pg_available_extensions WHERE name = 'btree_gist';` - confirm it is **listed**
+   (availability), then `CREATE EXTENSION IF NOT EXISTS btree_gist;` on the actual Railway database
+   and re-run `\dx` - confirm it is **installed** (Railway's managed PostgreSQL permits
+   superuser-free extension creation for the common ones, including `btree_gist`, but this must be
+   confirmed on the real instance, not assumed from that general reputation).
+3. If either check fails, stop before running `0001_initial_schema.sql` against Railway and report
+   back rather than altering the schema to work around it.
+
+Re-confirmed locally before relying on them again (same discipline as every earlier step - a past
+confirmation is never assumed to still hold): local PostgreSQL is still 18.6, `btree_gist` 1.8 is
+still installed in the local dev/test setup.
+
+##### Bookings (`server/services/bookings.pg.service.js`)
+
+Standalone pilot, not wired into any route; does not call and is not called by the MongoDB
+`server/services/bookings.service.js`, which remains the application's only active booking path.
+
+- **Reused, unmodified**: `server/utils/time.js`'s `zonedDateTimeToUtc` for the same club-timezone
+  date/time semantics `bookings.service.js` itself uses. `BOOKING_STATUSES`/`ACTIVE_BOOKING_STATUSES`
+  are small local copies of `models/Booking.js`'s own (not an import of that file, which requires
+  `"mongoose"` - the same isolation reason every earlier pilot's small local copies exist for).
+- **Implemented**: create, get-by-id, update (reschedule/change table), confirm (pending→confirmed),
+  cancel - the same rules `bookings.service.js` enforces (not in the past, at most 60 days ahead,
+  end time after start time, only pending/confirmed bookings can be rescheduled or cancelled,
+  cancelling frees the slot immediately).
+- **The one genuinely different guarantee**: `bookings.service.js` has no database transactions, so
+  it documents its own accepted gap - check for a clash before saving, save anyway, check again
+  after, and whichever of two racing requests loses deletes its own row. The schema's
+  `bookings_no_overlap` EXCLUDE USING gist constraint (committed already in step 2.3, but never
+  tested against a real service until now) makes an overlapping INSERT **or** UPDATE simply
+  impossible at the database level - there is no window, however brief, where two overlapping
+  active bookings can exist, and no "loser deletes itself" step is needed because the losing
+  attempt never succeeds at all. The schema was adequate as committed; no schema change was needed
+  for this step.
+
+##### What was verified - against the real local PostgreSQL
+
+1. **Create and retrieve** a booking; re-read matches exactly what was returned on creation.
+2. **Non-overlapping bookings on the same table** are both accepted, including a booking that
+   starts exactly when another ends (touching, not overlapping, is fine - same rule as MongoDB).
+3. **An overlapping booking on the same table is refused by the database itself** - a 409 with the
+   same `"Table <n> is already booked HH:MM–HH:MM (<name>)"` message `bookings.service.js` produces,
+   and confirmed with a direct `COUNT(*)` that the refused attempt left no row behind at all.
+4. **The identical time slot on a different table** is accepted without issue.
+5. **Invalid inputs refused cleanly**: a past date (`resolveTimes` throws synchronously, confirmed
+   with `assert.throws`), a non-existent table id (404 "Table not found"), a non-existent customer
+   id (404 "Customer not found"), and a zero-length booking (refused by the schema's own
+   `end_at > start_at` CHECK constraint).
+6. **Update**: rescheduling into a slot that clashes on another table is refused (409, same clash
+   message); rescheduling into a genuinely free slot succeeds.
+7. **Cancellation frees the slot immediately**: a second booking for the exact same freed slot
+   succeeds right after cancelling the first; cancelling an already-cancelled booking is refused
+   (409 "already cancelled").
+8. **Confirm**: pending → confirmed succeeds once, a second attempt is refused (409 "already
+   confirmed").
+9. **Real concurrency - 6 genuinely simultaneous `createBooking` calls for the identical table and
+   time slot** (`Promise.allSettled`, no mocks, no artificial delay): **exactly 1 succeeded, 5 were
+   rejected with 409**, and a direct `COUNT(*)` against the database confirmed **exactly 1 row was
+   actually committed** - decided by the database's own EXCLUDE constraint, not by any
+   check-then-insert logic in the service.
+10. **Real concurrency - 3 simultaneous `createBooking` calls on 3 different tables, same time
+    slot**: all 3 succeeded, proving the constraint's lock is per-table (via the `table_id` in the
+    GiST index), not a broad lock that would have serialized unrelated tables.
+11. **Isolation**: confirmed (no `mongoose`/`server/models/` anywhere in the pilot's full require
+    tree, checked recursively).
+
+##### Regression checks
+
+| Command | With PostgreSQL configured (run twice) | Without (the ordinary state) |
+|---|---|---|
+| `npm.cmd test` | **396 passed, 0 failed, 0 skipped**, both times | 307 passed, 0 failed, **10 skipped** (cleanly) |
+| `npm.cmd run test:browser` | **780 passed, 0 failed** (15 suites) - identical to every prior baseline | unaffected either way |
+
+All nine `postgres*.test.js` files (now including this one) run together, **three times** - no
+deadlocks or races (the step 2.5 advisory-lock fix holds with a ninth file). This file alone run
+**three times** in isolation too - the same 11/11 result every time. After every run, the test
+database (`snooker_club_pro_test`) was confirmed left clean - no `app` schema, no leftover tables.
+
+Confirmed: MongoDB remains the application's only active database; `bookings.service.js`, its
+routes and controller are unchanged; no route or controller reads the new pilot; every MongoDB test
+still uses its own throw-away database, untouched; no production data was changed; nothing was
+deployed; no Railway environment was touched (none exists to touch).
+
+##### Unverified behaviour and remaining risks
+
+- **Railway's PostgreSQL version and `btree_gist` availability remain genuinely unconfirmed** - no
+  Railway project exists for this app yet. The manual verification steps above must be run once one
+  is provisioned, before Phase 3 relies on this constraint in production.
+- **A real Sessions service still does not exist** - the Bookings pilot's fixture rows reference
+  `app.tables` and `app.customers` directly; `app.sessions`'s own FK relationship to bookings
+  (deferred constraint, step 2.3) has still only ever been exercised by raw SQL, not a service.
+- **Login/cookie/middleware flow, and the booking routes/controller themselves, are untouched** -
+  this step proves the data-layer guarantee only; wiring Bookings into the actual app is Phase 3 work.
+- **Tables, Matches and Customers still have no PostgreSQL pilot of their own** - only fixture rows
+  in tests, same as before this step. CafeOrder, StockMovement, Player and Counter remain completely
+  untouched by Phase 2.
+
 ### Phase 3 — Port services, one at a time (tests after each)
 
 Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
@@ -1338,7 +1448,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Phase 2, Step 2.6 — Bills repository pilot: ordered line items/players, all three partial-unique rules, FK, rollback, real calculateBill() numbers (358 server / 780 browser with PostgreSQL configured, 10 new tests, 0 skipped); confirmed the step 2.5 lock fix holds with a sixth test file
 - [x] Phase 2, Step 2.7 — Payments pilot: SELECT...FOR UPDATE locking, overpayment prevention proven with 5 real concurrent requests, transaction rollback (371 server / 780 browser with PostgreSQL configured, 13 new tests, 0 skipped); found and fixed a real ordering bug in the first locking design
 - [x] Phase 2, Step 2.8 — Users + AuthSession pilot: real password-hash verification, last-admin transaction rollback, and the first real foreign keys to a real user row (closing step 2.7's gap) (384 server / 780 browser with PostgreSQL configured, 13 new tests, 0 skipped)
-- [ ] Phase 2, Step 2.9 — Bookings (the btree_gist EXCLUDE constraint against a real service, and confirming Railway's extension availability) or Tables/Sessions/Customers, per the Phase 3 order above
+- [x] Phase 2, Step 2.9 — Bookings pilot: the real EXCLUDE overlap guarantee against a real service, proven with 6 genuinely concurrent requests for the identical slot (396 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped); Railway's PostgreSQL version and `btree_gist` availability remain unconfirmed - no Railway project exists yet (manual steps recorded above)
+- [ ] Phase 2, Step 2.10 — Tables, Sessions or Customers pilot, per the Phase 3 order above (not started; awaiting approval)
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
