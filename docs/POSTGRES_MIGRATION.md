@@ -423,6 +423,88 @@ in full on the new `postgres` branch as a safety check, confirming the branch ge
 `main`: `npm.cmd test` **300 passed, 0 failed**; `npm.cmd run test:browser` **780 passed, 0 failed**
 (15 suites) - identical to the numbers reported at the end of Phase 1.
 
+#### Step 2.2 — `pg`, connection pool, transaction helper, smoke test — done (connection unverified here; see limitations)
+
+**Dependency:** `pg` `^8.23.1` added to `package.json`'s `dependencies` (not a devDependency - the
+real app will need it once Phase 3 starts). No ORM, no other database framework. `npm.cmd install`
+only added `pg` and its own transitive packages to `package-lock.json` (`pg-pool`, `pg-protocol`,
+`pg-types`, `pg-connection-string`, `pg-cloudflare`, `pgpass`, `pg-int8`, `postgres-array`,
+`postgres-bytea`, `postgres-date`, `postgres-interval`, `split2`, `xtend`) - nothing else in the
+lockfile changed or was upgraded. `pg`'s own requirement is Node `>=16`; the project already
+requires `>=20` (`package.json` `engines`), so it is compatible as installed - confirmed by
+actually running it (the smoke test below), not merely by reading version numbers.
+
+**`server/config/env.js`:** one new, optional setting - `databaseUrl: process.env.DATABASE_URL || ""`.
+Nothing reads it at start-up; it does nothing on its own.
+
+**`server/config/db.pg.js` (new - `server/config/db.js`, Mongoose, is untouched):**
+- `getPool()` - builds the `pg.Pool` from `env.databaseUrl` **the first time it is actually called**,
+  never just because this file is required. Throws a clear, specific error ("DATABASE_URL is not
+  set...") if it's empty - never `pg`'s own confusing error from guessing a default local address.
+- `query(text, params)` - one query through the pool. `params` are bound as `$1, $2, …`; the file's
+  own header comment says plainly that a value must never be joined into `text` itself (SQL
+  injection). Every value this project will ever put through PostgreSQL goes through `params`, the
+  same discipline the Mongoose services already use with query filters.
+- `withTransaction(fn)` - acquires one client, `BEGIN`, runs `fn(client)`, `COMMIT` on success,
+  `ROLLBACK` on any error from `fn` (and the original error is what callers see - a failed rollback
+  is attached as `error.rollbackError`, never swapped in instead). The client is always released in
+  a `finally`, so a crash inside `fn` can never leak a connection out of the pool.
+- `closePool()` - the one explicit, documented way to close it. Nothing calls this automatically.
+- No credential logging anywhere: `safePgTarget()` (mirrors `db.js`'s `safeMongoTarget`) prints only
+  the host and database name, never the user name or password, and is the only thing the pool's
+  own error listener ever prints.
+
+**Test-database safety (`server/tests/helpers/testDb.pg.js`, new):** deliberately **not** a reuse
+of the MongoDB helper (`server/tests/helpers/testDb.js`), because that helper's rule - "test"
+*anywhere* in the name - has a real gap: a database named `snooker_club_pro_latest` would wrongly
+pass it (`"latest"` contains the substring `"test"`). The new PostgreSQL-only rule requires `"test"`
+as its **own word** (`\btest\b`, case-insensitive): `test`, `club_test`, `test_club` pass;
+`latest`, `attest` do not. It also introduces its own test-only variable, `PG_TEST_DATABASE_URL`
+(not `DATABASE_URL`): a test must never be able to run just because the real, future production
+variable happens to be set - the same separation the MongoDB tests already use
+(`MONGODB_URI` vs. each file's own `MONGODB_<AREA>_TEST_URI`). This module makes no queries and
+has no drop/reset function - Phase 2 doesn't need one yet, and the smoke test only ever reads.
+
+**Smoke test (`server/tests/postgresConnection.test.js`, new, the ONLY file touching PostgreSQL):**
+three tests -
+1. connect, `SELECT 1`, close the pool - **skipped** when `PG_TEST_DATABASE_URL` isn't set;
+2. a transaction that commits, and one that deliberately fails and is confirmed to roll back,
+   checking the *original* error (not a rollback error) is what comes out - also **skipped** without it;
+3. `db.pg.js` throws its clear "DATABASE_URL is not set" message (via a fresh subprocess with
+   `DATABASE_URL` genuinely empty, the same isolation pattern `server/tests/helpers/envSetting.js`
+   already uses) - this one needs no PostgreSQL server and always runs.
+
+**Configuring a local PostgreSQL test database (so tests 1-2 actually run):** install PostgreSQL
+locally (any recent version), create one throw-away database whose name contains `test` as its own
+word, e.g.:
+
+```sql
+CREATE DATABASE snooker_club_pro_test;
+```
+
+then run the smoke test with that database's connection string in `PG_TEST_DATABASE_URL`
+(PowerShell):
+
+```powershell
+$env:PG_TEST_DATABASE_URL = "postgres://postgres:yourpassword@127.0.0.1:5432/snooker_club_pro_test"
+node --test server/tests/postgresConnection.test.js
+```
+
+**Limitation - what was and wasn't actually verified:** this environment has **no PostgreSQL
+server and no Docker available**, so `PG_TEST_DATABASE_URL` could not be set here, and tests 1-2
+above were **skipped**, not passed - a skip is evidence of nothing. What *was* actually run and
+passed is: `pg` installs and loads correctly on this Node version, and `db.pg.js`'s "DATABASE_URL
+is missing" error path (test 3). **A real PostgreSQL connection has not been demonstrated.** Before
+trusting this module for Phase 2.3+, run it against a real local PostgreSQL test database using the
+steps above and confirm tests 1-2 actually pass (not skip).
+
+**Backward compatibility (checked):** `npm.cmd test`/`npm.cmd run test:browser` still pass in full
+(below) with no PostgreSQL configured anywhere - proving normal start-up, MongoDB, and every route
+are completely unaffected by this module's mere existence.
+
+Test results after 2.2: `npm.cmd test` **303 passed, 0 failed, 2 skipped** (300 + 3 new, 2 of the 3
+skipped as explained above); `npm.cmd run test:browser` **780 passed, 0 failed** (15 suites, unchanged).
+
 ### Phase 3 — Port services, one at a time (tests after each)
 
 Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
@@ -481,7 +563,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] 1.6 `client/vercel.json` + `client/404.html` (300 server / 780 browser; live Vercel check and real backend URL still pending Phase 5)
 - [x] 1.7 Docs + `.env.example` + full test runs (300 server / 780 browser) — **Phase 1 complete in code and docs; live deployment unverified (see "Phase 1 status" above)**
 - [x] Phase 2, Step 2.1 — inspection + foundation plan (docs only, `postgres` branch created from `34138b3`; 300 server / 780 browser re-run clean)
-- [ ] Phase 2, Step 2.2 — `pg` dependency, connection pool, transaction helpers, local test PostgreSQL, one smoke test
+- [x] Phase 2, Step 2.2 — `pg` dependency, connection pool, transaction helpers, smoke test (303 server / 780 browser; real PostgreSQL connection still unverified - no local server available, see step 2.2's limitation note)
+- [ ] Phase 2, Step 2.3 — confirm a real local PostgreSQL connection (run the skipped smoke tests), then start on schemas/migrations per the Phase 3 order
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified

@@ -118,6 +118,10 @@ const env = {
   port: readPort(process.env.PORT, 3000),
   mongoUri: process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/snooker_club_pro",
   clubTimeZone: readTimeZone(process.env.CLUB_TIMEZONE, "Asia/Karachi"),
+  // Phase 2 (PostgreSQL foundation, optional): empty unless someone sets it. Nothing reads this at
+  // start-up and no connection is made just because it's set - only server/config/db.pg.js, and only
+  // when something actually calls it. The app's real database today is MongoDB (mongoUri above).
+  databaseUrl: process.env.DATABASE_URL || "",
 
   // ---- Login (Phase 8) ----
   authSecret: readAuthSecret(process.env.AUTH_SECRET),

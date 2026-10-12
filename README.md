@@ -472,6 +472,7 @@ npm run test:browser -- cafe # only some suites, in the order given (auth, billi
 | `COOKIE_SECURE` | `false` (in `production`: `true`) | `true` = the login cookie is only sent over HTTPS. With `NODE_ENV=production` on plain http (the club network), set `COOKIE_SECURE=false`, or logins won't stick |
 | `TRUST_PROXY` | *(empty = no proxy, the club PC)* | *optional, only for hosting behind a proxy (e.g. Railway).* How many proxies sit in front of the app, so the login lock sees the visitor's real address instead of the proxy's. See `docs/POSTGRES_MIGRATION.md` |
 | `ALLOWED_ORIGINS` | *(empty = only this site's own pages)* | *optional, only for hosting the frontend elsewhere (e.g. Vercel).* Comma list of exact `https://…` addresses besides this site's own that may send changes. See `docs/POSTGRES_MIGRATION.md` |
+| `DATABASE_URL` | *(empty = unused)* | *optional PostgreSQL foundation, Phase 2 - not used by the running app yet.* The real database today is still `MONGODB_URI` above. See `docs/POSTGRES_MIGRATION.md` |
 
 ## Troubleshooting
 
