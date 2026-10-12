@@ -1681,6 +1681,116 @@ was deployed.
 - **Players, CafeOrder, StockMovement, Matches and Counter still have no PostgreSQL pilot** -
   completely untouched by Phase 2 so far.
 
+#### Step 2.13 — Players pilot: duplicate-name rules and the deliberately out-of-scope history — done
+
+**Scope chosen:** a standalone Players repository, following the same `*.pg.service.js` pattern
+as every earlier pilot. Not wired into any route; does not call and is not called by
+`server/services/players.service.js` (MongoDB), which stays the application's only active path.
+
+##### Players (`server/services/players.pg.service.js`)
+
+- **`nameKeyOf`** is a small, local copy of `models/Category.js`'s own function (the exact rule
+  `models/Player.js`'s own `pre("validate")` hook uses) - not an import of it, the same isolation
+  reason every earlier pilot's local copies exist for.
+- **`nameKey` and `phoneDigits` deliberately left out of the returned shape** -
+  `models/Player.js`'s own `toJSON` transform strips both from every response the real app
+  sends (internal search/uniqueness helpers, not player data); this pilot matches that exactly.
+- **Implemented**: create, get-by-id, update (partial; renaming to the same name with different
+  capitals is fine), deactivate/reactivate (`setActive`; a player is **never deleted** - matches
+  and bills can always point back to them, exactly as `models/Player.js`'s own header comment
+  states), list/search (status filter defaulting to `"active"`, name/phone-digit search,
+  pagination, ordered by `name_key`).
+- **The one real nuance preserved exactly**: a duplicate-name error's *message* differs depending
+  on whether the clashing existing player is active ("already registered") or inactive
+  ("already registered (inactive - reactivate them instead)") - the same distinction
+  `players.service.js`'s own `duplicateError` makes. This pilot does a pre-check for that
+  specific message (reusing the same lookup `createPlayer` and `updatePlayer` both call), with the
+  database's own `players_name_key_key` unique index (step 2.3) as the real, final guard -
+  verified directly with two genuinely concurrent creates for the identical name below, not just
+  reasoned about.
+- **No new uniqueness or business rule was introduced** - phone is not unique here either (same
+  as Customers, step 2.11), matching the existing model exactly; nothing was added to make this
+  pilot look more complete than the real service.
+
+##### Player history - explicitly deferred, not invented
+
+`playerHistory.service.js` (Phase 11.6) builds a player's history by joining `Match` and `Bill`
+records (`Player -> Match -> Bill -> Payment`, per its own header comment). **Matches has no real
+PostgreSQL repository** - only step 2.5's fixture-only `match_players`/`match_teams` ordered-row
+proof exists, not a service with business rules. Building any player-history read here would mean
+either fabricating a count/total without a real join, or silently reimplementing Matches'
+business rules as a side effect of a Players pilot - both explicitly against this step's
+instructions. **Nothing was built**; this gap is recorded as the step's main remaining risk,
+unchanged until a real Matches pilot exists.
+
+##### What was verified - against the real local PostgreSQL
+
+1. **Create and retrieve**: name trimmed; `nameKey`/`phoneDigits` confirmed absent from the
+   returned object (not just unused - genuinely not present as keys).
+2. **Duplicate names refused, case/space-insensitive** ("ALI   khan" collides with "Ali Khan"),
+   confirmed with a `COUNT(*)` that the refused duplicate left no row behind; the message changes
+   correctly to mention "reactivate them instead" when the clashing player is inactive.
+3. **Invalid input refused cleanly**: name below 2 or above 60 characters, phone above 20
+   characters, notes above 200 characters.
+4. **Missing player id** refused with 404, for both a read and an update.
+5. **Update**: a partial change (phone + notes) applies without touching the name; renaming to the
+   same name with different capitals succeeds (excludes the player's own row from the duplicate
+   check); renaming to a name taken by a *different* player is refused, with the original name
+   confirmed unchanged afterward.
+6. **Deactivate/reactivate**: `deactivatedAt` is set on deactivation and cleared on reactivation;
+   repeating the same state (`"already inactive"`/`"already active"`) is refused.
+7. **List/search**: status defaults to active, hides deactivated players unless `status:
+   "inactive"` is asked for; name search and phone-digit search; pagination math matches the
+   real total.
+8. **Real concurrency - 2 genuinely simultaneous `createPlayer` calls for the identical name**
+   (different capitalisation/spacing, same `nameKey`, `Promise.allSettled`, no mocks): exactly 1
+   succeeded, 1 was refused (409) by the database's own unique index, and a direct `COUNT(*)`
+   confirmed exactly 1 row was actually committed.
+9. **Foreign-key compatibility**: a real `app.match_players` row (with a real match/session/table
+   fixture) referencing this player's id inserts cleanly; a non-existent player id in the same
+   column is refused by the database (`23503`); a `NULL` player id (a walk-in player, per the
+   schema's own comment) is still accepted, confirming the column's nullability was preserved
+   correctly.
+10. **Transaction rollback, the real guarantee**: inside one `withTransaction`, an `UPDATE` is
+    applied and then a second statement fails (duplicate primary key) - the whole transaction
+    rolls back, and the row is confirmed completely unchanged afterward.
+- **Isolation**: confirmed (no `mongoose`/`server/models/` anywhere in the pilot's full require
+  tree, checked recursively).
+
+No schema change was needed or made - the committed step 2.3 schema (`players_name_key_key`
+unique index, the default-`RESTRICT`-or-nullable foreign keys from `match_players`/`bill_players`)
+was already adequate for every rule above.
+
+##### Regression checks
+
+| Command | With PostgreSQL configured (run twice) | Without (the ordinary state) |
+|---|---|---|
+| `npm.cmd test` | **445 passed, 0 failed, 0 skipped**, both times | 307 passed, 0 failed, **14 skipped** (cleanly) |
+| `npm.cmd run test:browser` | **780 passed, 0 failed** (15 suites) - identical to every prior baseline | unaffected either way |
+
+All thirteen `postgres*.test.js` files (now including this one) run together, **three times** -
+145/145 every time, no deadlocks or races (the step 2.5 advisory-lock fix holds with a thirteenth
+file). This file alone run **three times** in isolation too - the same 12/12 result every time.
+After every run, the test database (`snooker_club_pro_test`) was confirmed left clean - no `app`
+schema, no leftover tables. No unrelated failure occurred during this step's verification.
+
+Confirmed: MongoDB remains the application's only active database; `players.service.js`, its
+routes and controller are unchanged; no route or controller reads the new pilot; every MongoDB
+test still uses its own throw-away database, untouched; no production data was changed; nothing
+was deployed.
+
+##### Unverified behaviour and remaining risks
+
+- **Player history (`playerHistory.service.js`) was not built** (explicitly deferred above) -
+  blocked on a real Matches PostgreSQL pilot (and, for bill/payment totals, a Bills/Payments join
+  against real match-linked bills), neither of which exists yet in a form this pilot could safely
+  join against without fabricating data.
+- **Login/cookie/middleware flow, and the players routes/controller themselves, are untouched** -
+  this step proves the data-layer rules only; wiring Players into the actual app is Phase 3 work.
+- **Matches and CafeOrder/StockMovement still have no PostgreSQL pilot of their own** - step 2.5's
+  fixture-only `match_players`/`match_teams` proof remains the only PostgreSQL contact point for
+  Matches; Counter remains completely untouched by Phase 2 so far.
+
 ### Phase 3 — Port services, one at a time (tests after each)
 
 Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
@@ -1751,7 +1861,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Phase 2, Step 2.10 — Tables pilot: CRUD, uniqueness, status/session/booking restrictions, real FK compatibility with bookings, transaction rollback (409 server / 780 browser with PostgreSQL configured, 13 new tests, 0 skipped)
 - [x] Phase 2, Step 2.11 — Customers pilot: search/pagination with real booking stats, archive-not-delete, FK-backed deletion restriction (421 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped)
 - [x] Phase 2, Step 2.12 — Sessions pilot: real one-transaction start/end, the sessions_one_open_per_table guarantee proven with genuine concurrency, FK compatibility (433 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped)
-- [ ] Phase 2, Step 2.13 — Players, CafeOrder/StockMovement or Matches pilot, per the Phase 3 order above (not started; awaiting approval)
+- [x] Phase 2, Step 2.13 — Players pilot: duplicate-name rules (active vs inactive message), deactivate/reactivate, real concurrency proof, FK compatibility with match_players (445 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped); player history explicitly deferred (no Matches pilot yet)
+- [ ] Phase 2, Step 2.14 — CafeOrder/StockMovement or Matches pilot, per the Phase 3 order above (not started; awaiting approval)
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
