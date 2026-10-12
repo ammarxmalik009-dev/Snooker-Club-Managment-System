@@ -20,6 +20,9 @@ const mongoose = require("mongoose");
 
 const SUITES_DIR = path.join(__dirname, "suites");
 const PORT = Number(process.env.BROWSER_TEST_PORT || 3998);
+// Step 1.5: suites named "static-*" run against this second port (client/ served as plain static
+// files, like Vercel - no server-side pageGuard). See tests/browser/server.js.
+const STATIC_PORT = Number(process.env.BROWSER_TEST_STATIC_PORT || PORT + 1);
 const DB_URI = process.env.BROWSER_TEST_DB_URI || "mongodb://127.0.0.1:27017/snooker_club_pro_uitest";
 const BUDGET = Number(process.env.BROWSER_TEST_BUDGET_MS || 400000);
 
@@ -41,13 +44,13 @@ function findBrowser() {
 function startServer() {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path.join(__dirname, "server.js")], {
-      env: { ...process.env, BROWSER_TEST_PORT: String(PORT), BROWSER_TEST_DB_URI: DB_URI },
+      env: { ...process.env, BROWSER_TEST_PORT: String(PORT), BROWSER_TEST_STATIC_PORT: String(STATIC_PORT), BROWSER_TEST_DB_URI: DB_URI },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let output = "";
     const onData = (chunk) => {
       output += chunk;
-      if (output.includes("BROWSER-TEST-SERVER READY")) resolve(child);
+      if (output.includes("BROWSER-TEST-SERVER READY") && output.includes("BROWSER-TEST-STATIC-SERVER READY")) resolve(child);
     };
     child.stdout.on("data", onData);
     child.stderr.on("data", (chunk) => (output += chunk));
@@ -62,8 +65,9 @@ function decodeHtml(text) {
 function runSuite(browser, name) {
   // A short path in the system temp folder (Windows has a path-length limit; profiles have deep folders)
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "scp-bt-"));
+  const port = name.startsWith("static-") ? STATIC_PORT : PORT;
   const args = ["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", `--user-data-dir=${profile}`,
-    `--virtual-time-budget=${BUDGET}`, "--window-size=1400,1000", "--dump-dom", `http://127.0.0.1:${PORT}/_harness/${name}`];
+    `--virtual-time-budget=${BUDGET}`, "--window-size=1400,1000", "--dump-dom", `http://127.0.0.1:${port}/_harness/${name}`];
   return new Promise((resolve) => {
     execFile(browser, args, { maxBuffer: 64 * 1024 * 1024, timeout: 15 * 60 * 1000 }, (error, stdout) => {
       try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 }); } catch { /* best effort */ }

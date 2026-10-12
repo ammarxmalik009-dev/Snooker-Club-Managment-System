@@ -122,4 +122,4 @@ function sameOriginOnly(req, res, next) {
   refuse();
 }
 
-module.exports = { loadUser, requireAuth, requirePermission, pageGuard, sameOriginOnly, canonicalPagePath };
+module.exports = { loadUser, requireAuth, requirePermission, pageGuard, sameOriginOnly, canonicalPagePath, PAGE_NAME };

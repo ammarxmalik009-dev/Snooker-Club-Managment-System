@@ -4,6 +4,19 @@
    Tablet & mobile:   sidebar slides in from the left (menu button).
    ========================================================= */
 
+/* Step 1.5 (client-side page-role guard, UX only - the server/API always decide access for real):
+   the page's own content stays hidden until layout.js confirms /api/auth/page-access says
+   "allowed" (body[data-access="allowed"]). This is the FAIL-CLOSED default: on a redirect
+   (wrong role), a check error, or simply before the answer arrives, nothing is shown. */
+body:not([data-access="allowed"]) main.page-content {
+    display: none;
+}
+
+.page-access-error {
+    margin: 28px;
+    max-width: 520px;
+}
+
 /* ---------- Sidebar ---------- */
 .sidebar {
     position: fixed;

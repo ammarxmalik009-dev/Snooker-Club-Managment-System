@@ -2,7 +2,9 @@
 
 const { matchedData } = require("express-validator");
 const authService = require("../services/auth.service");
-const { permissionsForRole } = require("../config/permissions");
+const { permissionsForRole, roleHasPermission, PAGE_PERMISSIONS } = require("../config/permissions");
+const { canonicalPagePath, PAGE_NAME } = require("../middleware/auth");
+const AppError = require("../utils/AppError");
 const { sendSuccess } = require("../utils/response");
 
 // Safe user info for the browser (never the password hash)
@@ -39,4 +41,21 @@ async function me(req, res) {
   sendSuccess(res, "Logged in", publicUser(req.user));
 }
 
-module.exports = { login, logout, me, publicUser };
+// Step 1.5: "may this logged-in user's role open this page?" - for the browser's page-role guard
+// ONLY (a convenience redirect). This is read-only and changes nothing. It uses the EXACT SAME
+// logic as pageGuard (middleware/auth.js), so "allowed" here can never disagree with what the
+// server would actually do when the page itself is requested: a page with no entry in
+// PAGE_PERMISSIONS (most pages) is allowed for any logged-in user, same as pageGuard.
+async function pageAccess(req, res) {
+  const { page } = matchedData(req, { locations: ["query"] });
+  const canonicalPage = canonicalPagePath(page);
+  if (!canonicalPage || !PAGE_NAME.test(canonicalPage.canonical)) {
+    throw new AppError("Invalid page address", 400);
+  }
+  const { canonical } = canonicalPage;
+  const needed = PAGE_PERMISSIONS[canonical];
+  const allowed = !needed || roleHasPermission(req.user.role, needed);
+  sendSuccess(res, "Page access checked", { page: canonical, allowed });
+}
+
+module.exports = { login, logout, me, pageAccess, publicUser };

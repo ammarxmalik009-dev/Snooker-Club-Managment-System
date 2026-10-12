@@ -32,14 +32,24 @@ require("node:fs").rmSync(process.env.BACKUP_DIR, { recursive: true, force: true
 
 const path = require("node:path");
 const express = require("express");
+const helmet = require("helmet");
+const cookieParser = require("cookie-parser");
 const mongoose = require("mongoose");
 const { createApp } = require("../../server/app");
+const apiRoutes = require("../../server/routes");
+const { apiNotFound, pageNotFound } = require("../../server/middleware/notFound");
+const errorHandler = require("../../server/middleware/errorHandler");
 const users = require("../../server/services/users.service");
 const loginThrottle = require("../../server/services/loginThrottle");
 
 const PORT = Number(process.env.BROWSER_TEST_PORT || 3998);
+// Step 1.5: a second listener that serves client/ as plain static files, like a Vercel deployment -
+// no pageGuard runs on an HTML page there. The static-pageguard suite runs against THIS port to
+// prove the client-side page-role guard (not the server) is what hides a restricted page's content.
+const STATIC_PORT = Number(process.env.BROWSER_TEST_STATIC_PORT || PORT + 1);
 const DB_URI = process.env.BROWSER_TEST_DB_URI || "mongodb://127.0.0.1:27017/snooker_club_pro_uitest";
 const SUITES_DIR = path.join(__dirname, "suites");
+const CLIENT_DIR = path.join(__dirname, "..", "..", "client");
 const UI_PASSWORD = "Ui-test-pass-123"; // test accounts only, in the throw-away database
 
 const DATA_COLLECTIONS = ["tables", "sessions", "bills", "payments", "settings", "counters", "customers", "bookings",
@@ -52,6 +62,9 @@ const DATA_COLLECTIONS = ["tables", "sessions", "bills", "payments", "settings",
   await mongoose.connection.syncIndexes();
   const db = mongoose.connection;
   const outer = express();
+  // Test-only routes shared by BOTH listeners (normal app + static host): /_harness, /_reset and
+  // every "fail on purpose" switch work the same way on either port, against the same database.
+  const control = express.Router();
 
   // One test user per role, created fresh (never logged in). Suites log in through the real /api/auth/login.
   async function seedUsers() {
@@ -64,8 +77,9 @@ const DATA_COLLECTIONS = ["tables", "sessions", "bills", "payments", "settings",
   // Switches that make parts of the API fail on purpose (error-state tests)
   const failingReports = new Set();
   let failDashboard = false;
+  let failAccess = false; // Step 1.5: GET /api/auth/page-access
 
-  outer.get("/_harness/:name", (req, res) => {
+  control.get("/_harness/:name", (req, res) => {
     if (!/^[a-z0-9-]+$/.test(req.params.name)) return res.status(400).send("bad name");
     res.sendFile(path.join(SUITES_DIR, `${req.params.name}.html`));
   });
@@ -75,7 +89,7 @@ const DATA_COLLECTIONS = ["tables", "sessions", "bills", "payments", "settings",
   //  - the three role users created again: new ids, never logged in
   //  - every old login cookie is dead (its session is gone), so a previous suite's login can't carry over
   //  - the in-memory login throttle and all "fail on purpose" switches cleared
-  outer.get("/_reset", async (req, res) => {
+  control.get("/_reset", async (req, res) => {
     for (const { name } of await db.db.listCollections().toArray()) {
       await db.collection(name).deleteMany({});
     }
@@ -83,12 +97,13 @@ const DATA_COLLECTIONS = ["tables", "sessions", "bills", "payments", "settings",
     loginThrottle.clearAll();
     failingReports.clear();
     failDashboard = false;
+    failAccess = false;
     clockOffsetMs = 0; // real time again
     res.json({ reset: true, users: await db.collection("users").countDocuments() });
   });
 
   // Set the server's "now": /_clock/2026-10-05T12:00:00%2B05:00 (or /_clock/real)
-  outer.get("/_clock/:when", (req, res) => {
+  control.get("/_clock/:when", (req, res) => {
     if (req.params.when === "real") {
       clockOffsetMs = 0;
     } else {
@@ -100,19 +115,19 @@ const DATA_COLLECTIONS = ["tables", "sessions", "bills", "payments", "settings",
   });
 
   // Clears club data only, keeping users and logins (for use INSIDE a suite)
-  outer.get("/_drop", async (req, res) => {
+  control.get("/_drop", async (req, res) => {
     for (const name of DATA_COLLECTIONS) await db.collection(name).deleteMany({});
     res.send("dropped");
   });
   // Move the running session of a table back in time by N seconds (to test timers without waiting)
-  outer.get("/_backdate/:tableNumber/:seconds", async (req, res) => {
+  control.get("/_backdate/:tableNumber/:seconds", async (req, res) => {
     const startedAt = new Date(Date.now() - Number(req.params.seconds) * 1000);
     const result = await db.collection("sessions").updateOne(
       { tableNumber: Number(req.params.tableNumber), isOpen: true }, { $set: { startedAt } });
     res.json({ matched: result.matchedCount, startedAt });
   });
   // Add N finished sessions in September (for paging tests)
-  outer.get("/_seed/:count", async (req, res) => {
+  control.get("/_seed/:count", async (req, res) => {
     const table = await db.collection("tables").findOne({});
     const docs = Array.from({ length: Number(req.params.count) }, (_, i) => {
       const startedAt = new Date(Date.UTC(2026, 8, 1 + (i % 28), 10, 0, 0));
@@ -124,7 +139,7 @@ const DATA_COLLECTIONS = ["tables", "sessions", "bills", "payments", "settings",
     res.send("seeded");
   });
   // Move a booking so it starts N minutes from now (negative = already started)
-  outer.get("/_bookingstart/:id/:minutes", async (req, res) => {
+  control.get("/_bookingstart/:id/:minutes", async (req, res) => {
     const startAt = new Date(Date.now() + Number(req.params.minutes) * 60000);
     const booking = await db.collection("bookings").findOne({ _id: new mongoose.Types.ObjectId(req.params.id) });
     const length = booking.endAt - booking.startAt;
@@ -132,7 +147,7 @@ const DATA_COLLECTIONS = ["tables", "sessions", "bills", "payments", "settings",
     res.json({ startAt });
   });
   // Set a date field on one record (to put test data into a past period)
-  outer.get("/_setdate/:collection/:id/:field/:iso", async (req, res) => {
+  control.get("/_setdate/:collection/:id/:field/:iso", async (req, res) => {
     const allowed = ["bills", "payments", "sessions", "bookings", "customers", "tables", "matches", "players"]; // matches, players: Phase 11.7
     if (!allowed.includes(req.params.collection)) return res.status(400).send("no");
     const result = await db.collection(req.params.collection).updateOne(
@@ -140,21 +155,21 @@ const DATA_COLLECTIONS = ["tables", "sessions", "bills", "payments", "settings",
     res.json({ matched: result.matchedCount });
   });
   // Make chosen report endpoints fail with 503 (to test error + Retry)
-  outer.get("/_failreport/:name/:mode", (req, res) => {
+  control.get("/_failreport/:name/:mode", (req, res) => {
     if (req.params.mode === "on") failingReports.add(req.params.name); else failingReports.delete(req.params.name);
     res.send([...failingReports].join(",") || "none");
   });
-  outer.get("/api/reports/:name", (req, res, next) => {
+  control.get("/api/reports/:name", (req, res, next) => {
     if (!failingReports.has(req.params.name)) return next();
     res.status(503).json({ success: false, message: "The database is not available. Please try again shortly." });
   });
   // e.g. /_failreport/outstanding-print/on makes /api/reports/outstanding/print fail
-  outer.get("/api/reports/:name/:sub", (req, res, next) => {
+  control.get("/api/reports/:name/:sub", (req, res, next) => {
     if (!failingReports.has(`${req.params.name}-${req.params.sub}`)) return next();
     res.status(503).json({ success: false, message: "The database is not available. Please try again shortly." });
   });
   // Insert N unpaid bills at one moment, straight into the database (for the print safety-limit test)
-  outer.get("/_bulkbills/:count/:iso", async (req, res) => {
+  control.get("/_bulkbills/:count/:iso", async (req, res) => {
     const table = await db.collection("tables").findOne({});
     const createdAt = new Date(req.params.iso);
     const docs = Array.from({ length: Number(req.params.count) }, (_, n) => ({
@@ -170,19 +185,40 @@ const DATA_COLLECTIONS = ["tables", "sessions", "bills", "payments", "settings",
     res.json({ inserted: docs.length });
   });
   // Simulate a broken API for the dashboard (to test error states)
-  outer.get("/_fail/:mode", (req, res) => { failDashboard = req.params.mode === "on"; res.send(`fail ${failDashboard}`); });
-  outer.get("/api/dashboard/summary", (req, res, next) => {
+  control.get("/_fail/:mode", (req, res) => { failDashboard = req.params.mode === "on"; res.send(`fail ${failDashboard}`); });
+  control.get("/api/dashboard/summary", (req, res, next) => {
     if (!failDashboard) return next();
     res.status(503).json({ success: false, message: "The database is not available. Please try again shortly." });
   });
   // Phase 10: read a product's stock straight from the database (to prove what the API did)
-  outer.get("/_stock/:id", async (req, res) => {
+  control.get("/_stock/:id", async (req, res) => {
     const product = await db.collection("products").findOne({ _id: new mongoose.Types.ObjectId(req.params.id) });
     res.json({ stockQuantity: product ? product.stockQuantity : null });
   });
+  // Step 1.5: make the page-access check itself fail (to test the client guard's fail-closed state)
+  control.get("/_failaccess/:mode", (req, res) => { failAccess = req.params.mode === "on"; res.send(`failaccess ${failAccess}`); });
+  control.get("/api/auth/page-access", (req, res, next) => {
+    if (!failAccess) return next();
+    res.status(503).json({ success: false, message: "The database is not available. Please try again shortly." });
+  });
 
+  outer.use(control);
   outer.use(createApp());
   outer.listen(PORT, () => console.log(`BROWSER-TEST-SERVER READY on ${PORT}`));
+
+  // Step 1.5: the "static host" listener - client/ served as plain files (express.static), with NO
+  // pageGuard, exactly like Vercel. /api/* keeps the real backend's own checks (requireAuth, roles).
+  const staticOuter = express();
+  staticOuter.use(control); // same /_harness, /_reset and fail switches, same database
+  staticOuter.use(helmet({ contentSecurityPolicy: { directives: { upgradeInsecureRequests: null } } }));
+  staticOuter.use(express.json({ limit: "100kb" }));
+  staticOuter.use(cookieParser());
+  staticOuter.use("/api", apiRoutes);
+  staticOuter.use("/api", apiNotFound);
+  staticOuter.use(express.static(CLIENT_DIR)); // no pageGuard: every page file is public, like Vercel
+  staticOuter.use(pageNotFound);
+  staticOuter.use(errorHandler);
+  staticOuter.listen(STATIC_PORT, () => console.log(`BROWSER-TEST-STATIC-SERVER READY on ${STATIC_PORT}`));
 })().catch((error) => {
   console.error(error);
   process.exit(1);

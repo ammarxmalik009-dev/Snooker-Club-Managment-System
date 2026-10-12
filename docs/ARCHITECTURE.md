@@ -406,6 +406,7 @@ simpler tools with no extra dependencies (only `cookie-parser` was added):
 | Forgotten admin password | Phase 11.8: `npm run reset-admin-password` on the club PC. Only an existing active admin, hidden input, normal rules, all their logins end |
 | Brute force | In-memory counter (`services/loginThrottle.js`): 5 failures per username or 20 per IP in 15 min → 15-min lock (429). Unknown usernames take the same time as known ones (fake hash check) and get the same message |
 | Cross-site requests | `SameSite=Strict` cookie, plus `sameOriginOnly`: a POST, PATCH or DELETE whose `Origin` is another site → 403 |
+| Restricted pages on a static host | `pageGuard` only runs when this app serves its own frontend. On a static host (e.g. Vercel) a page's HTML is public, but it holds no club data: `GET /api/auth/page-access` lets the browser redirect away from a page its role can't use (`client/js/core/layout.js`, deployment readiness step 1.5) - a convenience only, since every real API call still needs its own login and role check |
 | Headers | `helmet` adds standard security headers (incl. a Content-Security-Policy with no inline scripts) |
 | Input | Every request body is validated (`express-validator`) **and** Mongoose validates again. Login input is capped (password ≤ 200 chars) before hashing |
 | Secrets | `AUTH_SECRET` and the database URL live in `.env`, which is never committed. `.env.example` has only placeholders. Production refuses to start without a real secret |

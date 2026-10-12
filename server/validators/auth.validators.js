@@ -13,6 +13,14 @@ const loginRules = [
     .isLength({ min: 1, max: 200 }).withMessage("Enter your username and password"),
 ];
 
+// Step 1.5: the client asks "may I show this page?" with ?page=<path>. The exact shape of a page
+// address (/pages/x.html, decoded, canonical) is checked by canonicalPagePath - the same function
+// pageGuard uses - so this only checks that something sensible was sent at all.
+const pageAccessRules = [
+  query("page").isString().withMessage("Invalid page address").bail()
+    .isLength({ min: 1, max: 200 }).withMessage("Invalid page address"),
+];
+
 const idRules = [param("id").isMongoId().withMessage("Invalid user id")];
 
 const nameRule = (required) => {
@@ -60,4 +68,4 @@ const listUserRules = [
     .customSanitizer((value) => value === "true"),
 ];
 
-module.exports = { loginRules, idRules, createUserRules, updateUserRules, passwordRules, listUserRules, USERNAME_PATTERN };
+module.exports = { loginRules, pageAccessRules, idRules, createUserRules, updateUserRules, passwordRules, listUserRules, USERNAME_PATTERN };

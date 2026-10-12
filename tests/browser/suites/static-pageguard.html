@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>static-pageguard UI harness</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="f" width="1280" height="900"></iframe>
+<script>
+// Step 1.5 browser tests: the CLIENT-SIDE page-role guard, run against the STATIC-HOST listener
+// (tests/browser/server.js, the second port) which serves client/ as plain static files - like
+// Vercel - with NO server-side pageGuard. Whatever protects a restricted page here is entirely
+// layout.js + GET /api/auth/page-access. The actual data stays protected regardless: every API
+// endpoint still checks login (401) and role (403) on its own, which this suite also checks.
+const log = [];
+const ok = (label, cond, detail) => log.push((cond ? "PASS " : "FAIL ") + label + (!cond && detail !== undefined ? "  -> " + JSON.stringify(detail) : ""));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("f");
+const PASSWORD = "Ui-test-pass-123";
+
+const doc = () => frame.contentDocument;
+const path = () => { try { return frame.contentWindow.location.pathname + frame.contentWindow.location.search; } catch { return ""; } };
+async function waitFor(check, timeout = 6000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { try { const v = check(); if (v) return v; } catch {} await sleep(50); }
+  return null;
+}
+// Navigate the frame and wait until the given path has loaded (redirects included)
+async function goto(url, expectPath) {
+  frame.src = url;
+  await sleep(100);
+  await waitFor(() => doc().readyState === "complete" && (!expectPath || path().startsWith(expectPath)));
+  await sleep(200); // let layout.js's /auth/me + /auth/page-access settle
+}
+const api = async (method, p, body) => {
+  const r = await fetch("/api" + p, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json().catch(() => null) };
+};
+const loginAs = (username, password = PASSWORD) => api("POST", "/auth/login", { username, password });
+const logoutApi = () => api("POST", "/auth/logout");
+const visible = (el) => el && !el.hidden && el.offsetParent !== null;
+const toastHas = (text) => [...doc().querySelectorAll(".toast-message")].some((t) => t.textContent.includes(text));
+const mainVisible = () => visible(doc().querySelector("main.page-content"));
+
+// Expected allowed/denied per PERMISSIONS table (server/config/permissions.js) - the SAME roles
+// and pages the server-side pageGuard already enforces when this app serves its own frontend.
+const RESTRICTED = { settings: "settings:manage", users: "users:manage", reports: "reports:view",
+  products: "cafe:view", categories: "cafe:view", players: "players:view" };
+const EXPECTED = {
+  admin:   { settings: true, users: true, reports: true, products: true, categories: true, players: true },
+  staff:   { settings: false, users: false, reports: true, products: true, categories: true, players: true },
+  cashier: { settings: false, users: false, reports: false, products: true, categories: true, players: true },
+};
+
+(async () => {
+  try {
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    await fetch("/_failaccess/off");
+    ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await api("GET", "/auth/me")).status === 401);
+
+    // ===== 1. This host has NO server-side pageGuard (unlike the normal app: Vercel can't run it) =====
+    const rawFetch = await fetch("/pages/users.html");
+    ok("static host: a restricted page's HTML is public (no pageGuard) - like Vercel", rawFetch.status === 200 && (await rawFetch.text()).includes("<title>Users"));
+
+    // ===== 2. Logged out: the client guard still sends you to the login page =====
+    await goto("/pages/reports.html", "/pages/login.html");
+    ok("logged out: client guard redirects to login with ?next= (same as pageGuard would)", path().startsWith("/pages/login.html?next=%2Fpages%2Freports.html"), path());
+    ok("logged out: the restricted page's content is never shown", !doc().body.innerHTML.includes("Revenue"));
+
+    // ===== 3. Every role x every restricted page: matches the server's own PAGE_PERMISSIONS =====
+    for (const [role, pages] of Object.entries(EXPECTED)) {
+      const login = await loginAs(`ui-${role}`);
+      ok(`${role}: logs in`, login.status === 200, login);
+
+      for (const [page, allowed] of Object.entries(pages)) {
+        await goto(`/pages/${page}.html`, allowed ? `/pages/${page}.html` : "/pages/dashboard.html");
+        if (allowed) {
+          ok(`${role}: allowed on ${page} - stays, content shown`, path().startsWith(`/pages/${page}.html`) && mainVisible(), path());
+        } else {
+          ok(`${role}: denied on ${page} - sent to dashboard, told why, URL cleaned`, path() === "/pages/dashboard.html" && toastHas("You don't have permission to open that page."), path());
+          ok(`${role}: denied on ${page} - dashboard's own content is shown (not stuck hidden)`, mainVisible());
+        }
+      }
+      await logoutApi();
+    }
+
+    // ===== 4. A page being reachable never bypasses the API's own role check =====
+    await loginAs("ui-cashier");
+    const cashierUsersApi = await api("GET", "/users");
+    ok("cashier: GET /api/users is still 403, even though the page file itself is public", cashierUsersApi.status === 403, cashierUsersApi);
+    const cashierSettingsApi = await api("PATCH", "/settings", { clubTimeZone: "Asia/Karachi" });
+    ok("cashier: changing settings via the API is still refused", cashierSettingsApi.status === 403, cashierSettingsApi);
+    await logoutApi();
+
+    // ===== 5. Fail-closed: the access check itself breaks -> hide, never show, never loop =====
+    await loginAs("ui-staff");
+    await fetch("/_failaccess/on");
+    await goto("/pages/dashboard.html");
+    ok("access check failing: content stays hidden (fail closed), not redirected anywhere", !mainVisible() && path() === "/pages/dashboard.html");
+    ok("access check failing: an explanation with a Reload button is shown", Boolean(doc().querySelector(".page-access-error")) && Boolean(doc().querySelector(".page-access-error button")));
+    await fetch("/_failaccess/off");
+    await goto("/pages/dashboard.html"); // reload: the check now succeeds
+    ok("access check recovered: content is shown again after a normal reload", mainVisible());
+    await logoutApi();
+
+    // ===== 6. Logout and an expired session both end at the login page, not a blank/stuck page =====
+    await loginAs("ui-admin");
+    await goto("/pages/players.html", "/pages/players.html");
+    ok("admin: on an allowed page before logging out", mainVisible());
+    await logoutApi();
+    await goto("/pages/players.html", "/pages/login.html");
+    ok("after logout: the same page now redirects to login, content not shown", path().startsWith("/pages/login.html") && !mainVisible());
+
+    await loginAs("ui-admin");
+    await goto("/pages/players.html", "/pages/players.html");
+    ok("admin: logged in again, page shown", mainVisible());
+    { const r = await fetch("/_reset"); if (!r.ok) throw new Error("reset failed: " + r.status); } // kills the login session server-side (expiry)
+    await goto("/pages/players.html", "/pages/login.html");
+    ok("expired session (deleted server-side): redirected to login, not a stuck/blank page", path().startsWith("/pages/login.html") && !mainVisible());
+
+    await sleep(200);
+  } catch (e) {
+    log.push("FAIL harness crashed: " + e.message + " " + e.stack);
+  }
+  const fails = log.filter((l) => l.startsWith("FAIL")).length;
+  document.getElementById("out").textContent = log.join("\n") + `\n\nTOTAL ${log.length - fails} passed, ${fails} failed`;
+})();
+</script>
+</body></html>

@@ -59,6 +59,51 @@ const currentUserReady = apiRequest("/auth/me")
 // Pages that show game modes can wait for it: gameModesReady.then(...). Never fails the page.
 const gameModesReady = currentUserReady.then((user) => (user ? loadGameModes().catch(() => null) : null));
 
+// ---------- Page-role guard (Step 1.5) ----------
+// UX / navigation convenience ONLY. The server's pageGuard (middleware/auth.js) already refuses a
+// restricted page before sending it when this app is served by Express - but a page hosted as a
+// plain static file (e.g. on Vercel) has no such guard, so anyone could open its HTML. This asks
+// the server "/api/auth/page-access" (the exact same PAGE_PERMISSIONS rule as pageGuard) and hides
+// the page's content (layout.css: body[data-access]) until the answer says "allowed". It can never
+// grant access to data: every API call still needs its own login (401) and permission (403) check.
+//
+// Resolves to true (show the page), "denied" (wrong role - already redirected to the dashboard),
+// or "error" (couldn't check - fail closed: keep hiding the content, let the person retry).
+const pageAccessReady = currentUserReady.then((user) => {
+    if (!user) return null; // not logged in: apiRequest already sent us to the login page
+    return apiRequest("/auth/page-access?page=" + encodeURIComponent(location.pathname), { redirectOn401: false })
+        .then(({ data }) => {
+            if (!data || typeof data.allowed !== "boolean") throw new Error("page-access: unexpected response");
+            if (data.allowed) {
+                document.body.setAttribute("data-access", "allowed");
+                return true;
+            }
+            location.replace("/pages/dashboard.html?denied=1");
+            return "denied";
+        })
+        .catch((error) => {
+            if (error instanceof ApiError && error.status === 401) {
+                goToLogin(); // the login expired between /auth/me and this request
+                return "denied";
+            }
+            showPageAccessError();
+            return "error";
+        });
+});
+
+// Fail-closed: the page's content (layout.css) stays hidden. No redirect - a server/network
+// problem here must never loop the person back to the login or dashboard page.
+function showPageAccessError() {
+    const main = document.querySelector("main.page-content");
+    if (!main) return;
+    const retryButton = buildElement("button", { className: "btn btn-secondary", attrs: { type: "button" } }, "Reload");
+    retryButton.addEventListener("click", () => location.reload());
+    main.insertAdjacentElement("beforebegin", buildElement("div", { className: "empty-state page-access-error" },
+        buildElement("p", { className: "empty-state-title", text: "Could not check your access to this page." }),
+        buildElement("p", { text: "Check your connection and try again." }),
+        retryButton));
+}
+
 // true if the logged-in user's role has this permission (for showing/hiding buttons only)
 function userCan(permission) {
     return Boolean(currentUser && currentUser.permissions.includes(permission));
@@ -233,7 +278,8 @@ function initLayout() {
         buildSidebarMenu(document.body.dataset.page);
         buildUserBox();
         applyPagePermissions();
-        // Sent here by the server because this role may not open the page it asked for
+        // Sent here by the server (pageGuard) or the client guard above because this role may
+        // not open the page it asked for
         if (new URLSearchParams(location.search).get("denied")) {
             showToast("You don't have permission to open that page.", "error", 6000);
             history.replaceState(null, "", location.pathname);

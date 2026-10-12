@@ -849,6 +849,19 @@ Ends the login in the database and clears the cookie. Always 200.
 - **200**: `{ id, name, username, role, active, permissions }` for the logged-in user. `passwordHash` is never returned by any endpoint.
 - **401** when logged out.
 
+### `GET /api/auth/page-access?page=<path>`
+Step 1.5 (deployment readiness): "may my role open this page?" - used by the browser to hide a
+restricted page's content on a static host (e.g. Vercel), where the server's own page guard never
+runs. **This is a convenience check only - it changes nothing and grants no access.** Every other
+endpoint still checks login and role on its own, exactly as if this endpoint didn't exist.
+- `page` (required): a page address like `/pages/users.html` (same rules as the server's own page
+  guard: URL-decoded, case-insensitive, `\` and extra slashes normalized).
+- **200**: `{ page, allowed }` - `page` is the normalized address, `allowed` is `true`/`false` for the
+  logged-in user's role. Always agrees with what actually happens when that page is requested from
+  this server (see `docs/POSTGRES_MIGRATION.md`, step 1.5).
+- **400** `"Invalid page address"` when `page` is missing or not a valid page address.
+- **401** when logged out.
+
 ---
 
 ## Users (admin only)

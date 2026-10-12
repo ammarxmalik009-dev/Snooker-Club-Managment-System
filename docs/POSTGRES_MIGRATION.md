@@ -54,7 +54,7 @@ so the origin check must accept an explicit allow-list (`ALLOWED_ORIGINS`) — n
 | 1.2 | `TRUST_PROXY` setting → `app.set("trust proxy", …)`, so `req.ip` (login throttle) is the real client IP behind Railway/Vercel | `server/config/env.js`, `server/app.js`, tests |
 | 1.3 | `ALLOWED_ORIGINS`: the origin check accepts the same host **or** an exact allow-listed origin; everything else stays 403 | `server/config/env.js`, `server/middleware/auth.js`, tests |
 | 1.4 | Vendored Chart.js: a committed copy in `client/vendor/`, so Vercel can serve it (no `node_modules` there) | `client/vendor/` (file, licenses, README), `server/app.js`, `.gitattributes`, tests |
-| 1.5 | Client-side page-role guard (user experience only — the API's `requirePermission` stays the real protection) | `client/js/core/layout.js`, tests |
+| 1.5 | Client-side page-role guard (user experience only — the API's `requirePermission` stays the real protection) | `server/{routes,controllers,validators}/auth.*`, `client/js/core/layout.js`, `client/css/layout.css`, `tests/browser/{server.js,run.js}`, tests |
 | 1.6 | `client/vercel.json` (API rewrite with a placeholder Railway URL, `/` → dashboard, security headers) + `client/404.html` | `client/vercel.json`, `client/404.html`, tests |
 | 1.7 | Docs + `.env.example`; full server + browser test runs | `README.md`, `docs/ARCHITECTURE.md`, `.env.example` |
 
@@ -175,6 +175,70 @@ unchanged. **Not verified on Vercel yet** (Phase 5): the path is only checked ag
 Test results after 1.4: `npm.cmd test` **287 passed, 0 failed** (283 + 4 new);
 `npm.cmd run test:browser` **741 passed, 0 failed** (14 suites).
 
+#### 1.5 Client-side page-role guard — done
+
+**Problem:** the server's `pageGuard` (`server/middleware/auth.js`) refuses a restricted page before
+sending it (login page if logged out; `/pages/dashboard.html?denied=1` if the role lacks the page's
+permission). On Vercel the pages are plain static files, so `pageGuard` never runs there - anyone
+could fetch a restricted page's HTML directly. **This step makes the browser do the same redirect,
+purely as a UX/navigation convenience.** The server stays the only real authority: every API
+endpoint still checks login (401) and role (403) on its own, exactly as before.
+
+**Design — the server stays the single source of truth:**
+- New read-only endpoint `GET /api/auth/page-access?page=<path>` (`server/routes/auth.routes.js`,
+  `server/validators/auth.validators.js`, `server/controllers/auth.controller.js`). It calls the
+  **exact same functions `pageGuard` uses** (`canonicalPagePath`, `PAGE_NAME`, `PAGE_PERMISSIONS`,
+  `roleHasPermission`), so `allowed` can never disagree with what `pageGuard` would actually do.
+  No new rule, no copy of the permission table anywhere else. 401 when logged out; 400
+  `"Invalid page address"` for a missing or malformed `page`; otherwise
+  `{ page: "<canonical>", allowed: true|false }`.
+- `client/js/core/layout.js`: on every page, in parallel with the existing `/auth/me` call, asks
+  `/auth/page-access?page=<location.pathname>`. `client/css/layout.css` hides `main.page-content`
+  by default (**fail-closed**: nothing is shown until the server says "allowed").
+  | Answer | Browser does |
+  |---|---|
+  | `allowed: true` | reveals the page (`body[data-access="allowed"]`) |
+  | `allowed: false` | `location.replace("/pages/dashboard.html?denied=1")` - same toast as the server's own redirect |
+  | 401 (login expired between `/me` and this call) | `goToLogin()` with `?next=`, same as everywhere else |
+  | network/server error, or an unexpected response | **stays hidden**, shows "Could not check your access to this page." + Reload - no redirect, so a transient problem can never create a redirect loop |
+- Nothing else changed: login, logout, cookies, roles, `pageGuard`, the origin check, MongoDB.
+  No other controller was touched - every API still enforces its own permission regardless of
+  what this endpoint answers (tested explicitly, see below).
+
+**Tests:**
+- `server/tests/pageAccess.test.js` (8 tests, own database `snooker_club_pro_test_pageaccess`):
+  401 when logged out / bad cookie / after logout; 400 for missing, duplicated or malformed `page`
+  (`../`, bad `%` escape, non-`/pages/x.html` shapes); different spellings (case, `%2E`, double
+  slash) agree with the canonical one; **every page × every role, compared against what `pageGuard`
+  itself actually does when the page is requested** (the source-of-truth check) and against
+  `PAGE_PERMISSIONS` directly; the login page is always allowed; a page being "allowed" never
+  bypasses a stricter API check (cashier can see the café products page but still gets 403
+  creating a product; staff can see Reports but a cashier's API call is still 403).
+- `tests/browser/server.js` / `run.js`: a **second listener** (`BROWSER_TEST_STATIC_PORT`, default
+  `PORT+1`) serves `client/` with `express.static` and **no `pageGuard`** - a faithful stand-in for
+  Vercel - while `/api/*` keeps the real backend (`requireAuth`, roles, everything). A suite named
+  `static-*` runs against this port instead of the normal one. A new `/_failaccess/on|off` switch
+  makes `/api/auth/page-access` return 503, to test the fail-closed path.
+- `tests/browser/suites/static-pageguard.html` (new suite, 39 checks): confirms the static host
+  truly has no `pageGuard` (a restricted page's HTML is served while logged out); logged-out
+  redirect to login; every role × every restricted page matches the `PERMISSIONS` table (admin: all
+  allowed; staff: not Settings/Users; cashier: also not Reports); an allowed page never weakens the
+  API's own check; the fail-closed error state and recovery; logout and a server-side-expired
+  session both end at the login page, never a blank or stuck one. The existing `auth` suite (the
+  real server-side `pageGuard` redirects) passes unchanged.
+
+**Security notes / limitations:**
+- The client guard can be bypassed (JavaScript disabled, DevTools) - by design, since it decides
+  nothing. Every `/api` request is checked by the server on its own regardless.
+- On a static host, a restricted page's HTML/CSS/JS is publicly readable (it holds no club data -
+  all real figures come from `/api` calls that are still protected).
+- One extra small request per page load (parallel with `/auth/me`, so no added round-trip).
+- Not yet verified on the live Vercel deployment (Phase 5) - only the static-host browser-test
+  listener stands in for it here.
+
+Test results after 1.5: `npm.cmd test` **294 passed, 0 failed** (287 + 7 new);
+`npm.cmd run test:browser` **780 passed, 0 failed** (15 suites, +1 new: `static-pageguard`).
+
 ### Phase 2 — PostgreSQL foundation (branch `postgres`)
 
 - `pg` pool from `DATABASE_URL`, query + transaction helpers, row mappers that keep today's JSON (UUIDs as strings).
@@ -237,7 +301,7 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] 1.2 `TRUST_PROXY` (272 server / 741 browser)
 - [x] 1.3 `ALLOWED_ORIGINS` origin check (283 server / 741 browser; live rewrite check pending Phase 5)
 - [x] 1.4 Vendored Chart.js 4.5.1 (287 server / 741 browser; Vercel load check pending Phase 5)
-- [ ] 1.5 Client-side page-role guard
+- [x] 1.5 Client-side page-role guard (294 server / 780 browser; live Vercel check pending Phase 5)
 - [ ] 1.6 `client/vercel.json` + `client/404.html`
 - [ ] 1.7 Docs + full test runs
 - [ ] Phase 2 — PostgreSQL foundation
