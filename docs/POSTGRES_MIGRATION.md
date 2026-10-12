@@ -1382,6 +1382,110 @@ deployed; no Railway environment was touched (none exists to touch).
   in tests, same as before this step. CafeOrder, StockMovement, Player and Counter remain completely
   untouched by Phase 2.
 
+#### Step 2.10 — Tables pilot: the one model every earlier pilot only ever fixtured — done
+
+**Scope chosen:** a standalone Tables repository, following the same `*.pg.service.js` pattern as
+every earlier pilot. Every prior pilot (Sessions fixture rows in step 2.5, Bookings in step 2.9,
+Bills/Payments) has inserted raw `app.tables` fixture rows directly, but no pilot had its own CRUD
+or business-rule service until now. Not wired into any route; does not call and is not called by
+`server/services/tables.service.js` (MongoDB), which stays the application's only active path.
+
+##### Tables (`server/services/tables.pg.service.js`)
+
+- **No actor columns at all** - `app.tables` (step 2.3's schema) never recorded who created or
+  changed a table, matching `models/Table.js` itself, which also never tracked this. Simpler than
+  Settings/Categories for that reason, not an oversight.
+- **Implemented**: create, get-by-id, get-by-number, list (status filter; name search,
+  case-insensitive; or exact table number when the search text is all digits - the same two
+  conditions `tables.service.js`'s own `listTables` checks), summary (counts grouped by status,
+  plus a total), update (name/rate/number/status), delete (with the same three safety checks
+  `tables.service.js` enforces).
+- **Status validation added explicitly, not left to the schema's CHECK constraint alone**: an
+  unrecognised status (e.g. `"closed"`) is refused with the same 400 message
+  `tables.service.js`'s own Mongoose enum validation gives, before any `INSERT`/`UPDATE` is even
+  attempted - matching the existing service's behaviour rather than letting a raw `23514` leak
+  through.
+- **"Occupied" still belongs to sessions**: while a session is open on a table
+  (`app.sessions.is_open`, the real `sessions_one_open_per_table` partial-unique index from step
+  2.3), the status can't be changed by hand - the same rule `tables.service.js`'s `updateTable`
+  enforces, checked here against a real `app.sessions` row instead of a Mongo count.
+- **Deletion restrictions preserved exactly**: occupied status, an open session, or an upcoming
+  (pending/confirmed, not yet ended) booking all refuse the delete with the same message shape as
+  `tables.service.js`'s own `deleteTable`. These application-level checks sit **on top of**, not
+  instead of, a real database guarantee: `app.sessions.table_id` and `app.bookings.table_id`
+  reference `app.tables(id)` with no `ON DELETE CASCADE` declared (step 2.3) - the default
+  `RESTRICT` - so even bypassing the application check entirely, the database itself refuses the
+  `DELETE` outright (`23503`, confirmed directly).
+
+##### What was verified - against the real local PostgreSQL
+
+1. **Create and retrieve**, by id and by table number.
+2. **Unique table numbers**: a duplicate is refused (409) and confirmed, by direct `COUNT(*)`,
+   that the original row is untouched and no second row was ever inserted.
+3. **Invalid table numbers (0, 1000) and rates (negative, above the maximum)** are refused by the
+   schema's own `CHECK` constraints.
+4. **Valid and invalid statuses**: `"reserved"` accepted; `"closed"` refused (400) *before* any
+   `INSERT` is attempted, confirmed with a `COUNT(*)` showing nothing was tried.
+5. **Updating**: name/rate change freely; renumbering into an already-taken number is refused
+   (409) with the original number confirmed unchanged; renumbering into a free number succeeds.
+6. **Status locked while a session is open**: changing status while `is_open` is refused (409,
+   "active session"); name/rate changes are still allowed during the same open session (only
+   status is blocked, matching the existing rule precisely).
+7. **Foreign-key compatibility**: a real `app.bookings` row referencing this table's id inserts
+   cleanly - the same relationship the Bookings pilot (step 2.9) already exercises, now proven
+   from the Tables side too.
+8. **Deletion restrictions**: occupied status (409 "currently occupied"); an upcoming booking
+   (409 "upcoming booking(s)"); and, bypassing the service layer entirely, a raw SQL `DELETE`
+   against a table with a dependent booking is refused by the database itself (`23503`) - the
+   real guarantee underneath the application-level message. A table with none of these is deleted
+   successfully and confirmed gone (404 on a subsequent lookup).
+9. **`listTables`**: status filter; number search; case-insensitive name search; default ordering
+   by table number ascending - all matching `tables.service.js`'s own behaviour.
+10. **`getTableSummary`**: grouped counts plus total, cross-checked against a direct `listTables()`
+    count per status.
+11. **Transaction rollback, the real guarantee**: inside one `withTransaction`, an `UPDATE` is
+    applied and then a second statement fails on a duplicate table number - the whole transaction
+    rolls back, and the row is confirmed completely unchanged afterward (the `UPDATE` never stuck,
+    even though it ran and succeeded before the later statement failed).
+- **Isolation**: confirmed (no `mongoose`/`server/models/` anywhere in the pilot's full require
+  tree, checked recursively).
+
+No schema change was needed or made - the committed step 2.3 schema (unique index on
+`table_number`, the two `CHECK` constraints, the default-`RESTRICT` foreign keys from
+`app.sessions`/`app.bookings`) was already adequate for every rule above.
+
+##### Regression checks
+
+| Command | With PostgreSQL configured (run 3x) | Without (the ordinary state) |
+|---|---|---|
+| `npm.cmd test` | **409 passed, 0 failed, 0 skipped** (2 of 3 runs); 1 run had a single, pre-existing, unrelated MongoDB test fail (`bookings.test.js`'s own concurrency test, nothing to do with this step - re-run in isolation 4x, passed 4/4; the full suite re-run immediately after also passed 409/409 clean) | 307 passed, 0 failed, **11 skipped** (cleanly) |
+| `npm.cmd run test:browser` | **780 passed, 0 failed** (15 suites) - identical to every prior baseline | unaffected either way |
+
+All ten `postgres*.test.js` files (now including this one) run together, **three times** - 109/109
+every time, no deadlocks or races (the step 2.5 advisory-lock fix holds with a tenth file). This
+file alone run **three times** in isolation too - the same 13/13 result every time. After every
+run, the test database (`snooker_club_pro_test`) was confirmed left clean - no `app` schema, no
+leftover tables.
+
+Confirmed: MongoDB remains the application's only active database; `tables.service.js`, its
+routes and controller are unchanged; no route or controller reads the new pilot; every MongoDB
+test still uses its own throw-away database, untouched; no production data was changed; nothing
+was deployed.
+
+##### Unverified behaviour and remaining risks
+
+- **The one flaky MongoDB test noted above** (`bookings.test.js`'s "10 people book the same slot"
+  concurrency test) is a pre-existing timing sensitivity in that test's own design (no database
+  transactions in MongoDB's booking path, by the same documented accepted gap step 2.9's own
+  comments describe) - it is unrelated to this step's Tables pilot and was not introduced by it,
+  but it has not been separately fixed or investigated further here (out of this step's scope).
+- **Customers and Sessions still have no PostgreSQL pilot of their own** - only fixture rows in
+  tests, same as before this step (explicitly out of scope per this step's safety rules).
+- **Login/cookie/middleware flow, and the tables routes/controller themselves, are untouched** -
+  this step proves the data-layer rules only; wiring Tables into the actual app is Phase 3 work.
+- **Players, CafeOrder, StockMovement, Matches and Counter still have no PostgreSQL pilot** -
+  completely untouched by Phase 2 so far.
+
 ### Phase 3 — Port services, one at a time (tests after each)
 
 Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
@@ -1449,7 +1553,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Phase 2, Step 2.7 — Payments pilot: SELECT...FOR UPDATE locking, overpayment prevention proven with 5 real concurrent requests, transaction rollback (371 server / 780 browser with PostgreSQL configured, 13 new tests, 0 skipped); found and fixed a real ordering bug in the first locking design
 - [x] Phase 2, Step 2.8 — Users + AuthSession pilot: real password-hash verification, last-admin transaction rollback, and the first real foreign keys to a real user row (closing step 2.7's gap) (384 server / 780 browser with PostgreSQL configured, 13 new tests, 0 skipped)
 - [x] Phase 2, Step 2.9 — Bookings pilot: the real EXCLUDE overlap guarantee against a real service, proven with 6 genuinely concurrent requests for the identical slot (396 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped); Railway's PostgreSQL version and `btree_gist` availability remain unconfirmed - no Railway project exists yet (manual steps recorded above)
-- [ ] Phase 2, Step 2.10 — Tables, Sessions or Customers pilot, per the Phase 3 order above (not started; awaiting approval)
+- [x] Phase 2, Step 2.10 — Tables pilot: CRUD, uniqueness, status/session/booking restrictions, real FK compatibility with bookings, transaction rollback (409 server / 780 browser with PostgreSQL configured, 13 new tests, 0 skipped)
+- [ ] Phase 2, Step 2.11 — Customers or Sessions pilot, per the Phase 3 order above (not started; awaiting approval)
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
