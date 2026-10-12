@@ -56,7 +56,7 @@ so the origin check must accept an explicit allow-list (`ALLOWED_ORIGINS`) — n
 | 1.4 | Vendored Chart.js: a committed copy in `client/vendor/`, so Vercel can serve it (no `node_modules` there) | `client/vendor/` (file, licenses, README), `server/app.js`, `.gitattributes`, tests |
 | 1.5 | Client-side page-role guard (user experience only — the API's `requirePermission` stays the real protection) | `server/{routes,controllers,validators}/auth.*`, `client/js/core/layout.js`, `client/css/layout.css`, `tests/browser/{server.js,run.js}`, tests |
 | 1.6 | `client/vercel.json` (API rewrite with a placeholder Railway URL, `/` → dashboard, security headers) + `client/404.html` | `client/vercel.json`, `client/404.html`, `server/tests/vercelConfig.test.js` |
-| 1.7 | Docs + `.env.example`; full server + browser test runs | `README.md`, `docs/ARCHITECTURE.md`, `.env.example` |
+| 1.7 | Docs + `.env.example`; full server + browser test runs | `README.md`, `.env.example`, `docs/POSTGRES_MIGRATION.md` |
 
 #### 1.2 `TRUST_PROXY` — done
 
@@ -302,6 +302,43 @@ unrelated failures in game-modes/stock tests from MongoDB load - re-running thos
 the full suite again both passed cleanly, confirming it was a transient flake, not caused by this
 step); `npm.cmd run test:browser` **780 passed, 0 failed** (15 suites, unchanged from step 1.5).
 
+#### 1.7 Final documentation, `.env.example` and Phase 1 verification — done
+
+- `.env.example`: added `TRUST_PROXY` and `ALLOWED_ORIGINS` (introduced in 1.2/1.3 but never added
+  here until now - a real gap this step closes), each marked optional with its default and a
+  one-line explanation; a short note at the top says every variable is optional except
+  `AUTH_SECRET`, which is required in production. `DATABASE_URL` is **not** added - Phase 2 hasn't
+  started, nothing in the code reads it yet, and `.env.example` should only list variables the app
+  actually uses today.
+- `README.md`: the Settings table gained `TRUST_PROXY` and `ALLOWED_ORIGINS` rows (same gap).
+- This section: the "Phase 1 status" summary and final checklist below.
+- `docs/API.md` and `docs/ARCHITECTURE.md`: already up to date from steps 1.4/1.5 (vendored
+  Chart.js, the static-hosting security row, the `page-access` endpoint) - nothing further needed.
+
+## Phase 1 status — code and documentation complete; live deployment not yet verified
+
+Every Phase 1 step (1.1–1.7) is implemented, tested locally and committed on `main`. **"Done" here
+means: the code exists, is tested against a local server (and, for 1.5/1.6, a browser-test listener
+built to behave like the real hosting target), and the documentation matches the code.** It does
+**not** mean the app has been deployed, or that Vercel/Railway have been shown to behave the way
+this documentation describes - only an actual deployment can show that (Phase 5).
+
+**What is genuinely still unverified, and can only be checked after deploying:**
+1. Vercel's actual rewrite/redirect/header behaviour for `client/vercel.json` (step 1.6).
+2. The real Railway backend URL - `client/vercel.json` still has the placeholder `<RAILWAY_BACKEND_URL>`.
+3. End-to-end login and API requests through the real Vercel → Railway path (steps 1.3, 1.5, 1.6 together).
+4. The correct `TRUST_PROXY` value for the real hosting setup (step 1.2 documents how to check it).
+5. That Vercel truly serves `client/404.html` automatically with a 404 status for an unknown address
+   (a documented Vercel convention, not something this repo's tests can exercise).
+
+**What you (the project owner) must still provide, not invented here:**
+- The real Railway backend URL, once that service exists.
+- `AUTH_SECRET`, `ALLOWED_ORIGINS` and `TRUST_PROXY` as Railway environment variables (never
+  committed) - see "Environment variables" below for what each should be set to.
+
+Test results after 1.7 (no code changed - documentation and `.env.example` only):
+`npm.cmd test` **300 passed, 0 failed**; `npm.cmd run test:browser` **780 passed, 0 failed** (15 suites).
+
 ### Phase 2 — PostgreSQL foundation (branch `postgres`)
 
 - `pg` pool from `DATABASE_URL`, query + transaction helpers, row mappers that keep today's JSON (UUIDs as strings).
@@ -366,7 +403,7 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] 1.4 Vendored Chart.js 4.5.1 (287 server / 741 browser; Vercel load check pending Phase 5)
 - [x] 1.5 Client-side page-role guard (294 server / 780 browser; live Vercel check pending Phase 5)
 - [x] 1.6 `client/vercel.json` + `client/404.html` (300 server / 780 browser; live Vercel check and real backend URL still pending Phase 5)
-- [ ] 1.7 Docs + full test runs
+- [x] 1.7 Docs + `.env.example` + full test runs (300 server / 780 browser) — **Phase 1 complete in code and docs; live deployment unverified (see "Phase 1 status" above)**
 - [ ] Phase 2 — PostgreSQL foundation
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
