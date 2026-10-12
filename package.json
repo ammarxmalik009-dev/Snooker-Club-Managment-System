@@ -13,7 +13,9 @@
     "start": "node server/server.js",
     "dev": "nodemon --watch server --ext js,json server/server.js",
     "test": "node --test \"server/tests/**/*.test.js\"",
-    "test:browser": "node tests/browser/run.js"
+    "test:browser": "node tests/browser/run.js",
+    "db:pg:migrate": "node server/db/migrate.js",
+    "db:pg:migrate:status": "node server/db/migrate.js status"
   },
   "engines": {
     "node": ">=20"
