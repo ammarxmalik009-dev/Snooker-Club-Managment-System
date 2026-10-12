@@ -2179,6 +2179,136 @@ touched; no production data was changed; nothing was deployed.
 - **Counter still has no PostgreSQL pilot** - the one remaining model completely untouched by
   Phase 2.
 
+#### Step 2.16 — Counters pilot: the shared, reusable atomic sequence — done
+
+**Scope chosen:** one small, standalone repository (`server/services/counters.pg.service.js`),
+the last model in this schema with no PostgreSQL pilot at all. Not wired into any route; does not
+call and is not called by `server/models/Counter.js` (MongoDB), which stays the application's
+only active path.
+
+##### Service responsibilities and atomic increment semantics
+
+A single reusable function, `nextSequence(name, client)`, reproducing `models/Counter.js`'s own
+`findOneAndUpdate({_id:name}, {$inc:{seq:1}}, {upsert:true})` exactly, against the real
+`app.counters` table (`id text PRIMARY KEY, seq bigint NOT NULL DEFAULT 0` - built for this in
+step 2.3; no schema change was needed or made):
+
+```sql
+INSERT INTO app.counters (id, seq) VALUES ($1, 1)
+ON CONFLICT (id) DO UPDATE SET seq = app.counters.seq + 1
+RETURNING seq
+```
+
+A brand-new name's first call returns `1`; every later call for the same name returns the next
+integer; two different names are completely independent rows - all three verified directly, not
+assumed. `seq` is a bigint column, which the `pg` driver always returns as a string (the same
+documented reason `rowMappers.js`'s own `toMoney` converts money columns back); `nextSequence`
+converts it with `Number(...)` and always returns a plain JS number - confirmed with
+`typeof result === "number"` in the tests, never a string or a `BigInt`. Counter names are
+validated (non-empty string, ≤200 characters - the schema's own `text` column has no length
+limit, so this pilot's own bound is enforced in code, the same pattern every earlier pilot uses
+for a rule the schema itself leaves unbounded) and refused with a clear `AppError`, not a raw SQL
+error.
+
+##### Transaction-scoped versus standalone behaviour - both of this codebase's real needs, by design
+
+This codebase's two real MongoDB callers of `nextSequence` actually want **different**
+guarantees, and both are preserved exactly:
+
+- `bills.service.js`'s own call has **no rollback**: if `Bill.create()` fails afterwards, the
+  sequence number is simply burned (a documented, accepted gap - bill numbers may have gaps,
+  never duplicates). `nextSequence(name)` with no second argument reproduces this: it runs
+  through the ordinary `query()` wrapper, commits immediately on its own, and is **not** undone
+  by a later, unrelated transaction's failure - verified directly (test 6).
+- `matches.pg.service.js`'s own inline counter SQL (step 2.14, **deliberately left unchanged by
+  this step** - see "the decision to leave Matches unchanged" below) already runs inside its
+  `startMatch` transaction, so a failure anywhere else in that same transaction rolls the
+  increment back too. `nextSequence(name, client)` with a transaction-scoped second argument
+  reproduces that same pattern for any future caller, without touching Matches' own
+  already-working, already-tested code - verified directly (test 5): a forced later-statement
+  failure in the same transaction rolls the counter's own row back to not existing at all.
+- A client argument that doesn't look like a real transaction-scoped client (no `.query()`
+  method) is rejected immediately with a `TypeError`, not silently treated as "no client" -
+  this is a caller-code contract, not user input, so it is a plain thrown error, not an
+  `AppError`.
+
+##### The decision to leave the existing Matches pilot unchanged
+
+`matches.pg.service.js`'s own `startMatch` already runs the identical
+`INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING seq` SQL inline, inside its own transaction,
+for match numbering - step 2.14's own, already-committed, already-tested code. This step
+explicitly did **not** refactor it to call the new shared service: doing so would touch an
+earlier, working, committed pilot for a pure consistency improvement with no behavioural change,
+which is a real (if small) regression risk for no functional gain. The new `counters.pg.service.js`
+is available for any **future** caller (a bills.pg.service.js bill-numbering integration, or a
+hypothetical next pilot) without that risk.
+
+##### What was verified - against the real local PostgreSQL
+
+1. A brand-new counter's first call returns `1`, as a plain JS number.
+2. Repeated calls for the same name return consecutive values with no gaps.
+3. Different counter names are completely independent of each other.
+4. **Real concurrency**: 20 genuinely simultaneous calls for the identical name
+   (`Promise.all`, no mocks) produce exactly the unique values `1` through `20` - confirmed with
+   a `Set` size check that no value was ever handed out twice.
+5. **Transaction-scoped rollback, the real guarantee**: inside one `withTransaction`, the
+   increment runs through the transaction's own client, then a later statement in the same
+   transaction fails (duplicate primary key) - the whole transaction rolls back, and the
+   counter's row is confirmed to not exist at all afterward, not merely unchanged.
+6. **Standalone commit survives an unrelated later failure**: a standalone increment commits
+   immediately; a completely separate, later transaction then fails for an unrelated reason - the
+   standalone increment is confirmed still committed, and the next call continues from where it
+   left off (not from `1` again).
+7. Invalid names (empty, whitespace-only, `null`, `undefined`, a number, over 200 characters) are
+   all refused with a 400 `AppError`, before any row is created.
+8. An invalid transaction-scoped client argument (missing `.query()`) is rejected immediately
+   with a `TypeError`.
+- **Isolation**: confirmed (no `mongoose`/`server/models/` anywhere in the pilot's full require
+  tree, checked recursively).
+
+No schema change was needed or made - the committed step 2.3 `app.counters` table was already
+exactly adequate for every rule above.
+
+##### Explicitly deferred - recorded, not invented
+
+**Bill-number integration** (wiring `nextSequence` into `bills.pg.service.js`/`bills.service.js`
+so a real bill number is generated automatically) remains deferred, exactly as step 2.6 itself
+already documented ("not ported; callers supply one"). That integration needs to run inside
+`bills.pg.service.js`'s own transaction (the same one that inserts the bill, its line items and
+players), so a failed bill save never leaves a burned-but-unused number look any different from
+today's accepted MongoDB gap - Phase 3 work, not a standalone Counters pilot's job. No production
+route, controller, or `bills.pg.service.js`/`bills.service.js` code was touched.
+
+##### Regression checks
+
+| Command | Result |
+|---|---|
+| `node --test server/tests/postgresCounters.test.js` (3 consecutive runs) | **10/10 every time** |
+| All sixteen `postgres*.test.js` files together (3 consecutive runs) | **201/201 every time** - no deadlocks or races (the step 2.5 advisory-lock fix holds with a sixteenth file) |
+| `npm.cmd test`, PostgreSQL configured (2 consecutive runs) | **501 passed, 0 failed, 0 skipped**, both times |
+| `npm.cmd test`, unconfigured (1 run) | 307 passed, 0 failed, **18 skipped** (cleanly) |
+| `npm.cmd run test:browser` | **780 passed, 0 failed** (15 suites) - identical to every prior baseline |
+
+After every run, the test database (`snooker_club_pro_test`) was confirmed left clean - no `app`
+schema, no leftover tables. No unrelated or intermittent failure was observed during this step's
+verification.
+
+Confirmed: MongoDB remains the application's only active database; `models/Counter.js`, its two
+real callers (`bills.service.js`, `matches.service.js`), and `matches.pg.service.js`'s own inline
+counter SQL are all unchanged; no production data was changed; nothing was deployed.
+
+##### Unverified behaviour and remaining risks
+
+- **Bill-number integration** was not built (explicitly deferred above) - a future Phase 3 step,
+  once `bills.pg.service.js` itself is ready to generate numbers inside its own save transaction.
+- **Login/cookie/middleware flow, and every route/controller, remain untouched** - this step
+  proves the data-layer primitive only.
+- With this step, **every MongoDB model now has at least a standalone PostgreSQL pilot** -
+  Phase 2's own stated goal. Whether to begin Phase 3 cutover planning next, or add further
+  cross-service integration pilots first (bill numbering, café bill integration from step 2.15,
+  player history from step 2.13, bill/match report joins from steps 2.12/2.14), is an open
+  decision for the next approval, not assumed here.
+
 ### Phase 3 — Port services, one at a time (tests after each)
 
 Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
@@ -2252,7 +2382,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Phase 2, Step 2.13 — Players pilot: duplicate-name rules (active vs inactive message), deactivate/reactivate, real concurrency proof, FK compatibility with match_players (445 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped); player history explicitly deferred (no Matches pilot yet)
 - [x] Phase 2, Step 2.14 — Matches pilot: the session-lock-before-create transaction, player/team rules, real concurrency proof (463 server / 780 browser with PostgreSQL configured, 18 new tests, 0 skipped); found (did not fix) a real Sessions-pilot timing bug; bill joins and changeResult explicitly deferred
 - [x] Phase 2, Step 2.15 — CafeOrders/StockMovements pilot: tab lifecycle with a real product-row-lock guarantee against overselling reserved stock, atomic stock increase/decrease proven with genuine concurrency, transaction-paired movement history (491 server / 780 browser with PostgreSQL configured, 26 new tests, 0 skipped); bill integration (takeForBill, claimForBill/releaseClaim, recordSale/restoreForCancelledBill) explicitly deferred with its transaction boundary documented
-- [ ] Phase 2, Step 2.16 — Counter pilot, or begin Phase 3 cutover planning, per the Phase 3 order above (not started; awaiting approval)
+- [x] Phase 2, Step 2.16 — Counters pilot: the shared atomic upsert-and-increment, both transaction-scoped and standalone modes proven with real concurrency and real rollback (501 server / 780 browser with PostgreSQL configured, 10 new tests, 0 skipped); bill-number integration explicitly deferred; matches.pg.service.js deliberately left unchanged. Every MongoDB model now has at least a standalone PostgreSQL pilot.
+- [ ] Phase 3 cutover planning, or further cross-service integration pilots (bill numbering, café/bill integration, player history, bill/match report joins), per the next approval (not started; awaiting approval)
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
