@@ -1791,6 +1791,148 @@ was deployed.
   fixture-only `match_players`/`match_teams` proof remains the only PostgreSQL contact point for
   Matches; Counter remains completely untouched by Phase 2 so far.
 
+#### Step 2.14 — Matches pilot: the session-lock guarantee, player/team rules — done
+
+**Scope chosen:** a standalone Matches repository, following the same `*.pg.service.js` pattern
+as every earlier pilot. Not wired into any route; does not call and is not called by
+`server/services/matches.service.js` (MongoDB), which stays the application's only active path.
+
+##### Matches (`server/services/matches.pg.service.js`)
+
+- **Reused, unmodified**: `server/config/gameModes.js` (pure config, no mongoose) - the exact same
+  player-limit/team/result-type rules `matches.service.js` itself reads from; and
+  `server/services/players.pg.service.js`'s own `nameKeyOf` (a PostgreSQL pilot file already, so
+  requiring it adds no mongoose to this file's require tree).
+- **Implemented**: start (player/team resolution + the atomic per-session match number, all in
+  one transaction), update (replace players/teams while `in_progress` only), complete (record a
+  winner/loser or a winning team, with every player's own result worked out), cancel, get-by-id,
+  list-for-session (players and teams loaded and attached, ordered by seat/number).
+- **The one genuinely different guarantee**: `matches.service.js` creates the match FIRST, then
+  re-checks whether the session is still open, and **deletes** the just-created match if it
+  closed in the meantime - a documented compensating step, because MongoDB gives it no way to
+  check-and-create atomically. Here, the session row is locked with `SELECT ... FOR UPDATE`
+  **before** anything is created, inside one transaction: a concurrent `endSession`
+  (`sessions.pg.service.js`'s own transaction) blocks on that same row until this transaction
+  commits or rolls back. There is no window where a match could ever be created on a session that
+  has just closed, and no compensating delete exists or is needed. **Proven with genuine
+  concurrency** (test 16 below), not just reasoned about.
+- **Player/team rules preserved exactly**: player-count limits from the registry; each registered
+  player only once and must be active; every name unique (registered or walk-in); team modes
+  require every player in exactly one team with exactly the right number of seats; a registered
+  player's **current** name is copied at match time, not whatever was typed.
+
+##### Explicitly out of scope - recorded, not invented
+
+- **`listMatchesForSession`'s / `matchSummaryForSessions`'s own bill joins** -
+  `matches.service.js` loads `bills.service.js` for this. Deferred the same way step 2.12's
+  Sessions pilot deferred its own bill/match joins - joining `bills.pg.service.js` (step 2.6) in
+  here would mean reimplementing `matches.service.js`'s billing-adjacent report logic as a side
+  effect of a Matches pilot, against this step's own instruction not to.
+- **`changeResult`** (changing a completed match's result later) - depends on **both** a Bill
+  lookup (`bills.pg.service.js`) **and** `server/config/permissions.js`'s `roleHasPermission` (an
+  authorization decision, not a repository concern). Neither dependency belongs inside a
+  standalone Matches repository; this operation was not built.
+
+##### A real, pre-existing bug found - not fixed here, reported instead
+
+Repeated test runs (required by this step) surfaced a genuine timing issue in
+`sessions.pg.service.js`'s `endSession` (step 2.12, already committed before this step):
+`ended_at` is computed with JS's own clock (`new Date()`), while `started_at` comes from
+PostgreSQL's `now()` at the session's `INSERT` (transaction-**start** time, not statement time,
+per PostgreSQL's own documented behaviour). Calling `startSession` then `endSession` back-to-back
+with almost no delay can occasionally make `ended_at` a few milliseconds earlier than
+`started_at`, violating the schema's own `sessions_check` CHECK constraint
+(`ended_at >= started_at`) - observed directly, not hypothesised: roughly 2 of 3 attempts failed
+this way when this step's own Matches test 3 originally chained `startSession`+`endSession` with
+no gap. **This is a Sessions pilot issue, not a Matches one, and out of this step's approved
+scope to fix** (the task's own strict boundaries: no unrelated refactoring). Test 3 was rewritten
+to build its "closed session" fixture directly with SQL instead of a real start-then-end round
+trip, sidestepping the issue rather than exercising it. Recorded below as a remaining risk for a
+future, dedicated fix (e.g. compute both timestamps from the same clock inside one transaction).
+
+##### What was verified - against the real local PostgreSQL
+
+1. **Start a match** (Century, two walk-ins) on an open session: correct match number (`#1`),
+   `in_progress` status, players seated in input order, re-read matches exactly.
+2. **A second match on the same session** gets the next number (`#2`) - the atomic per-session
+   counter (`app.counters`, the same pattern `models/Counter.js` uses) confirmed correct.
+3. **A non-existent session** gives 404; **a closed session** is refused (409, "has ended") and
+   confirmed, by `COUNT(*)`, to leave no match behind.
+4. **An unknown game mode** is refused (400).
+5. **Player-count rules from the registry** are enforced (Snooker Point: exactly 3 players).
+6. **Duplicate players refused**: the same registered player twice, or two walk-ins with the same
+   name (any capitalisation/spacing).
+7. **A registered player must exist and be active**: a non-existent id and a deactivated player
+   are both refused with the correct messages.
+8. **A registered player's current name is copied**, not a typed one.
+9. **Team mode (4 Players)**: exactly 2+2 seats enforced per team; assigning a team on a
+   non-team mode is refused with the specific message.
+10. **Update**: editing players while `in_progress` works (players replaced, teams recalculated);
+    refused once the match is completed.
+11. **Complete (player mode)**: the chosen seat's player is marked `winner`, every other player
+    `loser`; completing an already-completed match is refused.
+12. **Complete (team mode)**: the entire winning team is marked `winner`, the entire losing team
+    `loser`; choosing a `winnerSeat` for a team mode is refused with the specific message.
+13. **Cancel**: sets status/reason/`cancelledAt`; cannot be cancelled twice, and cannot be
+    cancelled once completed.
+14. **`listMatchesForSession`**: every match on a session, ordered by number; a non-existent
+    session gives 404.
+15. **Transaction rollback, the real guarantee**: inside one `withTransaction`, player rows are
+    deleted and re-inserted, then a later statement fails (a duplicate seat) - the whole
+    transaction rolls back, and the original players are confirmed completely unchanged
+    afterward.
+16. **Real concurrency, genuinely tested, not just reasoned about**: starting a match and ending
+    the same session at the same moment (`Promise.allSettled`, no mocks) - confirmed the outcome
+    is always consistent: either the match exists and is really there (`COUNT(*)` = 1), or
+    starting it was refused (409) and it left no row behind (`COUNT(*)` = 0); ending the session
+    itself always succeeds regardless of which way the race went.
+- **Isolation**: confirmed (no `mongoose`/`server/models/` anywhere in the pilot's full require
+  tree, checked recursively).
+
+No schema change was needed or made - the committed step 2.3 schema (`matches_session_number_key`
+unique index, `match_players`/`match_teams`'s own seat/number uniqueness, the `ON DELETE CASCADE`
+from `match_players`/`match_teams` to `matches`) was already adequate for every rule above.
+
+##### Regression checks
+
+| Command | With PostgreSQL configured (run twice) | Without (the ordinary state) |
+|---|---|---|
+| `npm.cmd test` | **463 passed, 0 failed, 0 skipped**, both times | 307 passed, 0 failed, **15 skipped** (cleanly) |
+| `npm.cmd run test:browser` | **780 passed, 0 failed** (15 suites) - identical to every prior baseline | unaffected either way |
+
+This file alone run **five times** in isolation - 18/18 every time (after the test-3 fixture fix
+above; before that fix, 2 of 3 runs failed on the Sessions-timing issue described above, not a
+Matches defect). All fourteen `postgres*.test.js` files run together, repeated **fourteen times**
+in total during this step's verification: **thirteen of fourteen runs were a clean 163/163**; one
+run showed 3 failures that did not reproduce in nine further attempts immediately after - reported
+honestly here as an observed, currently unreproduced flake rather than claimed as fully resolved.
+After every run, the test database (`snooker_club_pro_test`) was confirmed left clean - no `app`
+schema, no leftover tables.
+
+Confirmed: MongoDB remains the application's only active database; `matches.service.js`, its
+routes and controller are unchanged; no route or controller reads the new pilot; every MongoDB
+test still uses its own throw-away database, untouched; no production data was changed; nothing
+was deployed.
+
+##### Unverified behaviour and remaining risks
+
+- **The Sessions pilot's `endSession` timing issue** (described above) was found but not fixed -
+  a future, dedicated Sessions fix should compute `started_at`/`ended_at` from a single, consistent
+  clock inside one transaction rather than mixing PostgreSQL's `now()` and JS's `new Date()`.
+- **The one, unreproduced multi-file-run flake** (163 vs 160/3 failing, once in fourteen attempts)
+  was not root-caused - it did not recur despite focused retries, and no specific failing
+  assertion was captured before it stopped reproducing. Flagged for attention if it recurs.
+- **`listMatchesForSession`'s bill joins and `changeResult`** were not built (explicitly deferred
+  above) - blocked on Bills' billing-report logic and the permissions system respectively, neither
+  of which belongs inside a standalone Matches repository.
+- **Login/cookie/middleware flow, and the matches routes/controller themselves, are untouched** -
+  this step proves the data-layer rules only; wiring Matches into the actual app is Phase 3 work.
+- **Player history (`playerHistory.service.js`) remains deferred** (step 2.13's own note) -
+  this step's Matches pilot does not change that; a real Matches repository now exists, but the
+  join against Bills (also required) is still out of scope here.
+- **CafeOrder/StockMovement and Counter still have no PostgreSQL pilot** - completely untouched
+  by Phase 2 so far.
+
 ### Phase 3 — Port services, one at a time (tests after each)
 
 Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
@@ -1862,7 +2004,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Phase 2, Step 2.11 — Customers pilot: search/pagination with real booking stats, archive-not-delete, FK-backed deletion restriction (421 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped)
 - [x] Phase 2, Step 2.12 — Sessions pilot: real one-transaction start/end, the sessions_one_open_per_table guarantee proven with genuine concurrency, FK compatibility (433 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped)
 - [x] Phase 2, Step 2.13 — Players pilot: duplicate-name rules (active vs inactive message), deactivate/reactivate, real concurrency proof, FK compatibility with match_players (445 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped); player history explicitly deferred (no Matches pilot yet)
-- [ ] Phase 2, Step 2.14 — CafeOrder/StockMovement or Matches pilot, per the Phase 3 order above (not started; awaiting approval)
+- [x] Phase 2, Step 2.14 — Matches pilot: the session-lock-before-create transaction, player/team rules, real concurrency proof (463 server / 780 browser with PostgreSQL configured, 18 new tests, 0 skipped); found (did not fix) a real Sessions-pilot timing bug; bill joins and changeResult explicitly deferred
+- [ ] Phase 2, Step 2.15 — CafeOrder/StockMovement pilot, per the Phase 3 order above (not started; awaiting approval)
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
