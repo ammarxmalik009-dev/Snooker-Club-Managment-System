@@ -57,6 +57,27 @@ async function serverElapsed(tableNumber) {
 (async () => {
   try {
     { const r = await fetch("/_reset"); if (!r.ok) throw new Error("test server reset failed: " + r.status); }
+    // Anchor the server's "now" to the nearest club-local (Asia/Karachi) noon that is NOT before
+    // the real current moment, for the whole suite from here on: /_backdate (used below, twice)
+    // subtracts seconds from the CURRENT moment, and whenever that happens to run within about an
+    // hour of a real Asia/Karachi midnight, the result lands on the PREVIOUS club-local day, so a
+    // session that should show up under "today" (section F's filter test) doesn't. Noon is a
+    // 12-hour safety margin from either midnight. Setting this BEFORE any session in this suite
+    // is created (rather than partway through) avoids mixing a genuinely-real creation moment
+    // with a later, differently-anchored one for the same session - found to matter while
+    // verifying this fix: an earlier attempt that anchored mid-suite to a FIXED PAST date could
+    // make a session's own lifecycle look internally inconsistent. The server's own test clock
+    // still ticks normally from this anchor (see this file's own header comment), so every
+    // duration/timer assertion below is unaffected - only which calendar day things fall on is
+    // pinned down. Reset to real time after section F's day-sensitive checks (before section
+    // G/H, which don't need it).
+    {
+      const now = new Date();
+      const ymdInKarachi = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Karachi" }).format(now); // "YYYY-MM-DD", Asia/Karachi has no DST
+      let anchor = new Date(`${ymdInKarachi}T12:00:00+05:00`); // noon, club-local, today
+      if (anchor.getTime() < now.getTime()) anchor = new Date(anchor.getTime() + 24 * 60 * 60 * 1000); // already past noon -> noon tomorrow instead
+      await fetch(`/_clock/${anchor.toISOString()}`);
+    }
     ok("isolation: suite starts from a fresh server (logged out, old cookie dead)", (await fetch("/api/auth/me")).status === 401);
     { const r = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: "ui-admin", password: "Ui-test-pass-123" }) }); if (r.status !== 200) throw new Error("harness login failed: " + r.status); }
     for (const t of [{ tableNumber: 1, name: "VIP", hourlyRate: 80000 }, { tableNumber: 2, hourlyRate: 50000, status: "reserved" },
@@ -190,6 +211,8 @@ async function serverElapsed(tableNumber) {
     search.value = "4"; search.dispatchEvent(new Event("input", { bubbles: true }));
     await waitFor(() => rows().length === 1 && rows()[0].querySelector(".table-number").textContent === "4");
     ok("search '4' -> table 4", rows().length === 1 && rows()[0].querySelector(".table-number").textContent === "4");
+
+    await fetch("/_clock/real"); // back to real time for the rest (paging/responsive checks below don't need the anchor)
 
     // ===== G. Paging =====
     await fetch("/_seed/25");

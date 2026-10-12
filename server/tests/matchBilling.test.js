@@ -8,7 +8,7 @@ const mongoose = require("mongoose");
 const { dropTestDatabase } = require("./helpers/testDb"); // refuses any database without "test" in its name
 const { createApp } = require("../app");
 const { loginAs } = require("./helpers/auth");
-const { dateInTimeZone } = require("../utils/time");
+const { dateInTimeZone, startOfDayInTimeZone } = require("../utils/time");
 
 const TEST_DB_URI = process.env.MONGODB_MATCHBILLS_TEST_URI || "mongodb://127.0.0.1:27017/snooker_club_pro_test_matchbills";
 
@@ -446,7 +446,26 @@ test("an old bill stored before Phase 11.5 (no match field) is read and paid as 
 // One session, many bills: lists and reports
 // ---------------------------------------------------------------------------
 
-test("one session, many match bills: session history, dashboard and the tables report count every bill (time once)", async () => {
+test("one session, many match bills: session history, dashboard and the tables report count every bill (time once)", async (testContext) => {
+  // Anchored to the nearest club-local (Asia/Karachi) noon that is NOT before the real "now":
+  // endSession() below backdates the session by 50 minutes from "now", and whenever this test
+  // happens to run within 50 minutes of a real Asia/Karachi midnight, that lands the session on
+  // the PREVIOUS club-local day - so the "today" report queries further down correctly (but
+  // misleadingly, for this test's purpose) find nothing. Noon is a 12-hour safety margin from
+  // either midnight. The anchor is never set to a moment BEFORE the real "now": an earlier
+  // attempt that hardcoded a fixed past date made this test's own session look OLDER than
+  // sessions genuinely created a moment earlier (in real time) by the tests before it in this
+  // same file, pushing it out of the dashboard's "recent sessions" window - found and corrected
+  // while verifying this fix, not assumed safe. Only Date is mocked (node:test's own
+  // MockTimers, no new dependency), so every route handler in the same process sees this
+  // consistently; it is restored automatically when the test finishes (node:test's own
+  // documented behaviour - confirmed directly before relying on it).
+  const realNow = new Date();
+  let anchor = new Date(startOfDayInTimeZone(dateInTimeZone(realNow, "Asia/Karachi"), "Asia/Karachi").getTime() + 12 * 60 * 60 * 1000); // noon, club-local, today
+  if (anchor.getTime() < realNow.getTime()) anchor = new Date(anchor.getTime() + 24 * 60 * 60 * 1000); // already past noon -> noon tomorrow instead
+  testContext.mock.timers.enable({ apis: ["Date"] });
+  testContext.mock.timers.setTime(anchor.getTime());
+
   await db().collection("bills").deleteMany({});
   await db().collection("payments").deleteMany({});
   const session = await openSession();
