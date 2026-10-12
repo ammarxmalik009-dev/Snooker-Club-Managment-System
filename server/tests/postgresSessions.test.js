@@ -142,6 +142,45 @@ test("PostgreSQL Sessions pilot: the real transactional start/end, no-double-ope
     );
   });
 
+  await t.test("6a. rapid start/end sequences never violate the sessions_check CHECK constraint, even under a simulated clock skew", async () => {
+    // A real bug (found during step 2.14's own testing, fixed as a targeted follow-up): endSession
+    // used to compute ended_at with JS's live `new Date()` while started_at came from the
+    // started_at column's `now()` DEFAULT - PostgreSQL's now() is pinned to TRANSACTION START
+    // time, not statement-execution time (documented behaviour), so a system clock adjustment
+    // landing between the two could make the live JS reading look earlier than the frozen
+    // Postgres one. 50 genuinely rapid start-then-end sequences, back-to-back with no delay,
+    // against the FIXED code - none may fail.
+    for (let i = 0; i < 50; i++) {
+      const table = await getPool().query("INSERT INTO app.tables (table_number, hourly_rate) VALUES ($1, 60000) RETURNING id", [900 + i]);
+      const session = await sessionsPg.startSession({ tableId: table.rows[0].id });
+      const ended = await sessionsPg.endSession(session.id);
+      assert.equal(ended.isOpen, false);
+      assert.ok(typeof ended.durationSeconds === "number" && ended.durationSeconds >= 0, `iteration ${i}: duration must never be negative`);
+      assert.ok(new Date(ended.endedAt).getTime() >= new Date(ended.startedAt).getTime(), `iteration ${i}: endedAt must never be before startedAt`);
+    }
+  });
+
+  await t.test("6b. the exact failure condition, reproduced deterministically: a started_at set artificially into the 'future' can never violate the CHECK constraint when ended", async () => {
+    // Rather than hoping to get unlucky with a real clock adjustment (which is what originally
+    // surfaced this bug, and could not be reliably reproduced on demand - see
+    // docs/POSTGRES_MIGRATION.md), this builds the EXACT failure condition directly: a
+    // started_at a little ahead of the live clock, simulating what a frozen now()-at-BEGIN value
+    // would look like right after a backward clock correction. Before the fix, ending a session
+    // in this state raised a raw 23514 (sessions_check) - confirmed directly against the
+    // unfixed logic while diagnosing this bug, not assumed. After the fix, GREATEST(clock_
+    // timestamp(), started_at) guarantees this can never happen, for any gap, however large.
+    const table = await getPool().query("INSERT INTO app.tables (table_number, hourly_rate) VALUES (998, 60000) RETURNING id");
+    const future = await getPool().query(
+      `INSERT INTO app.sessions (table_id, table_number, hourly_rate_at_start, started_at)
+       VALUES ($1, 998, 60000, clock_timestamp() + interval '2 seconds') RETURNING id`,
+      [table.rows[0].id]
+    );
+    const ended = await sessionsPg.endSession(future.rows[0].id); // must not throw 23514
+    assert.equal(ended.isOpen, false);
+    assert.equal(ended.durationSeconds, 0, "clamped to the started_at moment itself - never negative");
+    assert.ok(new Date(ended.endedAt).getTime() >= new Date(ended.startedAt).getTime());
+  });
+
   await t.test("7. listActiveSessions / countActiveSessions / hasOpenSession reflect real, current state", async () => {
     const beforeCount = await sessionsPg.countActiveSessions();
     const freshId = await freshTable(605);
@@ -159,7 +198,7 @@ test("PostgreSQL Sessions pilot: the real transactional start/end, no-double-ope
   });
 
   await t.test("8. listSessions: status filter, table search, and pagination", async () => {
-    const byStatus = await sessionsPg.listSessions({ status: "completed" });
+    const byStatus = await sessionsPg.listSessions({ status: "completed", limit: 1000 }); // generous limit: tests 6a/6b create many other completed sessions, newer than sessionA
     assert.ok(byStatus.sessions.every((s) => s.status === "completed"));
     assert.ok(byStatus.sessions.some((s) => s.id === sessionA.id));
 

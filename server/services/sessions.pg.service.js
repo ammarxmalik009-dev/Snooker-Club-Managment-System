@@ -13,9 +13,25 @@
 // table's UPDATE is rolled back automatically along with it - no manual "release" step exists or
 // is needed, because there is no window where the table could be left claimed without a session.
 //
-// Reused, unmodified: server/utils/time.js's secondsBetween/startOfDayInTimeZone/
-// startOfNextDayInTimeZone (pure, no mongoose) - the exact same duration and club-local day
-// boundary rules sessions.service.js itself uses.
+// Reused, unmodified: server/utils/time.js's startOfDayInTimeZone/startOfNextDayInTimeZone
+// (pure, no mongoose) - the exact same club-local day boundary rules sessions.service.js itself
+// uses.
+//
+// Timestamp bug found and fixed after step 2.12 shipped (see docs/POSTGRES_MIGRATION.md's "Step
+// 2.12 timestamp fix" note): endSession originally computed ended_at with JS's own `new Date()`
+// while started_at came from the started_at column's `now()` DEFAULT - which in PostgreSQL is
+// pinned to TRANSACTION START time, not statement-execution time (documented PostgreSQL
+// behaviour). That is a frozen value from earlier, compared against a live JS clock reading
+// taken later - normally harmless, but a system clock adjustment (e.g. an NTP correction)
+// landing between the two could make the live JS reading appear EARLIER than the frozen
+// Postgres one, occasionally violating the sessions_check CHECK constraint
+// (ended_at >= started_at) on a fast start-then-end sequence. Fixed by using PostgreSQL's own
+// clock_timestamp() (the LIVE current time, re-evaluated on every call, unlike now()) for
+// ended_at, with a GREATEST(..., started_at) clamp so the stored ended_at can never be earlier
+// than started_at regardless of any clock behaviour - the CHECK constraint itself was never
+// weakened; this guarantees it is now provably impossible to violate from this code path.
+// duration_seconds is computed from that same, already-clamped value in the same SQL statement,
+// so the two numbers can never disagree.
 //
 // Explicitly out of scope (recorded, not invented): listSessions's own bill/match joins
 // (sessions.service.js loads server/services/bills.service.js and matches.service.js for this -
@@ -26,7 +42,7 @@ const { query, withTransaction } = require("../config/db.pg");
 const { toId, toMoney, actorFromRow, actorFrom, actorUserIdOrNull } = require("../db/rowMappers");
 const env = require("../config/env");
 const AppError = require("../utils/AppError");
-const { startOfDayInTimeZone, startOfNextDayInTimeZone, secondsBetween } = require("../utils/time");
+const { startOfDayInTimeZone, startOfNextDayInTimeZone } = require("../utils/time");
 
 const SESSION_STATUSES = ["active", "completed"];
 
@@ -103,9 +119,10 @@ async function startSession({ tableId }, actorUser = null) {
 }
 
 // End a session: only matches while still open (can't be ended twice), computes the real
-// duration with the server's own clock, and frees the table back to "available" - all inside
-// one transaction, so a session is never left "ended" with the table still stuck "occupied", or
-// vice versa.
+// duration from PostgreSQL's own LIVE clock (clock_timestamp(), not now() - see this file's own
+// header comment for why that distinction is exactly what fixed a real, found bug), and frees
+// the table back to "available" - all inside one transaction, so a session is never left "ended"
+// with the table still stuck "occupied", or vice versa.
 async function endSession(sessionId, actorUser = null) {
   const actor = actorFrom(actorUser);
   const userId = actor ? actorUserIdOrNull(String(actor.user)) : null;
@@ -117,16 +134,18 @@ async function endSession(sessionId, actorUser = null) {
       throw new AppError(`This session on Table ${current.rows[0].table_number} has already ended`, 409);
     }
 
-    const endedAt = new Date();
-    const durationSeconds = secondsBetween(current.rows[0].started_at, endedAt);
-
+    // GREATEST(clock_timestamp(), started_at) guarantees ended_at can never be earlier than
+    // started_at, however the system clock behaves - the sessions_check CHECK constraint is
+    // provably impossible to violate from this statement, not merely unlikely to be.
     const result = await client.query(
       `UPDATE app.sessions
-       SET is_open = false, status = 'completed', ended_at = $1, duration_seconds = $2,
-           ended_by_user_id = $3, ended_by_name = $4, ended_by_username = $5, updated_at = now()
-       WHERE id = $6 AND is_open = true
+       SET is_open = false, status = 'completed',
+           ended_at = GREATEST(clock_timestamp(), started_at),
+           duration_seconds = EXTRACT(EPOCH FROM (GREATEST(clock_timestamp(), started_at) - started_at))::int,
+           ended_by_user_id = $1, ended_by_name = $2, ended_by_username = $3, updated_at = now()
+       WHERE id = $4 AND is_open = true
        RETURNING *`,
-      [endedAt, durationSeconds, userId, actor ? actor.name : null, actor ? actor.username : null, sessionId]
+      [userId, actor ? actor.name : null, actor ? actor.username : null, sessionId]
     );
     if (result.rows.length === 0) {
       throw new AppError(`This session on Table ${current.rows[0].table_number} has already ended`, 409);

@@ -1916,9 +1916,8 @@ was deployed.
 
 ##### Unverified behaviour and remaining risks
 
-- **The Sessions pilot's `endSession` timing issue** (described above) was found but not fixed -
-  a future, dedicated Sessions fix should compute `started_at`/`ended_at` from a single, consistent
-  clock inside one transaction rather than mixing PostgreSQL's `now()` and JS's `new Date()`.
+- **The Sessions pilot's `endSession` timing issue** (described above) - **fixed as a targeted
+  follow-up immediately after this step; see "Step 2.12 timestamp fix" below.**
 - **The one, unreproduced multi-file-run flake** (163 vs 160/3 failing, once in fourteen attempts)
   was not root-caused - it did not recur despite focused retries, and no specific failing
   assertion was captured before it stopped reproducing. Flagged for attention if it recurs.
@@ -1932,6 +1931,117 @@ was deployed.
   join against Bills (also required) is still out of scope here.
 - **CafeOrder/StockMovement and Counter still have no PostgreSQL pilot** - completely untouched
   by Phase 2 so far.
+
+#### Step 2.12 timestamp fix — targeted follow-up: `endSession`'s real, found bug — done
+
+**Scope:** a targeted bug fix only, inside the already-committed Sessions pilot
+(`server/services/sessions.pg.service.js`, step 2.12). Not Café Orders, not Phase 3, not a new
+pilot. No production route, controller or MongoDB code touched; no schema change.
+
+##### Root cause - with evidence
+
+`endSession` computed `ended_at` with JS's own `new Date()`, while `started_at` came from the
+`started_at` column's `now()` DEFAULT (set at `startSession`'s `INSERT`). PostgreSQL's `now()`
+(and `CURRENT_TIMESTAMP`) is **pinned to transaction-start time**, not statement-execution time -
+documented PostgreSQL behaviour, confirmed directly here with
+`SELECT clock_timestamp(), now()` run repeatedly inside a transaction (the two values diverge as
+soon as any time passes after `BEGIN`). A direct comparison of the Node process clock against
+PostgreSQL's own `clock_timestamp()`, run ten times back-to-back, showed negligible skew (0-1ms)
+in steady state - ruling out ordinary cross-process clock drift as the cause. The actual trigger
+is a **frozen vs. live** mismatch: `started_at` is a value captured once, at transaction start,
+and never re-evaluated; `ended_at` was a live JS clock reading taken afterward. Whenever the
+system clock is adjusted (an NTP correction, a VM time-sync event) in the gap between the two, the
+live reading can end up appearing *earlier* than the frozen one, even though real elapsed time
+never went backward. **Reproduced deterministically**, not just inferred: inserting a session with
+`started_at` set to `clock_timestamp() + interval '50ms'` (simulating exactly what a frozen value
+looks like right after a small backward adjustment), then updating it with a plain live timestamp
+for `ended_at`, raised the exact `23514` (`sessions_check`) violation this bug produces. A tight
+100-iteration back-to-back start/end loop (no artificial clock manipulation) did **not** reproduce
+it - consistent with the root cause being a rare, real clock-adjustment event, not routine
+execution speed, matching step 2.14's own observation that this could not be reliably reproduced
+on demand.
+
+##### The fix
+
+`endSession`'s `UPDATE` now sets `ended_at = GREATEST(clock_timestamp(), started_at)` and computes
+`duration_seconds` from that same, already-clamped value in the same statement -
+`EXTRACT(EPOCH FROM (GREATEST(clock_timestamp(), started_at) - started_at))::int`. `clock_timestamp()`
+is PostgreSQL's **live** current time, re-evaluated on every call (unlike `now()`); the `GREATEST`
+clamp guarantees `ended_at` can never be stored earlier than `started_at`, **for any gap, however
+large** - not merely "unlikely to happen again." The `sessions_check` CHECK constraint itself was
+**not weakened or removed**; the fix makes it provably impossible to violate from this code path
+instead. `duration_seconds` is `0` (never negative) in the clamped case, matching the schema's own
+`duration_seconds >= 0` CHECK. The now-unused JS-side `secondsBetween` import was removed from this
+file; it is not used anywhere else in it.
+
+Deliberately **not** changed: `startSession`'s own `started_at` (still the column's `now()`
+default) - the fix only needed to make `ended_at` safe relative to whatever `started_at` holds,
+which the `GREATEST` clamp does unconditionally; changing `startSession` too was unnecessary and
+would have been a larger, less targeted change than the bug required.
+
+##### Tests
+
+Two new focused tests added to `server/tests/postgresSessions.test.js`:
+
+- **"6a"**: 50 genuinely rapid, back-to-back start-then-end sequences (no delay) against the
+  fixed code - every one confirms `durationSeconds >= 0` and `endedAt >= startedAt`.
+- **"6b"**: the exact failure condition, built deterministically (not hoping for a rare clock
+  event) - a session with `started_at` set 2 seconds into the "future" via raw SQL, then ended
+  through the real `endSession` function. Before the fix this raised `23514` directly (confirmed
+  while diagnosing the bug, outside the test file); after the fix it succeeds, with
+  `durationSeconds` correctly clamped to `0`.
+
+One existing test (`postgresSessions.test.js`'s own "8. listSessions...") needed a larger
+`limit` - it was asserting that a session from early in the test run still appeared on page 1 of
+a default-paginated list, which test 6a's own 50 new sessions (newer, so sorted first) pushed off
+that page. This is a test-ordering side effect of adding new fixtures in the same file, not a
+behaviour change in `listSessions` itself, and was not a hidden workaround for the actual bug.
+
+##### Results
+
+| Command | Result |
+|---|---|
+| `postgresSessions.test.js` alone, **5 times** | **14/14 every time** (was 12/14 passing with 2 failures before the pagination-limit fix above, unrelated to the timestamp bug itself) |
+| `postgresMatches.test.js` alone, **3 times** (uses Sessions internally) | **18/18 every time** - no regression |
+| All fifteen `postgres*.test.js` files together, **8 times** | **165/165 every time** - no deadlocks, no recurrence of step 2.14's own one-off multi-file-run flake |
+| `npm.cmd test`, PostgreSQL configured | **465 tests, 1 unrelated pre-existing failure** (see below) - not 0, and not claimed as such |
+| `npm.cmd test`, unconfigured | 306 passed, 0 failed, 15 skipped, **1 unrelated pre-existing failure** (see below) |
+| `npm.cmd run test:browser` | 779 passed, **1 unrelated pre-existing failure** (see below) |
+
+##### Two unrelated, pre-existing failures found during this step's own full-regression run -
+##### reported honestly, not fixed (out of this task's explicit scope)
+
+Both `npm.cmd test` runs (configured and unconfigured) and the browser suite showed exactly one
+failure each, **neither caused by this fix**:
+
+- `matchBilling.test.js`: *"one session, many match bills: ... (time once)"* - fails
+  consistently (confirmed 4/4 in isolation, with **and** without PostgreSQL configured). This
+  file has zero code dependency on `sessions.pg.service.js` or any PostgreSQL file (checked by
+  grep). Pure MongoDB test.
+- Browser suite, `sessions`: *"'Today' filter keeps both"* - fails consistently (3/3 retries).
+
+**Root cause identified precisely for `matchBilling.test.js`, not merely suspected**: its own
+`endSession(session, seconds)` test helper backdates the session's `startedAt` directly
+(`new Date(Date.now() - seconds * 1000)`, here 50 minutes) to simulate "50 billed minutes
+elapsed." The actual system clock when this run executed was `2026-10-12T19:1x:xxZ` UTC - already
+`2026-10-13, 00:1x` in `Asia/Karachi` (`CLUB_TIMEZONE`, UTC+5). Subtracting 50 minutes from that
+moment lands `startedAt` at roughly `2026-10-12, 23:2x` **club-local time - the previous calendar
+day**. The test's own `today = dateInTimeZone(new Date(), "Asia/Karachi")` then queries
+`/reports/tables?from=${today}&to=${today}` for *only* the 13th, which correctly finds nothing for
+a session whose club-local start time was genuinely the 12th - hence the all-zero result. This is
+a test-environment-timing coincidence (the test was written assuming it would never run within 50
+minutes of a club-local midnight), with **zero connection to PostgreSQL, Sessions, or this fix** -
+it would fail identically on the unmodified `347fbef` commit at this exact real-world moment. The
+browser suite's `sessions` "'Today' filter keeps both" failure, observed at the same real-world
+moment, is consistent with the same class of day-boundary issue, though its exact mechanism was
+not traced statement-by-statement the way `matchBilling.test.js`'s was. **Neither was fixed**, per
+this task's explicit boundary against unrelated changes; both are expected to pass again once
+re-run safely clear of a club-local midnight boundary.
+
+Confirmed: MongoDB remains the application's only active database; no production route,
+controller or MongoDB service was touched; no production data was changed; nothing was deployed;
+`startSession`'s table-claiming transaction, rollback guarantees, and table-release behaviour are
+all unchanged and still pass every existing test.
 
 ### Phase 3 — Port services, one at a time (tests after each)
 
