@@ -1178,6 +1178,100 @@ data was changed; nothing was deployed.
   Bookings pilot will need its own concurrency-safety design (the `EXCLUDE` constraint, not this
   pattern), not an assumption that this same fix applies there unchanged.
 
+#### Step 2.8 — Users + AuthSession pilot: the first real foreign keys to real users — done
+
+**Scope chosen:** Users (per the Phase 3 order's own position - second, right after Settings) plus
+a small, independent AuthSession create/read/revoke pilot, since it is what finally lets every
+earlier pilot's `*_user_id` column point at something real (the step 2.7 "remaining risks" gap).
+Neither is wired into any route. Login, logout, cookies and `auth.service.js`/the auth middleware
+are **completely untouched** - nothing in this step changes how anyone actually logs in today.
+
+##### Users (`server/services/users.pg.service.js`)
+
+- **Reused, not re-implemented**: `server/utils/password.js`'s real `hashPassword`/`verifyPassword`/
+  `passwordProblem` (Node's built-in scrypt) - the exact same algorithm the live app uses, not a
+  new one. `normalizeUsername` and the username format rule are small local copies of `models/User.js`'s
+  own (not an import of that file, which requires `"mongoose"` - the same isolation reason every
+  earlier pilot's `nameKeyOf`/`actorFrom` copies exist for).
+- **Implemented**: create, get-by-id, get-by-username, update (name/role/active) with the exact
+  same last-admin and self-protection rules as `users.service.js` - but using a **real PostgreSQL
+  transaction** instead of Mongo's "save, check, revert-and-resave": if demoting/deactivating a
+  user would leave zero active admins, the *whole* transaction rolls back (nothing is ever
+  half-applied, let alone written and then undone).
+- **Explicitly out of scope** (recorded, not silently dropped): `setPassword`, `createFirstAdmin`,
+  `resetAdminPassword` - admin-password-reset-specific flows, not needed for this pilot's narrow
+  goal of "establish real user records and the relationships other pilots need."
+
+##### AuthSession (`server/services/authSessions.pg.service.js`)
+
+Deliberately minimal, exactly as the task allowed: **create / read-by-token-hash / revoke only**.
+No TTL cleanup job (still an open item, unchanged from step 2.3's own note - MongoDB's TTL index
+has no PostgreSQL equivalent). `app.auth_sessions.user_id` is the **one** `*_user_id` column in
+the whole schema that is `NOT NULL` - every other one is a nullable "who did it" copy - so this
+pilot is what actually proves that constraint for the first time.
+
+##### What was verified - against the real local PostgreSQL
+
+1. **Create and retrieve**, by id and by (normalized) username - `"  ADMIN.ONE  "` finds the same
+   row `"admin.one"` was stored as.
+2. **Password hash security**: the raw column (read directly, bypassing the service entirely) is
+   in the exact `scrypt$16384$8$1$...` format `server/utils/password.js` writes - confirmed
+   verifiable with the real, unmodified `verifyPassword()` (accepts the real password, rejects a
+   wrong one) - and confirmed **never** present on anything the service itself returns, because
+   `getUserById`'s own `SELECT` doesn't name that column at all, not merely filtered out after.
+3. **Unique username**, case/space-insensitive: a duplicate is refused (409) and the original row
+   is confirmed unchanged - exactly one row with that username, never two.
+4. **Invalid ids, missing users, invalid role, weak password**: all refused cleanly (404/400),
+   never a raw SQL or crash.
+5. **A real foreign key, for the first time**: admin1 creates admin2 - `created_by_user_id`
+   genuinely resolves to admin1's row, confirmed with an actual SQL `JOIN`, not just "not null."
+6. **Updating** permitted fields works normally with two active admins.
+7. **Self-protection**: can't deactivate your own account; can't remove your own admin role.
+8. **Transaction rollback, the real guarantee**: with admin2 demoted to staff, admin1 is the
+   *only* active admin - a different actor (admin2) trying to demote admin1 is refused
+   (*"last active admin"*), and admin1's role **and** `updatedBy` are both confirmed completely
+   unchanged afterward (the attempt never touched the row at all).
+9-10. **AuthSession**: create → read-by-token-hash → revoke (gone afterward); the `NOT NULL`
+   foreign key correctly refuses a non-existent and a `null` user id.
+11. **Closes step 2.7's own documented gap**: a bill is created (minimal fixture, as every earlier
+    Bills/Payments test), and a payment is recorded with admin1 - a **real** user - as the actor.
+    `payment.receivedBy.user` is now admin1's real id (never `null`, for the first time across
+    every pilot), confirmed again with a `JOIN`. A non-existent user id is still correctly refused
+    by the same foreign key, unchanged from step 2.7 - **no code in `payments.pg.service.js` or
+    `bills.pg.service.js` was changed** to make this work; it already supported a real id
+    correctly, there simply was no real user to try it with until now.
+- **Isolation**: confirmed for both new services (no `mongoose`/`server/models/` in their full require trees).
+
+##### Regression checks
+
+| Command | With PostgreSQL configured (run twice) | Without (the ordinary state) |
+|---|---|---|
+| `npm.cmd test` | **384 passed, 0 failed, 0 skipped**, both times | 307 passed, 0 failed, **9 skipped** (cleanly) |
+| `npm.cmd run test:browser` | **780 passed, 0 failed** (15 suites) - identical to every prior baseline | unaffected either way |
+
+All eight `postgres*.test.js` files (now including this one) run together, **three times** - no
+deadlocks or races (the step 2.5 advisory-lock fix holds with an eighth file). This file alone
+run **three times** in isolation too - the same 13/13 result every time.
+
+Confirmed: MongoDB remains the application's only active database; login, logout and the auth
+middleware are unchanged; no route or controller reads either new pilot; every MongoDB test still
+uses its own throw-away database, untouched; no production data was changed; nothing was deployed.
+
+##### Unverified behaviour and remaining risks
+
+- **`setPassword`/admin-password-reset flows** were not built (explicitly out of scope above) -
+  a future step if Users is ever fully cut over in Phase 3.
+- **AuthSession TTL cleanup** - still not built, still open since step 2.3.
+- **Login itself has not moved** - this step proves the *data layer* (real users, real sessions,
+  real password hashes) works; the actual login/cookie/middleware flow is Phase 3 work, untouched here.
+- **A real Sessions/Bookings service still does not exist** - Bookings' `btree_gist` constraint
+  remains verified only against raw SQL (step 2.3), not a real service. Railway's `btree_gist`
+  availability is still unconfirmed.
+- **Only Settings, Categories/Products, Bills, Payments and now Users/AuthSession have ANY
+  PostgreSQL pilot** - Tables, Sessions, Matches and Customers have only ever been touched by
+  bare SQL fixture rows in tests (no repository of their own); Player, CafeOrder, StockMovement
+  and Counter have **never** been touched by anything in Phase 2 at all.
+
 ### Phase 3 — Port services, one at a time (tests after each)
 
 Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
@@ -1243,7 +1337,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Phase 2, Step 2.5 — Categories/Products (real FK + unique constraints) + match_players/match_teams fixture-only ordered-row proof (348 server / 780 browser with PostgreSQL configured, 19 new tests, 0 skipped); found and fixed a genuine test-concurrency bug (shared schema raced across parallel test files - advisory lock with a dedicated client)
 - [x] Phase 2, Step 2.6 — Bills repository pilot: ordered line items/players, all three partial-unique rules, FK, rollback, real calculateBill() numbers (358 server / 780 browser with PostgreSQL configured, 10 new tests, 0 skipped); confirmed the step 2.5 lock fix holds with a sixth test file
 - [x] Phase 2, Step 2.7 — Payments pilot: SELECT...FOR UPDATE locking, overpayment prevention proven with 5 real concurrent requests, transaction rollback (371 server / 780 browser with PostgreSQL configured, 13 new tests, 0 skipped); found and fixed a real ordering bug in the first locking design
-- [ ] Phase 2, Step 2.8 — Bookings (the btree_gist EXCLUDE constraint against a real service) or Users, per the Phase 3 order above
+- [x] Phase 2, Step 2.8 — Users + AuthSession pilot: real password-hash verification, last-admin transaction rollback, and the first real foreign keys to a real user row (closing step 2.7's gap) (384 server / 780 browser with PostgreSQL configured, 13 new tests, 0 skipped)
+- [ ] Phase 2, Step 2.9 — Bookings (the btree_gist EXCLUDE constraint against a real service, and confirming Railway's extension availability) or Tables/Sessions/Customers, per the Phase 3 order above
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
