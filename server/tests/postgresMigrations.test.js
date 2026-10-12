@@ -16,7 +16,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
-const { getPgTestDatabaseUrl } = require("./helpers/testDb.pg");
+const { getPgTestDatabaseUrl, lockAppSchema, unlockAppSchema } = require("./helpers/testDb.pg");
 
 const TEST_URL = getPgTestDatabaseUrl(); // null = not configured; never falls back to DATABASE_URL
 if (TEST_URL) process.env.DATABASE_URL = TEST_URL; // read by server/config/env.js when required below
@@ -38,9 +38,16 @@ test("PostgreSQL migrations: connect, apply, track, re-run safely, status, const
   const { getPool, closePool } = require("../config/db.pg");
   const migrate = require("../db/migrate");
 
+  // Several server/tests/postgres*.test.js files manage this SAME "app" schema, and node's test
+  // runner runs test files in parallel by default (step 2.5 found this the hard way: without
+  // this lock, two such files racing produce real deadlocks and "relation does not exist"
+  // errors). This blocks until any other such file's own run has fully finished.
+  const lockClient = await lockAppSchema(getPool());
+
   t.after(async () => {
     // Clean up ONLY this schema, inside the configured test database - never the whole database.
     await getPool().query("DROP SCHEMA IF EXISTS app CASCADE");
+    await unlockAppSchema(lockClient);
     await closePool();
   });
 

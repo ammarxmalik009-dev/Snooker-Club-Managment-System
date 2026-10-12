@@ -10,8 +10,8 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { toMoney, snakeToCamel, toId, actorFromRow } = require("../db/rowMappers");
-const { getPgTestDatabaseUrl } = require("./helpers/testDb.pg");
+const { toMoney, snakeToCamel, toId, actorFromRow, actorFrom } = require("../db/rowMappers");
+const { getPgTestDatabaseUrl, lockAppSchema, unlockAppSchema } = require("./helpers/testDb.pg");
 
 // ---------- Row-mapper unit tests (no database, no PostgreSQL needed) ----------
 
@@ -51,6 +51,12 @@ test("actorFromRow: flattened <prefix>_user_id/_name/_username columns -> { user
   );
 });
 
+test("actorFrom: a logged-in user -> { user, name, username }; no user -> null", () => {
+  assert.deepEqual(actorFrom({ _id: "652f1c2e8a1b2c3d4e5f6071", name: "Admin Owner", username: "owner" }),
+    { user: "652f1c2e8a1b2c3d4e5f6071", name: "Admin Owner", username: "owner" });
+  assert.equal(actorFrom(null), null);
+});
+
 // ---------- Settings service pilot (needs the real local PostgreSQL) ----------
 
 const TEST_URL = getPgTestDatabaseUrl(); // null = not configured; never falls back to DATABASE_URL
@@ -71,8 +77,13 @@ test("PostgreSQL Settings pilot: defaults, updates, concurrency, validation, iso
   const migrate = require("../db/migrate");
   const settingsPg = require("../services/settings.pg.service");
 
+  // See testDb.pg.js: several postgres*.test.js files share this "app" schema, and test files
+  // run in parallel by default - this blocks until any other such file's run has fully finished.
+  const lockClient = await lockAppSchema(getPool());
+
   t.after(async () => {
     await getPool().query("DROP SCHEMA IF EXISTS app CASCADE"); // only our own schema, only in this test database
+    await unlockAppSchema(lockClient);
     await closePool();
   });
 
@@ -191,9 +202,19 @@ test("PostgreSQL Settings pilot: defaults, updates, concurrency, validation, iso
     assert.equal(count.rows[0].n, 1, "20 concurrent calls must still produce exactly one row");
   });
 
-  await t.test("isolation: this pilot never touches MongoDB (no mongoose anywhere in its require chain)", () => {
-    for (const id of [require.resolve("../services/settings.pg.service"), require.resolve("../db/rowMappers")]) {
-      assert.ok(!require.cache[id].children.some((child) => child.id.includes("mongoose")), id);
+  await t.test("isolation: this pilot never touches MongoDB (no mongoose anywhere in its FULL require tree)", () => {
+    // Walks every descendant, not just direct children - step 2.4's first version of this check
+    // only looked at direct children, which happened to hide a real gap (settings.pg.service.js
+    // then required models/schemas/actor.js, which itself requires "mongoose" - fixed in step
+    // 2.5 by giving rowMappers.js its own small actorFrom instead; see docs/POSTGRES_MIGRATION.md).
+    function transitiveChildren(id, seen = new Set()) {
+      if (seen.has(id)) return seen;
+      seen.add(id);
+      for (const child of require.cache[id]?.children || []) transitiveChildren(child.id, seen);
+      return seen;
     }
+    const ids = transitiveChildren(require.resolve("../services/settings.pg.service"));
+    const mongooseFiles = [...ids].filter((id) => /[\\/]mongoose[\\/]/.test(id) || /[\\/]models[\\/]/.test(id));
+    assert.deepEqual(mongooseFiles, [], "nothing in the full require tree lives under mongoose/ or server/models/");
   });
 });

@@ -47,4 +47,27 @@ function actorFromRow(row, prefix) {
   return { user: toId(row[`${prefix}_user_id`]), name, username };
 }
 
-module.exports = { toMoney, snakeToCamel, toId, actorFromRow };
+// The flip side of actorFromRow: a logged-in user -> { user, name, username } to WRITE into the
+// flattened actor columns. Deliberately a small, local copy of
+// models/schemas/actor.js's actorFrom, not an import of it - that file requires "mongoose" just
+// to define its (unused, for this purpose) Mongoose sub-schema, and pulling it in here would put
+// mongoose back into every PostgreSQL pilot's require chain, undoing the isolation step 2.4
+// intended (and step 2.5 corrected: the original isolation test only checked DIRECT require
+// children, which happened to hide this exact gap - see docs/POSTGRES_MIGRATION.md, step 2.5).
+function actorFrom(user) {
+  return user ? { user: user._id, name: user.name, username: user.username } : null;
+}
+
+// Until Phase 3 ports Users to PostgreSQL, a logged-in person's real id is a MongoDB ObjectId
+// (24 hex characters), never a PostgreSQL uuid - storing it in a uuid column that's a foreign
+// key to app.users (which has no real rows yet) would either fail the type or the FK itself
+// (confirmed directly: a uuid-SHAPED but non-existent id is correctly refused - step 2.4). Every
+// *_user_id column uses this before it ever reaches a query: only a value already shaped like a
+// uuid is attempted; anything else (every real actor today) becomes null, while the readable
+// name/username (actorFromRow above) are still stored and returned.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function actorUserIdOrNull(value) {
+  return typeof value === "string" && UUID_RE.test(value) ? value : null;
+}
+
+module.exports = { toMoney, snakeToCamel, toId, actorFromRow, actorFrom, actorUserIdOrNull };

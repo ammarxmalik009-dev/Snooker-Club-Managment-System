@@ -9,29 +9,18 @@
 // Phase 3 roadmap in docs/POSTGRES_MIGRATION.md intends (Settings is first).
 //
 // Field names, defaults and business rules are the SAME as settings.service.js (MongoDB) - this
-// file deliberately reuses the shared, database-agnostic pieces that already define them
-// (config/gameModes.js's resolveGameRates, models/schemas/actor.js's actorFrom) rather than
-// re-implementing that logic a second time, so the two paths can never quietly disagree about
-// what a rate resolves to.
+// file reuses config/gameModes.js's resolveGameRates (the actual rate-resolution logic) rather
+// than re-implementing it, so the two paths can never quietly disagree about what a rate
+// resolves to. It uses its own small actorFrom (db/rowMappers.js), not
+// models/schemas/actor.js's - that file requires "mongoose" just to define an unused sub-schema,
+// which would otherwise put MongoDB back into this pilot's require chain (see rowMappers.js).
 
 const { query } = require("../config/db.pg");
-const { toMoney, toId, actorFromRow } = require("../db/rowMappers");
-const { actorFrom } = require("../models/schemas/actor");
+const { toMoney, toId, actorFromRow, actorFrom, actorUserIdOrNull } = require("../db/rowMappers");
 const { resolveGameRates } = require("../config/gameModes");
 const AppError = require("../utils/AppError");
 
 const SETTINGS_KEY = "club";
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-// Until Phase 3 ports Users to PostgreSQL, a logged-in person's real id is a MongoDB ObjectId,
-// not a PostgreSQL uuid - storing it in updated_by_user_id (a uuid column, FK to app.users once
-// that table has real rows) would either error on the type or point at nothing. Until then, only
-// the readable name/username are stored for audit purposes; the linked id stays null unless it
-// is already a genuine uuid (which it will be, once Phase 3 exists). This is a known, documented
-// gap (docs/POSTGRES_MIGRATION.md, step 2.4) - not a bug to silently work around.
-function actorUserIdOrNull(value) {
-  return typeof value === "string" && UUID_RE.test(value) ? value : null;
-}
 
 // A database row -> the same plain-object shape settings.service.js's Mongoose document
 // produces via .toJSON() - so describeSettings() below (and resolveGameRates, shared with the

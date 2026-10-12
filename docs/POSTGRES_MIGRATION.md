@@ -866,6 +866,124 @@ no production database was touched; nothing was deployed.
 
 Test results after 2.4: see "Regression checks" above.
 
+#### Step 2.5 — Relationship and ordered-array pilot — done
+
+**Why Categories + Products was chosen:** the task listed three candidates - Tables (simple,
+no relationship), Products/Categories (a real foreign key) and "another model with an embedded
+array". A plain Tables pilot would have proven nothing new (step 2.4's Settings pilot already
+exercises a standalone table with no relationships). Categories/Products is the **smallest real
+one-to-many relationship** in the schema, and matches the Phase 3 porting order exactly (third,
+right after tables/customers) - the natural next step, not a detour.
+
+**For the ordered-array requirement**, no model that small also has an embedded array of its
+own, and the schema's actual ordered-array tables (`match_players`, `match_teams`,
+`bill_line_items`, `bill_players`) all sit behind the much heavier `tables → sessions → matches`
+or `→ bills` chain. Per the task's own guidance ("if one model cannot safely test both... choose
+one narrowly scoped pilot and document the gap"), this step did **not** build a Matches or Bills
+service - but rather than leave the gap entirely open, it reached `match_players`/`match_teams`
+with the **minimum possible fixture rows** (one `tables`, one `sessions`, one `matches` row,
+inserted directly with plain SQL in the test file itself - **no `matches.pg.service.js` exists**,
+no business rules were ported) purely to prove the `position` pattern on real tables, not a
+throwaway one. This is explicitly scoped and documented, not silently expanded.
+
+##### What was verified (Categories + Products)
+
+`server/services/categories.pg.service.js` and `products.pg.service.js` - standalone, not wired
+into any route, reusing `db/rowMappers.js` throughout:
+- **Create and read**, a category then a product in it; re-read matches what was returned.
+- **Foreign key**: an unknown `category_id` is refused with the *same* message and status
+  `products.service.js` already gives ("Category does not exist", 400) - not a raw SQL error -
+  and a genuinely malformed id is refused cleanly too.
+- **Unique constraints**: a duplicate category name (case/space-insensitive) → 409; the same
+  product name twice in **one** category → 409; the same name in a **different** category → fine
+  (exactly `products.service.js`'s own rule).
+- **Null/missing values**: `trackStock: false` always stores `stockQuantity: 0`; `lowStockLimit`
+  defaults to 5 (`models/Product.js`'s `DEFAULT_LOW_STOCK_LIMIT`), matching exactly.
+- **Updating**: a category rename and a product price/status change are both stored and
+  re-readable.
+- **Transaction rollback**: a category insert followed, in the *same* transaction, by a product
+  insert that violates a `CHECK` constraint - the category insert is undone too (row count
+  unchanged, nothing left behind), proving `withTransaction` rolls back the **whole** transaction,
+  not just the statement that failed.
+- **Isolation**: neither service's full require tree touches `mongoose` or `server/models/`.
+
+##### What was verified (ordered child rows - `match_players`, `match_teams`)
+
+`server/tests/postgresOrderedRows.test.js`, against real `app.match_players`/`app.match_teams`:
+- Four players inserted in a **scrambled** order (seat 3, then 1, then 4, then 2) with `position`
+  set to their real order (0-3) - read back `ORDER BY position` gives Alice, Bilal, Charlie, Dee:
+  the **intended** order, not the order they were written in. This is the actual claim "ordered
+  child rows work" rests on, demonstrated, not assumed.
+- `match_players_match_seat_key` (unique per match+seat) and `match_teams_match_number_key`
+  (unique per match+team number) both correctly refuse a duplicate.
+- `match_teams.seats` (a native `integer[]`, not another child table) round-trips exactly, still
+  in `number` order.
+- `ON DELETE CASCADE` (step 2.3's design): deleting the match removes its `match_players` and
+  `match_teams` rows too - nothing orphaned.
+
+**Still unverified:** `bill_line_items`/`bill_players` (the other two ordered-array tables) were
+**not** exercised - they sit behind `bills`, a much larger table with its own partial-unique
+constraints (step 2.3). The `position` *mechanism* is now proven on real tables; Bills' own
+business rules (payer splits, café-line reshaping) remain for a future, dedicated pilot.
+
+##### Two smaller corrections found while building this step
+
+- `rowMappers.js` gained its own `actorFrom`/`actorUserIdOrNull`, and `settings.pg.service.js`
+  was updated to use them: it previously imported `actorFrom` from `models/schemas/actor.js`,
+  which itself requires `"mongoose"` (just to define an unused sub-schema) - quietly putting
+  MongoDB back into a "mongoose-free" pilot's require chain.
+- That gap existed because step 2.4's own isolation test only checked **direct** require
+  children, not the full tree - it technically passed while still missing the problem above.
+  Rewritten (in `postgresSettings.test.js` too) to walk the entire transitive require tree.
+
+##### A genuine, newly-found concurrency bug (not designed around in advance)
+
+Running this step's new test files **together** with the earlier ones (`postgresMigrations.test.js`,
+`postgresSettings.test.js`) produced real failures - `relation "app.settings" does not exist`,
+and once, an actual PostgreSQL deadlock (`error code 40P01`, two backend sessions each blocking
+the other). Cause, found by testing directly, not assumed: `node --test` runs test **files** in
+parallel by default, and several `postgres*.test.js` files each `DROP SCHEMA`/recreate/use the
+**same** `app` schema - racing each other.
+
+First fix attempt (a PostgreSQL advisory lock via `pool.query()` for both lock and unlock) **did
+not work** and still deadlocked - `pg_advisory_lock`/`unlock` are session-scoped, and a
+connection-pool's `.query()` call does not guarantee the same physical connection runs the
+matching lock and unlock. Fixed properly in `server/tests/helpers/testDb.pg.js`:
+`lockAppSchema(pool)` now checks out and returns **one dedicated client**, held for the test
+file's entire run, with `unlockAppSchema(client)` releasing that exact client at the end -
+ordinary queries in between still use the pool normally. Verified directly: all five
+`postgres*.test.js` files, run together, **three times in a row**, and the full `npm.cmd test`
+suite (default parallelism across 300+ files), **twice** - all clean, 0 failures either time.
+
+##### Regression checks
+
+| Command | With PostgreSQL configured | Without (the ordinary state) |
+|---|---|---|
+| `npm.cmd test` | **348 passed, 0 failed, 0 skipped** (run twice) | 307 passed, 0 failed, **6 skipped** (cleanly - the row-mapper/nameKeyOf unit tests still ran) |
+| `npm.cmd run test:browser` | **780 passed, 0 failed** (15 suites) | unaffected either way |
+
+Confirmed: MongoDB remains the application's only active database - no route or controller reads
+either new pilot service; every MongoDB-backed test still uses its own throw-away database,
+untouched; no production database was touched; nothing was deployed; MongoDB functionality was
+not redirected or modified.
+
+##### Remaining relationships, migration risks and open questions
+
+- **Railway's `btree_gist` availability is still unconfirmed** (carried over from step 2.3) -
+  unaffected by this step (it didn't touch bookings).
+- **`auth_sessions` has no TTL equivalent** (carried over from step 2.3) - still open, Phase 3
+  (users/auth) work.
+- **`bill_line_items`/`bill_players`** (the other ordered-array tables) remain unverified, as
+  above - a future pilot once Bills itself is tackled.
+- **Every other foreign key in the schema** (sessions↔bookings and matches↔bills, the two
+  deferred-`ALTER TABLE` pairs from step 2.3; `payments→bills`; `stock_movements→products`;
+  `cafe_orders→sessions/products/bills`) is still unexercised by any pilot - only
+  `products→categories` and `match_players/match_teams→matches` have actually been proven so far.
+- **The test-file concurrency fix (advisory lock) only protects the shared `app` schema** across
+  this project's own `postgres*.test.js` files - any *future* such test file must also call
+  `lockAppSchema`/`unlockAppSchema` (`server/tests/helpers/testDb.pg.js`), or it will race the
+  same way these did before the fix.
+
 ### Phase 3 — Port services, one at a time (tests after each)
 
 Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
@@ -928,7 +1046,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Phase 2, Step 2.2A — real local PostgreSQL 18.6 set up (portable, port 5433); smoke test actually connected and passed (303/0/0 skipped); fixed a word-boundary bug in testDb.pg.js found in the process
 - [x] Phase 2, Step 2.3 — full schema (20 tables) + migration runner, tested against the real local PostgreSQL (312 server / 780 browser with it configured; 9 new tests, 0 skipped); Railway `btree_gist` still unconfirmed
 - [x] Phase 2, Step 2.4 — row-mapper layer + standalone Settings service pilot, tested against the real local PostgreSQL (328 server / 780 browser with it configured, 16 new tests, 0 skipped); found and fixed a real actor-mapping edge case; the Users FK gap is documented, not worked around
-- [ ] Phase 2, Step 2.5 — a second, harder pilot (one with a relationship and/or an embedded array, e.g. Tables or Products/Categories), per the Phase 3 order above
+- [x] Phase 2, Step 2.5 — Categories/Products (real FK + unique constraints) + match_players/match_teams fixture-only ordered-row proof (348 server / 780 browser with PostgreSQL configured, 19 new tests, 0 skipped); found and fixed a genuine test-concurrency bug (shared schema raced across parallel test files - advisory lock with a dedicated client)
+- [ ] Phase 2, Step 2.6 — Bills (the hardest model: both ordered arrays AND the partial-unique session/match rules), or Bookings (the btree_gist EXCLUDE constraint, still unverified against a service), per the Phase 3 order above
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified

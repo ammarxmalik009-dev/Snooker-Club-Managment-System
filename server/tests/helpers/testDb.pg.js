@@ -51,4 +51,33 @@ function getPgTestDatabaseUrl() {
   return url;
 }
 
-module.exports = { assertTestDatabaseUrl, getPgTestDatabaseUrl, databaseNameFrom, hasTestWord };
+// A fixed, arbitrary advisory-lock id, shared only by this project's own tests. Several
+// server/tests/postgres*.test.js files each manage the SAME "app" schema (drop it, run the real
+// migrations into it, test, drop it again) - and node's test runner runs test FILES in parallel
+// by default (confirmed directly: without this lock, two such files running at once produce
+// real deadlocks and "relation does not exist" errors, step 2.5). A PostgreSQL advisory lock
+// serializes that: whichever test file calls lockAppSchema() first finishes its entire run
+// (including its own cleanup) before the next one's lockAppSchema() call returns - verified
+// directly with two real concurrent processes, not assumed. It has no effect on anything else
+// (not on MongoDB, not on the schema's actual content) - it is purely a "one at a time" gate.
+const APP_SCHEMA_LOCK_ID = 583742991;
+
+// pg_advisory_lock/unlock are SESSION-scoped: they only work called on the exact same physical
+// connection. A plain pool.query() for each call does NOT guarantee that (pg.Pool hands out
+// whichever client is free) - confirmed the hard way: an early version of this using
+// pool.query() for both calls let two test files corrupt each other's "app" schema and even
+// produced a genuine PostgreSQL deadlock (code 40P01) between two of the pool's own connections.
+// The fix: hold ONE dedicated client for the lock's entire lifetime; ordinary work can still use
+// the pool normally (any connection) in between - only the lock/unlock pair must match sessions.
+async function lockAppSchema(pool) {
+  const client = await pool.connect();
+  await client.query("SELECT pg_advisory_lock($1)", [APP_SCHEMA_LOCK_ID]);
+  return client;
+}
+
+async function unlockAppSchema(client) {
+  await client.query("SELECT pg_advisory_unlock($1)", [APP_SCHEMA_LOCK_ID]);
+  client.release();
+}
+
+module.exports = { assertTestDatabaseUrl, getPgTestDatabaseUrl, databaseNameFrom, hasTestWord, lockAppSchema, unlockAppSchema };
