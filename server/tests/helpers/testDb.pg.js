@@ -1,14 +1,21 @@
 // Test helper for PostgreSQL smoke tests (Phase 2, step 2.2) - a separate, STRICTER rule from
 // server/tests/helpers/testDb.js (MongoDB). That one accepts "test" ANYWHERE in the name, so a
 // database literally named "snooker_club_pro_latest" would wrongly pass it ("latest" contains the
-// substring "test"). This helper requires "test" as its OWN WORD (bounded by the start/end of the
-// name or a non-letter/digit/underscore character): "test", "club_test" and "test_club" pass;
-// "latest" and "attest" do not.
+// substring "test"). This helper requires "test" as its OWN WORD, splitting the name on every
+// run of non-alphanumeric characters - which includes "_", the separator this project's own
+// database names use (step 2.2A found this the hard way: a plain \b-based regex treats "_" as
+// part of the word, so it would wrongly REFUSE "snooker_club_pro_test" too): "test", "club_test"
+// and "test_club" pass; "latest", "attest" and "mytest" (no separator at all) do not.
 //
 // This module makes no queries and performs no destructive action itself. There is no drop/reset
 // function here on purpose - nothing in Phase 2 needs one yet, and the smoke test only reads.
 
-const TEST_WORD = /\btest\b/i;
+// True if "test" is one of the name's own words, splitting on any run of non-alphanumeric
+// characters (so "_", "-", "." etc. all count as separators, the same as "/" and ":" already do
+// by virtue of not being letters/digits).
+function hasTestWord(name) {
+  return name.toLowerCase().split(/[^a-z0-9]+/).includes("test");
+}
 
 // The database name from a postgres:// connection string's path - never the user name or password.
 function databaseNameFrom(connectionString) {
@@ -23,7 +30,7 @@ function databaseNameFrom(connectionString) {
 // The error never includes the connection string itself (which may hold a password).
 function assertTestDatabaseUrl(connectionString) {
   const name = databaseNameFrom(connectionString);
-  if (!name || !TEST_WORD.test(name)) {
+  if (!name || !hasTestWord(name)) {
     throw new Error(
       `Refusing to use database "${name || "(unknown)"}" for a PostgreSQL test: its name must ` +
         'contain "test" as its own word (e.g. "snooker_club_pro_test"). Nothing was connected to or changed.'
@@ -44,4 +51,4 @@ function getPgTestDatabaseUrl() {
   return url;
 }
 
-module.exports = { assertTestDatabaseUrl, getPgTestDatabaseUrl, databaseNameFrom };
+module.exports = { assertTestDatabaseUrl, getPgTestDatabaseUrl, databaseNameFrom, hasTestWord };

@@ -423,7 +423,7 @@ in full on the new `postgres` branch as a safety check, confirming the branch ge
 `main`: `npm.cmd test` **300 passed, 0 failed**; `npm.cmd run test:browser` **780 passed, 0 failed**
 (15 suites) - identical to the numbers reported at the end of Phase 1.
 
-#### Step 2.2 — `pg`, connection pool, transaction helper, smoke test — done (connection unverified here; see limitations)
+#### Step 2.2 — `pg`, connection pool, transaction helper, smoke test — done (connection verified in step 2.2A below)
 
 **Dependency:** `pg` `^8.23.1` added to `package.json`'s `dependencies` (not a devDependency - the
 real app will need it once Phase 3 starts). No ORM, no other database framework. `npm.cmd install`
@@ -490,20 +490,74 @@ $env:PG_TEST_DATABASE_URL = "postgres://postgres:yourpassword@127.0.0.1:5432/sno
 node --test server/tests/postgresConnection.test.js
 ```
 
-**Limitation - what was and wasn't actually verified:** this environment has **no PostgreSQL
-server and no Docker available**, so `PG_TEST_DATABASE_URL` could not be set here, and tests 1-2
-above were **skipped**, not passed - a skip is evidence of nothing. What *was* actually run and
-passed is: `pg` installs and loads correctly on this Node version, and `db.pg.js`'s "DATABASE_URL
-is missing" error path (test 3). **A real PostgreSQL connection has not been demonstrated.** Before
-trusting this module for Phase 2.3+, run it against a real local PostgreSQL test database using the
-steps above and confirm tests 1-2 actually pass (not skip).
+**Limitation as first written in step 2.2:** this environment had no PostgreSQL server and no
+Docker, so `PG_TEST_DATABASE_URL` could not be set, and tests 1-2 were **skipped**, not passed - a
+skip is evidence of nothing. What *was* actually run and passed then was only: `pg` installs and
+loads correctly on this Node version, and `db.pg.js`'s "DATABASE_URL is missing" error path (test
+3). **Step 2.2A (below) closes this gap with a real connection.**
 
 **Backward compatibility (checked):** `npm.cmd test`/`npm.cmd run test:browser` still pass in full
 (below) with no PostgreSQL configured anywhere - proving normal start-up, MongoDB, and every route
 are completely unaffected by this module's mere existence.
 
-Test results after 2.2: `npm.cmd test` **303 passed, 0 failed, 2 skipped** (300 + 3 new, 2 of the 3
-skipped as explained above); `npm.cmd run test:browser` **780 passed, 0 failed** (15 suites, unchanged).
+Test results after 2.2 (no PostgreSQL available yet): `npm.cmd test` **303 passed, 0 failed, 2
+skipped** (300 + 3 new, 2 of the 3 skipped as explained above); `npm.cmd run test:browser`
+**780 passed, 0 failed** (15 suites, unchanged).
+
+#### Step 2.2A — Real local PostgreSQL connection, actually verified — done
+
+Closes step 2.2's one open limitation: a genuine PostgreSQL server was set up locally and the
+smoke test was run against it for real - the two previously-skipped tests now **pass**, not skip.
+
+**Setup chosen (portable, no installer, no admin rights, no Windows service)** - the same idea as
+this project's own portable MongoDB (`npm run db`): EDB's "binaries" zip (no registration step
+needed), confirmed as a genuine zip (384,620,317 bytes) before trusting it, extracted to
+`%LOCALAPPDATA%\SnookerClubPro\postgresql\pgsql`. **Version actually running: PostgreSQL 18.6**
+(`pg_config --version`, read directly from the running binaries - not assumed).
+
+```powershell
+$PG = "$env:LOCALAPPDATA\SnookerClubPro\postgresql\pgsql"
+$DATA = "$env:LOCALAPPDATA\SnookerClubPro\postgresql\data"
+& "$PG\bin\initdb.exe" -D $DATA -U postgres -A trust --locale=C   # local-only, no password: never used for anything but this test database
+& "$PG\bin\pg_ctl.exe" -D $DATA -o "-p 5433 -h 127.0.0.1" -l "$env:LOCALAPPDATA\SnookerClubPro\postgresql\log.txt" start
+& "$PG\bin\createdb.exe" -h 127.0.0.1 -p 5433 -U postgres snooker_club_pro_test
+```
+Port **5433** (not PostgreSQL's usual 5432) and `-h 127.0.0.1` only, specifically so this throw-away
+instance can never collide with, or be reached from outside, any other PostgreSQL someone might
+already have. `-A trust` has no password at all - safe only because the server listens on the
+loopback address alone; this is a local test instance, never a production credential.
+
+**A real bug this step found and fixed:** `server/tests/helpers/testDb.pg.js`'s rule from step 2.2,
+`/\btest\b/i`, looked right but was wrong - regex `\b` treats `_` as part of a word (it's in `\w`),
+so it does **not** see a boundary in `pro_test`. The very name this document recommends,
+`snooker_club_pro_test`, was **refused** by the helper that was supposed to accept it (confirmed by
+testing the regex directly before touching anything else). Fixed by splitting the name on every run
+of non-alphanumeric characters (`_`, `-`, `.`, `/`, `:`, …) and checking `"test"` is one of the
+resulting words - verified against the same cases as before, now correctly: `snooker_club_pro_test`,
+`test`, `club_test`, `test_club` → accepted; `latest`, `attest`, `mytest`, `test123` → still refused.
+
+**What actually ran, against the real database above** (`PG_TEST_DATABASE_URL` set to the
+`snooker_club_pro_test` connection string, no password, loopback only):
+- `node --test server/tests/postgresConnection.test.js` → **all 3 tests passed** (0 skipped):
+  the connection was established, `SELECT 1` returned `1`, a transaction committed, another was
+  deliberately failed and confirmed to roll back (and the *original* error - not a rollback error -
+  is what came out), and the pool closed cleanly.
+- Full suite, same `PG_TEST_DATABASE_URL` still set: `npm.cmd test` **303 passed, 0 failed, 0
+  skipped**. With it unset again (the ordinary state for anyone who hasn't configured PostgreSQL):
+  the two connecting tests **skip** again, confirmed directly - proving the opt-in design works
+  both ways, not just when configured.
+- `npm.cmd run test:browser` **780 passed, 0 failed** (15 suites) - unaffected either way, as expected.
+
+**Still true, unchanged from step 2.2:** no schema or table was created, no model was ported, no
+production data exists or was touched, MongoDB remains the only database the running app actually
+uses. The local PostgreSQL server above is left running on `127.0.0.1:5433` for convenience (Step
+2.3 will need it again); stop it any time with:
+```powershell
+& "$env:LOCALAPPDATA\SnookerClubPro\postgresql\pgsql\bin\pg_ctl.exe" -D "$env:LOCALAPPDATA\SnookerClubPro\postgresql\data" stop
+```
+
+Test results after 2.2A: `npm.cmd test` **303 passed, 0 failed** (0 skipped, with
+`PG_TEST_DATABASE_URL` configured); `npm.cmd run test:browser` **780 passed, 0 failed** (15 suites).
 
 ### Phase 3 — Port services, one at a time (tests after each)
 
@@ -563,8 +617,9 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] 1.6 `client/vercel.json` + `client/404.html` (300 server / 780 browser; live Vercel check and real backend URL still pending Phase 5)
 - [x] 1.7 Docs + `.env.example` + full test runs (300 server / 780 browser) — **Phase 1 complete in code and docs; live deployment unverified (see "Phase 1 status" above)**
 - [x] Phase 2, Step 2.1 — inspection + foundation plan (docs only, `postgres` branch created from `34138b3`; 300 server / 780 browser re-run clean)
-- [x] Phase 2, Step 2.2 — `pg` dependency, connection pool, transaction helpers, smoke test (303 server / 780 browser; real PostgreSQL connection still unverified - no local server available, see step 2.2's limitation note)
-- [ ] Phase 2, Step 2.3 — confirm a real local PostgreSQL connection (run the skipped smoke tests), then start on schemas/migrations per the Phase 3 order
+- [x] Phase 2, Step 2.2 — `pg` dependency, connection pool, transaction helpers, smoke test (303 server / 780 browser, PostgreSQL tests skipped at this point - no local server yet)
+- [x] Phase 2, Step 2.2A — real local PostgreSQL 18.6 set up (portable, port 5433); smoke test actually connected and passed (303/0/0 skipped); fixed a word-boundary bug in testDb.pg.js found in the process
+- [ ] Phase 2, Step 2.3 — start on schemas/migrations, one table at a time, per the Phase 3 order (settings first)
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
