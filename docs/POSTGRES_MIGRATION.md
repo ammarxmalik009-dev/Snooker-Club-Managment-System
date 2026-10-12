@@ -1579,6 +1579,108 @@ was deployed.
 - **Players, CafeOrder, StockMovement, Matches and Counter still have no PostgreSQL pilot** -
   completely untouched by Phase 2 so far.
 
+#### Step 2.12 — Sessions pilot: starting and ending a session in one real transaction — done
+
+**Scope chosen:** a standalone Sessions repository, following the same `*.pg.service.js` pattern
+as every earlier pilot. Not wired into any route; does not call and is not called by
+`server/services/sessions.service.js` (MongoDB), which stays the application's only active path.
+
+##### Sessions (`server/services/sessions.pg.service.js`)
+
+- **Reused, unmodified**: `server/utils/time.js`'s `secondsBetween`/`startOfDayInTimeZone`/
+  `startOfNextDayInTimeZone` (pure, no mongoose) - the exact same duration and club-local day
+  boundary rules `sessions.service.js` itself uses.
+- **Implemented**: start (claim an available table + create the session), end (close an open
+  session, compute its real duration, free the table), get-by-id, list active sessions, count
+  active sessions, `hasOpenSession`, and a history list (status filter, club-local date range,
+  table name/number search, pagination) - the same rules `sessions.service.js`'s own functions
+  enforce.
+- **The one genuinely different guarantee**: `sessions.service.js` has no database transactions,
+  so starting a session is a documented two-step dance - claim the table with one atomic
+  conditional update, create the session, and if *that* insert ever fails (the unique
+  open-session index as a safety net), manually release the table back to its previous status as
+  a separate compensating step. Here, claiming the table and creating the session happen inside
+  **one real PostgreSQL transaction**: if the `INSERT` fails for any reason - including the
+  `sessions_one_open_per_table` unique partial index (committed already in step 2.3, but never
+  exercised by a real service until now) - the table's `UPDATE` rolls back automatically with it.
+  There is no manual "release" step and no window where a table could ever be left claimed
+  without a session, however briefly. Ending a session and freeing its table are likewise one
+  transaction, not two independent writes.
+- **Explicitly out of scope** (recorded, not invented): `listSessions`'s own bill/match joins -
+  `sessions.service.js` loads `bills.service.js` and `matches.service.js` for this, and neither
+  has a PostgreSQL pilot of its own yet; pulling either in here would be well beyond this step's
+  narrow goal. This pilot's `listSessions` returns sessions only.
+
+##### What was verified - against the real local PostgreSQL
+
+1. **Start a session**: claims the table (confirmed `occupied` in the database), creates the
+   session with the correct snapshot fields (`tableNumber`, `hourlyRateAtStart`), re-read matches
+   exactly what was returned.
+2. **Starting on an already-occupied table** is refused (409, "already occupied"), and confirmed
+   with a `COUNT(*)` that no second session was created.
+3. **A reserved or maintenance table** gives the specific matching reason message; a
+   non-existent table id gives 404 - and the reserved/maintenance tables are confirmed left in
+   their original status, never touched by the refused attempt.
+4. **The real transaction, proven with genuine concurrency, not just reasoned about**: two
+   simultaneous `startSession` calls for the identical fresh table - exactly 1 succeeded, 1 was
+   refused (409) by the database's own `sessions_one_open_per_table` partial unique index, and
+   the table ended up correctly `occupied` by the one session that actually won - never stuck
+   claimed-but-sessionless, confirmed by a direct row count.
+5. **Ending a session**: computes a real, non-negative duration, frees the table back to
+   `available`, confirmed with a direct table-status read; ending the same session again is
+   refused (409, "already ended").
+6. **Ending a non-existent session** is refused with 404.
+7. **`listActiveSessions`/`countActiveSessions`/`hasOpenSession`** reflect real, live state
+   before and after starting/ending a session on a fresh table.
+8. **`listSessions`**: status filter, table-number/name search, and pagination all behave like
+   `sessions.service.js`'s own `listSessions` (minus the explicitly out-of-scope bill/match
+   joins).
+9. **Foreign-key compatibility**: a real `app.bookings` row's `session_id` can reference this
+   session's id; a non-existent session id in that same column is refused by the database
+   (`23503`).
+10. **Transaction rollback, the real guarantee**: inside one `withTransaction`, a session's
+    `UPDATE` (closing it) is applied and then a second statement fails (duplicate primary key) -
+    the whole transaction rolls back, and the session is confirmed still genuinely open
+    afterward, not half-closed.
+- **Isolation**: confirmed (no `mongoose`/`server/models/` anywhere in the pilot's full require
+  tree, checked recursively).
+
+No schema change was needed or made - the committed step 2.3 schema (the
+`sessions_one_open_per_table` partial unique index, the `CHECK` constraints, the default-`RESTRICT`
+foreign keys) was already adequate for every rule above.
+
+##### Regression checks
+
+| Command | With PostgreSQL configured (run twice) | Without (the ordinary state) |
+|---|---|---|
+| `npm.cmd test` | **433 passed, 0 failed, 0 skipped**, both times | 307 passed, 0 failed, **13 skipped** (cleanly) |
+| `npm.cmd run test:browser` | **780 passed, 0 failed** (15 suites) - identical to every prior baseline | unaffected either way |
+
+All twelve `postgres*.test.js` files (now including this one) run together, **three times** -
+133/133 every time, no deadlocks or races (the step 2.5 advisory-lock fix holds with a twelfth
+file). This file alone run **three times** in isolation too - the same 12/12 result every time.
+After every run, the test database (`snooker_club_pro_test`) was confirmed left clean - no `app`
+schema, no leftover tables. No unrelated failure occurred during this step's verification.
+
+Confirmed: MongoDB remains the application's only active database; `sessions.service.js`, its
+routes and controller are unchanged; no route or controller reads the new pilot; every MongoDB
+test still uses its own throw-away database, untouched; no production data was changed; nothing
+was deployed.
+
+##### Unverified behaviour and remaining risks
+
+- **`listSessions`'s bill/match joins** were not built (explicitly out of scope above) - would
+  require Bills and Matches PostgreSQL pilots first; a future step if Sessions is ever fully cut
+  over in Phase 3.
+- **Login/cookie/middleware flow, and the sessions routes/controller themselves, are untouched** -
+  this step proves the data-layer rules only; wiring Sessions into the actual app is Phase 3 work.
+- **Checking in a booking to start a session** (the `booking_id` link, Phase 7 per the schema's
+  own comment) was not exercised beyond a raw foreign-key insert in test 9 - no real
+  "check in" operation exists in `sessions.service.js` itself yet either, so none was invented
+  here.
+- **Players, CafeOrder, StockMovement, Matches and Counter still have no PostgreSQL pilot** -
+  completely untouched by Phase 2 so far.
+
 ### Phase 3 — Port services, one at a time (tests after each)
 
 Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
@@ -1648,7 +1750,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Phase 2, Step 2.9 — Bookings pilot: the real EXCLUDE overlap guarantee against a real service, proven with 6 genuinely concurrent requests for the identical slot (396 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped); Railway's PostgreSQL version and `btree_gist` availability remain unconfirmed - no Railway project exists yet (manual steps recorded above)
 - [x] Phase 2, Step 2.10 — Tables pilot: CRUD, uniqueness, status/session/booking restrictions, real FK compatibility with bookings, transaction rollback (409 server / 780 browser with PostgreSQL configured, 13 new tests, 0 skipped)
 - [x] Phase 2, Step 2.11 — Customers pilot: search/pagination with real booking stats, archive-not-delete, FK-backed deletion restriction (421 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped)
-- [ ] Phase 2, Step 2.12 — Sessions pilot, per the Phase 3 order above (not started; awaiting approval)
+- [x] Phase 2, Step 2.12 — Sessions pilot: real one-transaction start/end, the sessions_one_open_per_table guarantee proven with genuine concurrency, FK compatibility (433 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped)
+- [ ] Phase 2, Step 2.13 — Players, CafeOrder/StockMovement or Matches pilot, per the Phase 3 order above (not started; awaiting approval)
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
