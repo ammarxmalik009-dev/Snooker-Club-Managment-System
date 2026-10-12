@@ -55,7 +55,7 @@ so the origin check must accept an explicit allow-list (`ALLOWED_ORIGINS`) — n
 | 1.3 | `ALLOWED_ORIGINS`: the origin check accepts the same host **or** an exact allow-listed origin; everything else stays 403 | `server/config/env.js`, `server/middleware/auth.js`, tests |
 | 1.4 | Vendored Chart.js: a committed copy in `client/vendor/`, so Vercel can serve it (no `node_modules` there) | `client/vendor/` (file, licenses, README), `server/app.js`, `.gitattributes`, tests |
 | 1.5 | Client-side page-role guard (user experience only — the API's `requirePermission` stays the real protection) | `server/{routes,controllers,validators}/auth.*`, `client/js/core/layout.js`, `client/css/layout.css`, `tests/browser/{server.js,run.js}`, tests |
-| 1.6 | `client/vercel.json` (API rewrite with a placeholder Railway URL, `/` → dashboard, security headers) + `client/404.html` | `client/vercel.json`, `client/404.html`, tests |
+| 1.6 | `client/vercel.json` (API rewrite with a placeholder Railway URL, `/` → dashboard, security headers) + `client/404.html` | `client/vercel.json`, `client/404.html`, `server/tests/vercelConfig.test.js` |
 | 1.7 | Docs + `.env.example`; full server + browser test runs | `README.md`, `docs/ARCHITECTURE.md`, `.env.example` |
 
 #### 1.2 `TRUST_PROXY` — done
@@ -239,6 +239,69 @@ endpoint still checks login (401) and role (403) on its own, exactly as before.
 Test results after 1.5: `npm.cmd test` **294 passed, 0 failed** (287 + 7 new);
 `npm.cmd run test:browser` **780 passed, 0 failed** (15 suites, +1 new: `static-pageguard`).
 
+#### 1.6 `client/vercel.json` + `client/404.html` — done
+
+Neither file existed before this step; both are new.
+
+**How a request is handled, once deployed (`client/` as the Vercel project root):**
+
+| Address | What happens |
+|---|---|
+| `/pages/dashboard.html`, `/css/...`, `/js/...`, `/vendor/...` | served directly - real static files, unchanged |
+| `/` | **redirect** (302, `permanent: false`) to `/pages/dashboard.html` - same as `server/app.js`'s `res.redirect()` today |
+| `/api/*` | **rewrite** (server-side proxy) to `https://<RAILWAY_BACKEND_URL>/api/:path*` - the browser's address bar never changes, so the login cookie stays first-party (Step 1.3) |
+| anything else (typo, old bookmark, removed page) | Vercel's own static-hosting convention: a `404.html` at the project root is served automatically, with a 404 status |
+
+`<RAILWAY_BACKEND_URL>` is a **placeholder** - it must be replaced with the real Railway service
+address before deploying (see "What you must provide" below). Left as-is, the rewrite simply fails
+(an unresolvable host) rather than silently reaching a real, unrelated server.
+
+`cleanUrls: false` is explicit: every internal link in this app already includes the `.html`
+extension (`/pages/users.html`, not `/pages/users`), so Vercel must not strip it.
+
+**Headers:** `client/vercel.json`'s `headers` rule adds the exact header set `helmet()` already
+sends for every response today (confirmed by starting the app locally and reading the response:
+`Content-Security-Policy` with the same directives except `upgrade-insecure-requests` - already off
+- plus `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Cross-Origin-Opener-Policy`,
+`Cross-Origin-Resource-Policy`, `X-Download-Options`, `X-Permitted-Cross-Domain-Policies`,
+`Origin-Agent-Cluster`, `X-DNS-Prefetch-Control`, `Strict-Transport-Security`). Without this, every
+static file Vercel serves would carry none of them - only `/api/*` responses would, since those
+still come from the Express app on Railway. The rule's `source` (`/(.*)`) also matches the rewritten
+`/api/*` requests; Railway's own identical headers may then appear twice on an API response, which
+is harmless (same policy, so nothing is more or less restrictive) but is a known minor overlap.
+
+**`client/404.html`:** built from the existing design system (`theme.css`/`layout.css`/`components.css`,
+the same `.login-card` shell `login.html` uses) - not Express's own plain-text 404
+(`server/middleware/notFound.js`, unchanged - it only matters for Railway/local, which still use it;
+Vercel never reaches it). Deliberately has **no `<script>`**: an error page must keep working even if
+the backend or the login check can't be reached, and must never claim the visitor is logged in. Its
+one link goes to `/pages/dashboard.html`; if the visitor isn't logged in, that page's own Step 1.5
+guard sends them to the login page as usual - the 404 page itself bypasses nothing.
+
+**Tests:** `server/tests/vercelConfig.test.js` (6 tests, no database): valid JSON with the expected
+`cleanUrls`/`rewrites`/`redirects`/`headers` shape; the `/api/:path*` rewrite is an absolute
+cross-origin URL (never a local path, never `404.html` or `/pages/...`) and no other rule touches an
+`/api` address; the `/` redirect matches `server/app.js`'s own behaviour; the header keys and the CSP
+value match what the running app actually sends; `404.html` has no script, uses the real stylesheets,
+has a working link to a real file, and never prints a fabricated figure or an internal detail
+(`MONGODB_URI`, `AUTH_SECRET`, `localhost`, …). These checks run against the **files**, not a live
+Vercel deployment - see the limitation below. Steps 1.5's own suites (`pageAccess.test.js`,
+`static-pageguard`) were re-run unchanged to confirm no regression.
+
+**Not verified (needs the live deployment, Phase 5):**
+- That Vercel's rewrite/redirect/headers rules behave exactly as the JSON says once actually deployed.
+- That a missing path truly gets `404.html` with a 404 status (this is Vercel's documented static-site
+  convention, not something `vercel.json` configures explicitly, so it cannot be checked from the repo).
+- The real Railway backend address - still a placeholder.
+
+**What you (the project owner) must provide before deploying:** the real Railway backend URL, to
+replace `<RAILWAY_BACKEND_URL>` in `client/vercel.json`.
+
+Test results after 1.6: `npm.cmd test` **300 passed, 0 failed** (294 + 6 new; one run showed 8
+unrelated failures in game-modes/stock tests from MongoDB load - re-running those files alone and
+the full suite again both passed cleanly, confirming it was a transient flake, not caused by this
+step); `npm.cmd run test:browser` **780 passed, 0 failed** (15 suites, unchanged from step 1.5).
+
 ### Phase 2 — PostgreSQL foundation (branch `postgres`)
 
 - `pg` pool from `DATABASE_URL`, query + transaction helpers, row mappers that keep today's JSON (UUIDs as strings).
@@ -302,7 +365,7 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] 1.3 `ALLOWED_ORIGINS` origin check (283 server / 741 browser; live rewrite check pending Phase 5)
 - [x] 1.4 Vendored Chart.js 4.5.1 (287 server / 741 browser; Vercel load check pending Phase 5)
 - [x] 1.5 Client-side page-role guard (294 server / 780 browser; live Vercel check pending Phase 5)
-- [ ] 1.6 `client/vercel.json` + `client/404.html`
+- [x] 1.6 `client/vercel.json` + `client/404.html` (300 server / 780 browser; live Vercel check and real backend URL still pending Phase 5)
 - [ ] 1.7 Docs + full test runs
 - [ ] Phase 2 — PostgreSQL foundation
 - [ ] Phase 3 — Services ported
