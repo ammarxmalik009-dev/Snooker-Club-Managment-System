@@ -2043,6 +2043,142 @@ controller or MongoDB service was touched; no production data was changed; nothi
 `startSession`'s table-claiming transaction, rollback guarantees, and table-release behaviour are
 all unchanged and still pass every existing test.
 
+#### Step 2.15 — CafeOrders/StockMovements pilot: the row-lock guarantee for tab reservations — done
+
+**Scope chosen:** two standalone repositories, following the same `*.pg.service.js` pattern as
+every earlier pilot. Neither is wired into any route; neither calls, nor is called by,
+`server/services/cafeOrders.service.js`/`stock.service.js` (MongoDB), which stay the
+application's only active path.
+
+##### CafeOrders (`server/services/cafeOrders.pg.service.js`)
+
+- **Implemented**: `addItem`, `updateItem`, `removeItem`, `listItems`, `openItemsForSession`,
+  `openTabQuantities` - the same tab lifecycle `cafeOrders.service.js` enforces: a snapshot of
+  table number / product name / category name / unit price taken at add time (never changed by a
+  later price edit); `product_id = NULL` for typed-in items; quantity 1-99, description/consumer
+  ≤60 characters (enforced in code - no matching CHECK constraint in the schema, same pattern
+  earlier pilots use for their own uncommitted-to-schema rules); only `open` items can be changed
+  or removed; removed items kept for history, excluded from `listItems`'s own read; the tab locks
+  once a **whole-session** bill exists (`match_id IS NULL`), but a real match bill
+  (`match_id NOT NULL`) does **not** close it - verified against a real `app.matches`/`app.bills`
+  fixture, not merely asserted; inactive products can't be added.
+- **The one genuinely different guarantee**: `cafeOrders.service.js`'s own free-stock check
+  (physical stock minus what's already reserved on OTHER open tabs) is a plain read (an
+  aggregate over open tab items) followed by a separate, unprotected insert - a real,
+  acknowledged gap in that design (the actual, final guarantee is the PHYSICAL stock decrease at
+  billing time, deferred here too). This pilot's `addItem`/`updateItem` (quantity-increase path)
+  instead run inside one transaction that locks the **product row** first
+  (`SELECT ... FOR UPDATE`): a second, genuinely concurrent reservation attempt for the SAME
+  product blocks on that lock until the first transaction commits or rolls back, then recomputes
+  free stock against the now-committed, up-to-date reserved total - never a stale read. **Proven
+  with genuine concurrency** (6 simultaneous 1-unit reservations against a stock of 5 - exactly 5
+  win), not assumed.
+
+##### StockMovements (`server/services/stockMovements.pg.service.js`)
+
+- **Reused, not re-implemented**: `products.pg.service.js`'s own `mapProductRow` (a sibling
+  PostgreSQL pilot file - the same reuse `players.pg.service.js`'s `nameKeyOf` already
+  established); `server/utils/time.js`'s `startOfDayInTimeZone`/`startOfNextDayInTimeZone` (pure,
+  no mongoose) for `listMovements`'s club-local date filtering.
+- **Implemented**: `restock`, `adjust` (adjustment ± or waste, always a reduction regardless of
+  the input's sign), `recordInitialStock`, `listMovements`, and the atomic `increase`/`decrease`
+  pair. Movement types, signed quantities, `balance_after`, the 0/1,000,000 stock boundaries, and
+  "manual operations refused for untracked products" all match `stock.service.js` exactly.
+- **Every stock mutation and its `stock_movements` row are written in ONE transaction** (not two
+  separate, non-transactional writes like MongoDB's `Product.findOneAndUpdate` +
+  `StockMovement.create()`): if the movement insert ever failed after the stock change succeeded,
+  the whole transaction rolls back, undoing the stock change too - verified directly (test 9
+  below), not assumed.
+- **Overselling can't happen**: a decrease is one atomic conditional `UPDATE` with
+  `stock_quantity >= quantity` in its own `WHERE` clause - proven with 10 genuinely concurrent
+  requests racing to take 1 unit each from a stock of 5 (exactly 5 win), and `balance_after`
+  confirmed, under that same concurrency, to be a true permutation of 4-3-2-1-0 with no
+  duplicates or gaps - each movement really saw the stock *after* its own change, never a stale
+  or duplicated value from a racing sibling.
+
+##### Explicitly out of scope - recorded, not invented, with the deferred transaction boundary
+
+- **`takeForBill`/`putBack`** (multi-product, all-or-nothing PHYSICAL stock deduction tied to an
+  actual bill save) - needs to run inside `bills.pg.service.js`'s own transaction (the same one
+  that inserts the bill, its line items and players), so that a bill is never saved with some of
+  its café stock taken and some not. Belongs to Phase 3's Bills/Café integration, not a
+  standalone CafeOrders/StockMovements pilot.
+- **`claimForBill`/`releaseClaim`** (a bill's claim on open tab items, marking them `billed`
+  before the bill itself is known to have saved) - same transaction boundary as above: claiming
+  must commit or roll back together with the bill row itself.
+- **`recordSale`/`restoreForCancelledBill`** (the `sale`/`sale_reversal` movements a bill's own
+  creation/cancellation produces) - these write `stock_movements` rows with a real `bill_id`,
+  which only exists once a bill has actually been saved; wiring them in here would mean
+  reimplementing part of `bills.pg.service.js`'s own save/cancel flow as a side effect of this
+  pilot, against this step's own instruction not to.
+- **No café payer rules, pricing, or bill calculation logic was touched or reimplemented** -
+  `bills.pg.service.js` itself was not changed.
+
+##### What was verified - against the real local PostgreSQL
+
+CafeOrders (15 tests): product-based and typed-in item creation with the correct snapshot;
+free stock correctly shared/reduced across different sessions' open tabs; untracked products
+always available; a later price change never retroactively changes an already-ordered item;
+inactive products refused; only-open-items-change/remove enforced, removed items confirmed to
+survive in the database (excluded only from `listItems`'s own read); quantity-update re-checks
+free stock correctly (counting the item's own current quantity, not double-counting it);
+whole-session-bill-closes-the-tab vs match-bill-does-not, against real `app.matches`/`app.bills`
+fixtures; `openTabQuantities` aggregated correctly across sessions and products; the real
+concurrency guarantee (6 concurrent reservations, a stock of 5, exactly 5 win); foreign-key
+refusal for a non-existent product (mapped to the same 400 `cafeOrders.service.js` itself gives,
+not a raw SQL error); transaction rollback (a failed second insert leaves no row behind, not even
+the first one in the same transaction); isolation.
+
+StockMovements (11 tests): restock/adjustment/waste with correct `balance_after`; waste always
+stored as a negative quantity regardless of the input's sign; stock boundaries (never below 0,
+never above 1,000,000, exactly-at-the-maximum accepted); manual operations refused for untracked
+and for missing products; `recordInitialStock` only for tracked products with real starting
+stock (confirmed `null` for zero-stock and for untracked products); `listMovements` filtering by
+product/type/club-local date range and pagination; the real concurrency guarantee (10 concurrent
+requests, a stock of 5, exactly 5 win, `balance_after` a true 4-3-2-1-0 permutation); a raw
+foreign-key violation refused by the database itself; transaction rollback (a failed movement
+insert leaves the stock change itself rolled back too); isolation.
+
+No schema change was needed or made - the committed step 2.3 schema (`app.cafe_orders`,
+`app.stock_movements`, both already linked to `app.bills` via the `ALTER TABLE` once that table
+existed) was already adequate for every rule above.
+
+**A real bug found and fixed during this step's own development** (not a database-integrity
+issue - a parameter-type ambiguity in `increase`/`decrease`'s SQL): `stock_quantity <= $3 - $2`
+failed with PostgreSQL's own `42725` ("operator is not unique... add explicit type casts") because
+two untyped parameters either side of `-` leaves the server unable to infer a type. Fixed by
+casting both sides explicitly (`$3::int - $2::int`) before any test was taken as passing.
+
+##### Regression checks
+
+| Command | With PostgreSQL configured (run twice) | Without (the ordinary state) |
+|---|---|---|
+| `npm.cmd test` | **491 passed, 0 failed, 0 skipped**, both times | 307 passed, 0 failed, **17 skipped** (cleanly) |
+| `npm.cmd run test:browser` | **780 passed, 0 failed** (15 suites) - identical to every prior baseline | unaffected either way |
+
+Each new test file alone, **three times**: CafeOrders 15/15 every time; StockMovements 11/11
+every time. All fifteen `postgres*.test.js` files run together, **three times** - 191/191 every
+time, no deadlocks or races (the step 2.5 advisory-lock fix holds with a fifteenth file). After
+every run, the test database (`snooker_club_pro_test`) was confirmed left clean - no `app`
+schema, no leftover tables. No unrelated or intermittent failure was observed during this step's
+verification.
+
+Confirmed: MongoDB remains the application's only active database; `cafeOrders.service.js`,
+`stock.service.js`, their routes and controllers are unchanged; `bills.pg.service.js` was not
+touched; no production data was changed; nothing was deployed.
+
+##### Unverified behaviour and remaining risks
+
+- **Bill integration** (`takeForBill`, `claimForBill`/`releaseClaim`, `recordSale`/
+  `restoreForCancelledBill`) was not built (explicitly deferred above, with its required
+  transaction boundary documented) - a future step if Café Orders is ever fully cut over in
+  Phase 3, once it can share `bills.pg.service.js`'s own transaction.
+- **Login/cookie/middleware flow, and the café/products/stock routes/controllers themselves, are
+  untouched** - this step proves the data-layer rules only; wiring Café Orders into the actual
+  app is Phase 3 work.
+- **Counter still has no PostgreSQL pilot** - the one remaining model completely untouched by
+  Phase 2.
+
 ### Phase 3 — Port services, one at a time (tests after each)
 
 Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
@@ -2115,7 +2251,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Phase 2, Step 2.12 — Sessions pilot: real one-transaction start/end, the sessions_one_open_per_table guarantee proven with genuine concurrency, FK compatibility (433 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped)
 - [x] Phase 2, Step 2.13 — Players pilot: duplicate-name rules (active vs inactive message), deactivate/reactivate, real concurrency proof, FK compatibility with match_players (445 server / 780 browser with PostgreSQL configured, 12 new tests, 0 skipped); player history explicitly deferred (no Matches pilot yet)
 - [x] Phase 2, Step 2.14 — Matches pilot: the session-lock-before-create transaction, player/team rules, real concurrency proof (463 server / 780 browser with PostgreSQL configured, 18 new tests, 0 skipped); found (did not fix) a real Sessions-pilot timing bug; bill joins and changeResult explicitly deferred
-- [ ] Phase 2, Step 2.15 — CafeOrder/StockMovement pilot, per the Phase 3 order above (not started; awaiting approval)
+- [x] Phase 2, Step 2.15 — CafeOrders/StockMovements pilot: tab lifecycle with a real product-row-lock guarantee against overselling reserved stock, atomic stock increase/decrease proven with genuine concurrency, transaction-paired movement history (491 server / 780 browser with PostgreSQL configured, 26 new tests, 0 skipped); bill integration (takeForBill, claimForBill/releaseClaim, recordSale/restoreForCancelledBill) explicitly deferred with its transaction boundary documented
+- [ ] Phase 2, Step 2.16 — Counter pilot, or begin Phase 3 cutover planning, per the Phase 3 order above (not started; awaiting approval)
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
