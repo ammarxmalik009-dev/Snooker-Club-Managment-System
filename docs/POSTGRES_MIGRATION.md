@@ -1081,6 +1081,103 @@ data was changed; nothing was deployed.
   PostgreSQL in step 2.3's own notes) has not actually been built or tested yet - this pilot's
   tests supply plain string bill numbers directly.
 
+#### Step 2.7 — Payments pilot: real concurrency, no mocks — done
+
+**Scope:** `server/services/payments.pg.service.js` reuses `bills.pg.service.js`'s `mapBillRow`
+(step 2.6) rather than inventing a parallel shape - following the established repository
+pattern, not a new architecture. It is a standalone pilot: not wired into any route, does not
+call and is not called by `payments.service.js` (MongoDB).
+
+**Database guarantees actually implemented - at the transaction/locking level, not an
+application-code pre-check:**
+- `recordPayment()` runs inside **one** PostgreSQL transaction (`withTransaction`, step 2.2):
+  `SELECT ... FOR UPDATE` the bill row, then the player's `bill_players` row - both lock
+  immediately, so any other transaction touching the *same* bill or the *same* player row
+  **blocks** until this one commits or rolls back. Only once both are locked are the balances
+  checked in application code (now guaranteed stable - nothing else can change them underneath),
+  and only then are both rows updated and the payment inserted, all before `COMMIT`.
+- This is **stronger** than `payments.service.js`'s own approach, not a copy of it:
+  MongoDB (without a replica set) can only make ONE document's update atomic, so that service
+  saves the `Payment` record as a *separate* step and manually reverses the bill's `$inc` if that
+  insert fails. Here, the bill update, the player update and the payment insert are all **one**
+  transaction - a failure anywhere rolls back everything together; no compensation logic exists
+  or is needed.
+
+**A real bug this step found and fixed, not designed around in advance:** the first version used
+two *separate* conditional `UPDATE ... WHERE amount_paid <= total - $1` statements (bill, then
+player) - the same idea as `payments.service.js`'s single-document update, just split across two
+tables. A real test caught the problem: when the bill's own condition happened to hold but the
+player's did not, the bill had *already* been incremented (inside the still-open transaction) by
+the time the code tried to explain why the payment was refused - producing a confusing, wrong
+balance in the error message (the transaction still rolled back correctly, so no bad data was
+ever saved, but the message lied about why). Fixed by locking both rows first and validating
+*before* writing anything, as described above.
+
+##### What was verified - with real, simultaneous requests, not mocks
+
+Against the real local PostgreSQL, using bills created by the real `calculateBill()` (step 2.6's
+pattern) on minimal fixture rows (no Sessions/Payments-adjacent service exists):
+1-2. **Recording and retrieving**: a payment is saved, returned, and listed for its bill.
+3. **Bill association / foreign key**: an unknown bill → `"Bill not found"` (404), the same
+   message `payments.service.js` gives.
+4. **Payer validation**: a name that isn't one of the bill's players → 400; a player with a
+   zero share (set directly to test this exact case) → *"doesn't owe anything"* (409).
+5. **Amount validation**: `0` and a negative amount are both refused cleanly (the schema's own
+   `CHECK (amount >= 1)`, step 2.3, surfaced as a normal rejection, not a raw SQL error leaking out).
+6. **Partial payments and full payment**: two partial payments from one player reach their exact
+   share and the bill correctly stays `partially_paid` until the *other* player also pays in
+   full, at which point it becomes `paid` with `balanceDue: 0`.
+7. **Overpayment refused, at both levels**: one paisa over a player's own share → *"only owes
+   Rs 0.00 more"* (exact remaining balance, not a rounded figure); a further payment after a
+   player's own share is fully paid → the same; a payment after the bill itself is fully paid →
+   *"already fully paid"*.
+8. **Concurrent payments on the SAME bill - the actual overpayment-prevention proof**: 5
+   *simultaneous* (`Promise.allSettled`, real parallel requests, not sequential awaits) attempts
+   of Rs 90 each against a Rs 300 bill (mathematically, at most 3 can fit: 3 × 90 = 270 ≤ 300, a
+   4th would need ≤ 30 remaining). Result: **exactly 3 succeeded, 2 were refused with 409** - and,
+   critically, the number of `payments` rows actually in the database (3), their sum (27000), the
+   bill's own `amount_paid` (27000) and the player's own `paid_amount` (27000) **all agree
+   exactly** - nothing over-counted, nothing lost, nothing desynced.
+9. **Two different players paying concurrently on the same bill** don't interfere with each
+   other - both succeed, the bill correctly reaches `paid` with the exact combined total.
+10. **Transaction rollback**: an invalid payment method (the schema's `CHECK` on `method`, step
+    2.3) rolls back the *entire* attempt - the bill's `amount_paid`, the player's `paid_amount`
+    and the payment row count are all confirmed unchanged afterward, not just "probably fine."
+11. **Cancelled bills** refuse any payment, matching `payments.service.js`.
+- **Idempotency**: `models/Payment.js` defines **no idempotency key or mechanism** - per the
+  task's own instruction, this was therefore *not* built or tested as a database guarantee; a
+  test instead confirms two identical requests are recorded as two separate payments, which is
+  `payments.service.js`'s own behaviour today too (not a gap this pilot introduced).
+- **Isolation**: confirmed (no `mongoose`/`server/models/` in the pilot's full require tree).
+
+##### Regression checks
+
+| Command | With PostgreSQL configured (run twice) | Without (the ordinary state) |
+|---|---|---|
+| `npm.cmd test` | **371 passed, 0 failed, 0 skipped**, both times | 307 passed, 0 failed, **8 skipped** (cleanly) |
+| `npm.cmd run test:browser` | **780 passed, 0 failed** (15 suites) | unaffected either way |
+
+All seven `postgres*.test.js` files (now including this one) run together, **three times**, and
+the concurrency test alone run **three times** in isolation - no flakiness, the same 3-succeed/
+2-refused outcome every time (deterministic because all five concurrent attempts request the
+same amount, so which specific requests "win" the race never changes how many can).
+
+Confirmed: MongoDB remains the application's only active database; no route or controller reads
+this pilot; every MongoDB test still uses its own throw-away database, untouched; no production
+data was changed; nothing was deployed.
+
+##### Remaining risks and unverified behaviour
+
+- **Users still not ported** - every `*_user_id` across every pilot, including `received_by_user_id`
+  here, stores `null` for a real actor (documented since step 2.4, unchanged).
+- **A real Sessions/Bookings service still does not exist** - Bookings' `btree_gist` `EXCLUDE`
+  constraint (step 2.3) remains unverified against an actual service layer, only against raw SQL
+  directly (step 2.3's own test). Railway's `btree_gist` availability is still unconfirmed.
+- **`auth_sessions` has no TTL equivalent** - still open (carried over since step 2.3).
+- **This pilot's locking fix (`SELECT ... FOR UPDATE`) is specific to Payments** - a future
+  Bookings pilot will need its own concurrency-safety design (the `EXCLUDE` constraint, not this
+  pattern), not an assumption that this same fix applies there unchanged.
+
 ### Phase 3 — Port services, one at a time (tests after each)
 
 Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
@@ -1145,7 +1242,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Phase 2, Step 2.4 — row-mapper layer + standalone Settings service pilot, tested against the real local PostgreSQL (328 server / 780 browser with it configured, 16 new tests, 0 skipped); found and fixed a real actor-mapping edge case; the Users FK gap is documented, not worked around
 - [x] Phase 2, Step 2.5 — Categories/Products (real FK + unique constraints) + match_players/match_teams fixture-only ordered-row proof (348 server / 780 browser with PostgreSQL configured, 19 new tests, 0 skipped); found and fixed a genuine test-concurrency bug (shared schema raced across parallel test files - advisory lock with a dedicated client)
 - [x] Phase 2, Step 2.6 — Bills repository pilot: ordered line items/players, all three partial-unique rules, FK, rollback, real calculateBill() numbers (358 server / 780 browser with PostgreSQL configured, 10 new tests, 0 skipped); confirmed the step 2.5 lock fix holds with a sixth test file
-- [ ] Phase 2, Step 2.7 — Payments (the overpayment-prevention atomic update) or Bookings (the btree_gist EXCLUDE constraint against a real service), per the Phase 3 order above
+- [x] Phase 2, Step 2.7 — Payments pilot: SELECT...FOR UPDATE locking, overpayment prevention proven with 5 real concurrent requests, transaction rollback (371 server / 780 browser with PostgreSQL configured, 13 new tests, 0 skipped); found and fixed a real ordering bug in the first locking design
+- [ ] Phase 2, Step 2.8 — Bookings (the btree_gist EXCLUDE constraint against a real service) or Users, per the Phase 3 order above
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
