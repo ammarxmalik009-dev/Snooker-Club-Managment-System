@@ -754,6 +754,118 @@ row-mapper layer (UUID↔string, the `position` columns, computing `phone_digits
 `auth_sessions` expiry cleanup job; the Railway `btree_gist` confirmation; a `DATABASE_URL` for
 Railway itself (still a placeholder everywhere it's mentioned).
 
+#### Step 2.4 — Row mappers and a Settings service pilot — done
+
+**Scope:** a small, reusable row-mapper layer built for the conversions this pilot actually
+demonstrated a need for (not speculatively for all 16 models), plus one standalone PostgreSQL
+Settings service, tested on its own against the real local database. **Nothing in the running
+application calls any of this** - `server/app.js`, `server/server.js` and every route are
+untouched; MongoDB stays the only database the app actually uses.
+
+##### Row-mapper layer (`server/db/rowMappers.js`)
+
+Built only after confirming each conversion was real, by querying the actual local PostgreSQL
+directly (not assumed from documentation):
+
+| Conversion | What was actually found | Function |
+|---|---|---|
+| `bigint` (every money column) | `pg` returns it as a **string** (`"1000"`, not `1000`) - confirmed: `SELECT 1000::bigint` → JS `typeof` is `"string"`. The app's amounts never exceed `MAX_PRICE` (10,000,000), far under `Number.MAX_SAFE_INTEGER`, so converting loses nothing | `toMoney` - also keeps `null` as `null` (never set) **distinct from `0`** (explicitly switched off) - the two must never collapse into each other, per `models/Setting.js`'s own comment |
+| `uuid` | already a plain JS string from `pg` - confirmed, not assumed | `toId` - exists to name the conversion in one place, the same way `cleanJson.js` names `_id → id` today |
+| plain snake_case columns | e.g. `minimum_billable_minutes` | `snakeToCamel` - for ordinary one-to-one columns **only**; a column needing reshaping (see `gameRates` below) is mapped explicitly instead, never guessed |
+| flattened "who did it" (`<prefix>_user_id/_name/_username`, step 2.3) | → `{ user, name, username }` or `null` | `actorFromRow` - a real edge case found while testing (not designed up front): until Phase 3 ports Users, a real actor's `user_id` is stored as `null` (see below) while `name`/`username` ARE still known - Mongoose's embedded `actorSchema` never has that combination, so this had to check presence on name/username, not on `user_id` alone, or it would have silently thrown away a known name |
+
+`timestamptz` columns needed no conversion function: `pg` already returns a JS `Date`, exactly
+like Mongoose - `res.json()` serializes both to an ISO string the same way.
+
+##### Settings service pilot (`server/services/settings.pg.service.js`)
+
+A **separate, standalone module** - it neither calls nor is called by
+`server/services/settings.service.js` (MongoDB); nothing wires it into a route. It reuses, rather
+than re-implements, the two shared pieces that already define Settings' business rules, so the
+two paths can never quietly disagree:
+- `config/gameModes.js`'s `resolveGameRates` (admin value → legacy field → registry default)
+- `models/schemas/actor.js`'s `actorFrom` (building an actor record from a logged-in user)
+
+**Create-once, race-free initialization**, verified directly (not assumed): PostgreSQL's
+`INSERT ... ON CONFLICT (key) DO UPDATE SET key = EXCLUDED.key RETURNING *` - a genuine no-op
+"update" so the row's own unique `key` constraint (step 2.3) is what actually serializes
+concurrent calls, the same role MongoDB's upsert + unique index plays today. Tested with 20
+truly concurrent calls (`Promise.all`): exactly one row, every time, both as a standalone probe
+and through the real service.
+
+**A genuine architectural finding, not a design choice made up front:** `app.settings
+.updated_by_user_id` is a `uuid` **foreign key** to `app.users(id)` (step 2.3). Attempting to
+store a real admin's actual id there failed with `violates foreign key constraint
+"settings_updated_by_user_id_fkey"` - because **Users has not been ported to PostgreSQL yet**
+(that's Phase 3): `app.users` has no real rows, and a logged-in person's real id today is a
+MongoDB ObjectId (24 hex characters), never a PostgreSQL `uuid`, so it could never have matched
+anyway. Resolved by:
+1. `actorUserIdOrNull()`: only a value that is already *shaped* like a uuid is even attempted;
+   anything else (every real actor today) becomes `null` before it reaches the database.
+2. The name/username are **still stored and returned** even when the id is `null` - readable
+   audit history survives, matching the actual intent behind Mongo's embedded actor copy.
+3. The foreign key is **deliberately left in place**, not removed or weakened: a test proves it
+   correctly refuses a uuid-shaped id that matches no real row, demonstrating the constraint
+   actually protects referential integrity (not just that it exists in the schema) - once Phase 3
+   populates real `app.users` rows, the exact same code starts linking to them correctly, with
+   no further change needed here.
+
+**Preserved exactly, field for field, from `settings.service.js` (MongoDB):** every default
+(`minimumBillableMinutes: 15`, `billingIncrementMinutes: 5`, `taxEnabled: false`, `currency:
+"PKR"`, `backupEnabled: true`, `backupIntervalHours: 12`, `backupKeepCount: 30`, …), the
+`framePrice` ↔ `gameRates.frame` "must agree if both are sent" 400 rule, and the "0 means switched
+off, not yet-another-default" distinction for every rate.
+
+##### Tests (`server/tests/postgresSettings.test.js`)
+
+- **Row-mapper unit tests (4, no database - always run, proven in this report):** `toMoney`,
+  `snakeToCamel`, `toId`, `actorFromRow` - including the "name known, id unknown" case the
+  service pilot actually hit.
+- **Settings pilot (12 checks inside one skippable test, needs `PG_TEST_DATABASE_URL` at
+  `127.0.0.1:5433` - the verified local instance, step 2.2A):** creating the default row exactly
+  once; every stored default matches `Setting.js`; an unset rate is `null` raw but resolves to the
+  registry default through `describeSettings` (reusing the shared function); re-initializing
+  never overwrites a value already changed; a rate update is stored precisely and other fields
+  stay untouched; **the foreign-key finding above, reproduced on demand**; a rate explicitly set
+  to `0` stays `0` (never falls back to the default); the `framePrice`/`gameRates.frame` conflict
+  rule (400) and the matching-values case (accepted); `MAX_PRICE` round-trips exactly as a number
+  through a real update and re-read; 20 concurrent initializations still produce exactly one row;
+  and a structural check that this pilot's own require chain never touches `mongoose`.
+
+Isolation: everything happens inside the test database's own `app` **schema**, dropped before and
+after (confirmed clean by direct inspection) - never the whole database, never anything outside
+that schema, never MongoDB.
+
+**Actually run, against the real local PostgreSQL 18.6 (127.0.0.1:5433), twice in a row:** **16
+passed, 0 failed**, both times.
+
+##### Regression checks
+
+| Command | With PostgreSQL configured | Without (the ordinary state) |
+|---|---|---|
+| `npm.cmd test` | **328 passed, 0 failed, 0 skipped** | 305 passed, 0 failed, **4 skipped** (the four PostgreSQL integration tests, cleanly - the row-mapper unit tests still ran and passed) |
+| `npm.cmd run test:browser` | **780 passed, 0 failed** (15 suites) | unaffected either way |
+
+Confirmed: MongoDB remains the application's only active database (no route or controller reads
+this module); every MongoDB-backed test above still uses its own throw-away database, untouched;
+no production database was touched; nothing was deployed.
+
+##### Remaining conversion risks and open questions
+
+- **`updated_by_user_id` stays `null` for every real call until Phase 3 ports Users** - documented
+  above, not a bug. Phase 3 must re-check `actorUserIdOrNull` once real `app.users` rows exist (it
+  may simply no longer be needed once every actor genuinely has a PostgreSQL id).
+- **`auth_sessions` has no TTL equivalent** (carried over from step 2.3, still open): PostgreSQL
+  needs an explicit periodic cleanup job; Settings' own `backupIntervalHours`/`backupKeepCount`
+  fields are unaffected by this, but it is Phase 3 (users/auth) work either way.
+- **Railway's `btree_gist` availability is still unconfirmed** (carried over from step 2.3) - this
+  step didn't touch bookings, so nothing new to add here, but it remains open before Phase 5.
+  `gameRates`'s nullable-rate design and the `position`-column approach for embedded arrays (step
+  2.3) were not exercised by this pilot (Settings has neither) - still to be proven once a model
+  that has them (e.g. Bills, Matches) is ported.
+
+Test results after 2.4: see "Regression checks" above.
+
 ### Phase 3 — Port services, one at a time (tests after each)
 
 Order: settings → users/auth → tables → customers → categories/products/stock → players → sessions →
@@ -815,7 +927,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Phase 2, Step 2.2 — `pg` dependency, connection pool, transaction helpers, smoke test (303 server / 780 browser, PostgreSQL tests skipped at this point - no local server yet)
 - [x] Phase 2, Step 2.2A — real local PostgreSQL 18.6 set up (portable, port 5433); smoke test actually connected and passed (303/0/0 skipped); fixed a word-boundary bug in testDb.pg.js found in the process
 - [x] Phase 2, Step 2.3 — full schema (20 tables) + migration runner, tested against the real local PostgreSQL (312 server / 780 browser with it configured; 9 new tests, 0 skipped); Railway `btree_gist` still unconfirmed
-- [ ] Phase 2, Step 2.4 — the Phase 3 row-mapper layer (UUID↔string, position columns, derived fields), starting with the first real service port (settings)
+- [x] Phase 2, Step 2.4 — row-mapper layer + standalone Settings service pilot, tested against the real local PostgreSQL (328 server / 780 browser with it configured, 16 new tests, 0 skipped); found and fixed a real actor-mapping edge case; the Users FK gap is documented, not worked around
+- [ ] Phase 2, Step 2.5 — a second, harder pilot (one with a relationship and/or an embedded array, e.g. Tables or Products/Categories), per the Phase 3 order above
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
