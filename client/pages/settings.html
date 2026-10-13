@@ -138,6 +138,9 @@
                         <div class="alert alert-warning" id="backup-drive-warning" role="alert" hidden>
                             <span>The backup folder is on the system drive. If Windows or this drive breaks, the backups are lost too. Set <code>BACKUP_DIR</code> in .env to another drive, a USB drive or a OneDrive folder.</span>
                         </div>
+                        <div class="alert alert-warning" id="backup-dir-unconfigured-warning" role="alert" hidden>
+                            <span><code>BACKUP_DIR</code> is not set - backups are being written to a folder chosen automatically next to the app. If this app is running somewhere other than the club PC (a container, a cloud host), confirm that folder actually survives a restart or redeploy before relying on it.</span>
+                        </div>
                         <dl class="backup-status" id="backup-status">
                             <dt>Folder</dt><dd id="backup-folder">—</dd>
                             <dt>Last backup</dt><dd id="backup-last">—</dd>

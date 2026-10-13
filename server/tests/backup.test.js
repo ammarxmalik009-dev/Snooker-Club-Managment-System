@@ -186,6 +186,7 @@ test("API: admin sees the status, makes a backup and downloads it; staff and cas
   const status = await api("GET", "/backups");
   assert.equal(status.status, 200);
   assert.equal(status.body.data.folder, BACKUP_DIR);
+  assert.equal(status.body.data.configured, true, "Step 38: this test always sets BACKUP_DIR explicitly, so the API must report it as configured");
   assert.equal(status.body.data.intervalHours, 12);
   assert.deepEqual(status.body.data.files, []);
 

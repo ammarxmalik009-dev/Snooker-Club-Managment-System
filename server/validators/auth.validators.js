@@ -3,6 +3,7 @@
 
 const { body, param, query } = require("express-validator");
 const { ROLES } = require("../models/User");
+const { isValidActorIdentity } = require("../models/schemas/actor");
 
 const USERNAME_PATTERN = /^[a-z0-9._-]{3,30}$/;
 
@@ -21,7 +22,16 @@ const pageAccessRules = [
     .isLength({ min: 1, max: 200 }).withMessage("Invalid page address"),
 ];
 
-const idRules = [param("id").isMongoId().withMessage("Invalid user id")];
+// A user id may be a real MongoDB ObjectId (today's only actual case) OR a PostgreSQL UUID
+// (Phase 3 identity-compatibility change - not yet produced by anything active, but accepted
+// here so this validator can never be the reason a future, correctly-authenticated
+// PostgreSQL-authoritative request is refused). Reuses the EXACT SAME check
+// models/schemas/actor.js's own schema-level validator uses, so the two can never quietly
+// disagree about what counts as a valid user id. Scoped to THIS file's own user-id routes only
+// (/api/users/:id, /api/users/:id/password) - every other resource's own id validator
+// (tables, customers, products, categories, sessions, bookings, matches, bills...) still uses
+// plain .isMongoId() elsewhere, unchanged.
+const idRules = [param("id").custom(isValidActorIdentity).withMessage("Invalid user id")];
 
 const nameRule = (required) => {
   const chain = body("name");

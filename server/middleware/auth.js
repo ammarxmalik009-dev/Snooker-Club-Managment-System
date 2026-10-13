@@ -5,11 +5,19 @@
 //   requirePermission 403 if the logged-in user's role lacks the permission (config/permissions.js)
 //   pageGuard         the same rules for HTML pages: not logged in -> login page; no permission -> dashboard
 //   sameOriginOnly    refuses changes (POST/PATCH/DELETE) sent from another website
+//
+// Phase 3, Group 2: this requires the cutover adapter (authCutover.service.js), not
+// auth.service.js directly - the ONLY change this step made to this file, the same pattern
+// Group 1 used for Settings. The adapter itself decides MongoDB vs PostgreSQL per
+// server/config/cutover.js's own selector; "users" is NOT a recognised route group there yet
+// (deliberately), so the adapter always delegates to MongoDB today - this file's own behaviour
+// is completely unchanged until that changes. See docs/POSTGRES_MIGRATION.md's Phase 3 Group 2
+// section for the full design.
 
 const path = require("node:path");
 const AppError = require("../utils/AppError");
 const { roleHasPermission, PERMISSIONS, PAGE_PERMISSIONS } = require("../config/permissions");
-const authService = require("../services/auth.service");
+const authService = require("../services/authCutover.service");
 const { pageNotFound } = require("./notFound");
 
 async function loadUser(req, res, next) {

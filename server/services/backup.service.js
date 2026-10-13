@@ -186,10 +186,16 @@ function fileStamp(date) {
 }
 
 // Is the backup folder on the same drive as Windows? Then a broken PC can take the backups with it.
+// `configured` (Step 38) is a separate, platform-agnostic signal: whether BACKUP_DIR was actually
+// set, rather than falling back to the auto-computed default. onSystemDrive only ever means
+// anything on the club PC (it is always false on Linux/Railway, by construction - there is no
+// "system drive" there); a deployment with BACKUP_DIR unset gets NO onSystemDrive warning on a
+// host where that check cannot apply at all, so `configured` exists to still say "this folder's
+// durability has not been confirmed" instead of silently implying everything is fine.
 function describeBackupFolder(folder = env.backupDir) {
   const systemDrive = (process.env.SystemDrive || "C:").toUpperCase();
   const onSystemDrive = process.platform === "win32" && path.parse(path.resolve(folder)).root.toUpperCase().startsWith(systemDrive);
-  return { folder, onSystemDrive };
+  return { folder, onSystemDrive, configured: env.backupDirConfigured };
 }
 
 async function listBackups(folder = env.backupDir) {

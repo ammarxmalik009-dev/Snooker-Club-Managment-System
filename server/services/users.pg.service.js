@@ -18,14 +18,23 @@
 // Phase 3, Group 2 (this addition) builds those three, plus listUsers/listActiveAdmins and
 // touchLastLogin/getUserByUsernameForLogin (used by server/services/auth.pg.service.js's own
 // login) - additive only, nothing above this comment was changed. These functions are real,
-// tested PostgreSQL code, but are NOT wired into any route or CLI script: see
-// docs/POSTGRES_MIGRATION.md's Phase 3 Group 2 section for the exact, confirmed reason
-// (models/schemas/actor.js's actorSchema requires a real MongoDB ObjectId for `user`, which a
-// PostgreSQL-authoritative user's UUID id cannot satisfy, and every other still-MongoDB-
-// authoritative write in the app calls actorFrom(req.user) - activating this for real HTTP
-// traffic today would break every other authenticated write in the app, not just Users/Auth's
-// own routes). "users" was deliberately NOT added to server/config/cutover.js's
-// KNOWN_ROUTE_GROUPS for the same reason - there is no way to accidentally turn this on.
+// tested PostgreSQL code. They are NOT wired into any HTTP route (server/controllers/
+// users.controller.js still delegates through server/services/usersCutover.service.js's own
+// selector, which only ever reaches MongoDB today - "users" is deliberately NOT in
+// server/config/cutover.js's KNOWN_ROUTE_GROUPS, so there is no way to accidentally turn this
+// on). createFirstAdmin/listActiveAdmins/resetAdminPassword ARE wired, directly (bypassing the
+// cutover adapter on purpose, the same way the MongoDB admin scripts bypass it too), into the
+// PostgreSQL-only CLI commands added in Step 32: server/scripts/createAdminPg.js and
+// server/scripts/resetAdminPasswordPg.js.
+//
+// Historical note, since fixed (Steps 27-29): activating "users" for real HTTP traffic used to
+// be blocked by an identity-format mismatch - models/schemas/actor.js's actorSchema required a
+// real MongoDB ObjectId for `user`, which a PostgreSQL-authoritative user's UUID id could not
+// satisfy, and every other still-MongoDB-authoritative write in the app calls
+// actorFrom(req.user). actorSchema.user is now a plain `String` validated by
+// `isValidActorIdentity` (ObjectId OR UUID), so this no longer blocks activation on its own -
+// see docs/POSTGRES_MIGRATION.md's Phase 3 Group 2 section and Steps 33-34's audit/readiness
+// write-ups for what activation still actually requires today.
 //
 // Session invalidation on deactivation/password change (users.service.js's own
 // endAllSessionsForUser calls) is now wired in too, closing a real gap step 2.8's own pilot had
@@ -33,7 +42,7 @@
 // not assumed to already work.
 
 const { query, withTransaction } = require("../config/db.pg");
-const { toId, actorFromRow, actorFrom, actorUserIdOrNull } = require("../db/rowMappers");
+const { toId, actorFromRow, actorFrom, actorUserIdOrNull, identityOf } = require("../db/rowMappers");
 const { hashPassword, passwordProblem } = require("../utils/password"); // pure Node crypto, no mongoose
 const authSessionsPg = require("./authSessions.pg.service");
 const AppError = require("../utils/AppError");
@@ -138,7 +147,14 @@ async function createUser({ name, username, role, password }, actorUser = null) 
 // transaction rolls back (nothing is half-applied), rather than being written then undone.
 async function updateUser(id, changes, actorUser) {
   if (changes.role !== undefined) checkRole(changes.role);
-  const isSelf = actorUser && String(actorUser._id) === String(id);
+  // identityOf, not a direct .id/._id read - found and fixed during Phase 3's own integration-
+  // readiness audit: the old direct `actorUser._id` check silently evaluated to `false` for a
+  // PostgreSQL-shaped actor (which has no `._id` at all), meaning this exact self-protection
+  // safeguard would NOT have triggered for a PostgreSQL-authoritative admin acting on
+  // themselves - a real authorization bug, not merely a missing feature. identityOf uses the
+  // same "prefer .id, fall back to ._id" rule as rowMappers.js's own actorFrom, so both ends of
+  // a self-comparison are read the same way regardless of which backend's actor shape it is.
+  const isSelf = actorUser && String(identityOf(actorUser)) === String(id);
   if (isSelf && changes.active === false) {
     throw new AppError("You can't deactivate your own account. Ask another admin.", 409);
   }
@@ -241,7 +257,7 @@ async function setPassword(id, password, actorUser, { currentSessionId = null } 
   );
   if (result.rows.length === 0) throw new AppError("User not found", 404);
 
-  const isSelf = actorUser && String(actorUser.id ?? actorUser._id) === String(id);
+  const isSelf = actorUser && String(identityOf(actorUser)) === String(id); // same identityOf rule as updateUser's own isSelf, above
   await authSessionsPg.endAllSessionsForUser(id, { exceptSessionId: isSelf ? currentSessionId : null });
   return mapUserRow(result.rows[0]);
 }

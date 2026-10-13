@@ -32,6 +32,36 @@ function readTimeZone(value, fallback) {
 const nodeEnv = process.env.NODE_ENV || "development";
 const isProduction = nodeEnv === "production";
 
+// Step 38: the same "fail loudly in production, warn in development" rule AUTH_SECRET already
+// uses below, now also applied to the database address itself. Without this, a production
+// deployment that forgot to set MONGODB_URI would silently fall back to
+// "mongodb://127.0.0.1:27017/snooker_club_pro" - on a real host that address usually has nothing
+// listening on it, so the app still refuses to start (connectToDatabase's own retry/exit-1 logic
+// catches it), but the failure message then talks about "127.0.0.1:27017" as if that were a
+// real, configured value, which is confusing, not a clear "you forgot to set MONGODB_URI".
+// Development behaviour is UNCHANGED: the local default is still used, with no warning (every
+// existing local/test workflow already relies on this).
+function readMongoUri(value) {
+  if (value && value.trim()) return value.trim();
+  if (isProduction) {
+    throw new Error("MONGODB_URI is not set. A production deployment must set it explicitly - there is no safe default to fall back to.");
+  }
+  return "mongodb://127.0.0.1:27017/snooker_club_pro";
+}
+
+// Step 38: PG_CUTOVER_ROUTES (server/config/cutover.js) names which route groups PostgreSQL
+// should answer for; those adapters only work once DATABASE_URL is also set (server/config/
+// db.pg.js's getPool() throws clearly, but only when something first queries it, not at
+// start-up). Naming a route group without DATABASE_URL is always a misconfiguration - catching
+// it here, at start-up, in every environment (not just production), is strictly earlier and
+// clearer than waiting for the first request that needs it to fail.
+function assertCutoverRoutesHaveDatabaseUrl(routesValue, databaseUrl) {
+  const hasRoutes = String(routesValue || "").split(",").map((item) => item.trim()).filter(Boolean).length > 0;
+  if (hasRoutes && !databaseUrl) {
+    throw new Error("PG_CUTOVER_ROUTES names a route group, but DATABASE_URL is not set - PostgreSQL cutover needs both.");
+  }
+}
+
 // Secret used to protect login sessions (it never leaves the server).
 // Must be a long random value in .env. Without it, development uses a temporary
 // random secret (everyone is logged out on restart); production refuses to start.
@@ -112,16 +142,19 @@ function readAllowedOrigins(value) {
   });
 }
 
+const databaseUrl = process.env.DATABASE_URL || "";
+assertCutoverRoutesHaveDatabaseUrl(process.env.PG_CUTOVER_ROUTES, databaseUrl);
+
 const env = {
   nodeEnv,
   isProduction,
   port: readPort(process.env.PORT, 3000),
-  mongoUri: process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/snooker_club_pro",
+  mongoUri: readMongoUri(process.env.MONGODB_URI),
   clubTimeZone: readTimeZone(process.env.CLUB_TIMEZONE, "Asia/Karachi"),
   // Phase 2 (PostgreSQL foundation, optional): empty unless someone sets it. Nothing reads this at
   // start-up and no connection is made just because it's set - only server/config/db.pg.js, and only
   // when something actually calls it. The app's real database today is MongoDB (mongoUri above).
-  databaseUrl: process.env.DATABASE_URL || "",
+  databaseUrl,
 
   // ---- Login (Phase 8) ----
   authSecret: readAuthSecret(process.env.AUTH_SECRET),
@@ -138,6 +171,12 @@ const env = {
   // Folder for the XML backups. Put it OUTSIDE the C: drive (D:, a USB drive or a OneDrive folder),
   // so the backups survive when Windows or the system drive breaks. Only set here, never from a web page.
   backupDir: readBackupDir(process.env.BACKUP_DIR),
+  // Step 38: whether BACKUP_DIR was actually set, vs falling back to the auto-computed default
+  // next to the app's own data. The default is a reasonable choice on the club PC (still warned
+  // about via onSystemDrive, below) but is not a safe assumption anywhere else this app might
+  // run (a container, a cloud host) - nothing here claims to know whether backupDir itself is a
+  // durable location; this flag only reports whether BACKUP_DIR was explicitly configured at all.
+  backupDirConfigured: Boolean(process.env.BACKUP_DIR && process.env.BACKUP_DIR.trim()),
 };
 
 // Empty = %LOCALAPPDATA%\SnookerClubPro\backups (next to the database, so on the system drive:

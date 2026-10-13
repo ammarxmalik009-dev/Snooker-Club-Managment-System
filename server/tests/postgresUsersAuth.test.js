@@ -177,6 +177,28 @@ test("Phase 3 Group 2: Users/Auth PostgreSQL service layer - login, sessions, se
     );
   });
 
+  await t.test("8a. self-protection works with the REAL PostgreSQL actor shape (.id, no ._id) - not just a hand-built MongoDB-style object", async () => {
+    // admin1 here is exactly what usersPg.createUser() actually returned in test 1 - a plain
+    // { id, name, username, ... } object, never reshaped to look like a Mongoose document. The
+    // step 2.8 pilot's own original self-protection test (server/tests/postgresUsers.test.js)
+    // happened to pass a hand-built `{ _id: admin1.id, ... }` actor, which accidentally matched
+    // the OLD buggy check and never exercised this real shape - found while building Phase 3's
+    // integration foundation, not assumed safe just because an older test was green.
+    await assert.rejects(
+      usersPg.updateUser(admin1.id, { active: false }, admin1),
+      (error) => { assert.equal(error.statusCode, 409); assert.match(error.message, /can't deactivate your own account/); return true; }
+    );
+    await assert.rejects(
+      usersPg.updateUser(admin1.id, { role: "staff" }, admin1),
+      (error) => { assert.equal(error.statusCode, 409); assert.match(error.message, /can't remove your own admin role/); return true; }
+    );
+    // And the inverse: this real shape must NOT be mistaken for "self" when acting on someone
+    // else entirely - a different, genuine user id.
+    const other = await usersPg.createUser({ name: "Not Self", username: "not.self", role: "staff", password: STRONG_PASSWORD }, admin1);
+    const changed = await usersPg.updateUser(other.id, { active: false }, admin1);
+    assert.equal(changed.active, false, "acting on a genuinely different user is never blocked by self-protection");
+  });
+
   await t.test("9. createFirstAdmin: refused once an active admin already exists (admin1, from test 1)", async () => {
     await assert.rejects(
       usersPg.createFirstAdmin({ name: "Someone Else", username: "someone.else", password: STRONG_PASSWORD }),

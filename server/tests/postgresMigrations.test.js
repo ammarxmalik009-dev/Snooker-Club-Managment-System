@@ -61,15 +61,15 @@ test("PostgreSQL migrations: connect, apply, track, re-run safely, status, const
 
   await t.test("2 & 3. a migration applies successfully and is recorded in the history table", async () => {
     const applied = await migrate.runMigrations();
-    assert.deepEqual(applied, ["0001_initial_schema.sql"]);
+    assert.deepEqual(applied, ["0001_initial_schema.sql", "0002_deferrable_foreign_keys.sql"]);
 
     const recorded = await migrate.getAppliedMigrations();
-    assert.deepEqual(recorded, ["0001_initial_schema.sql"]);
+    assert.deepEqual(recorded, ["0001_initial_schema.sql", "0002_deferrable_foreign_keys.sql"]);
   });
 
   await t.test("4. re-running migrations does not apply the same migration twice", async () => {
     const appliedAgain = await migrate.runMigrations();
-    assert.deepEqual(appliedAgain, [], "nothing pending - 0001 must not run a second time");
+    assert.deepEqual(appliedAgain, [], "nothing pending - neither migration must run a second time");
 
     const count = await getPool().query("SELECT count(*)::int AS n FROM app.schema_migrations WHERE id = '0001_initial_schema.sql'");
     assert.equal(count.rows[0].n, 1, "exactly one history row, not two");
@@ -77,7 +77,7 @@ test("PostgreSQL migrations: connect, apply, track, re-run safely, status, const
 
   await t.test("5. migration status accurately reports applied and pending migrations", async () => {
     const result = await migrate.status();
-    assert.deepEqual(result.applied, ["0001_initial_schema.sql"]);
+    assert.deepEqual(result.applied, ["0001_initial_schema.sql", "0002_deferrable_foreign_keys.sql"]);
     assert.deepEqual(result.pending, []);
   });
 
@@ -124,6 +124,17 @@ test("PostgreSQL migrations: connect, apply, track, re-run safely, status, const
       "SELECT conname FROM pg_constraint WHERE conrelid = 'app.bookings'::regclass AND contype = 'x'"
     );
     assert.deepEqual(exclusion.rows.map((r) => r.conname), ["bookings_no_overlap"]);
+  });
+
+  await t.test("6b. migration 0002: every foreign key in schema app is DEFERRABLE INITIALLY DEFERRED (Step 36)", async () => {
+    const result = await getPool().query(
+      "SELECT conname, condeferrable, condeferred FROM pg_constraint WHERE contype = 'f' AND connamespace = 'app'::regnamespace"
+    );
+    assert.ok(result.rows.length > 0, "sanity: there really are foreign keys to check");
+    for (const row of result.rows) {
+      assert.equal(row.condeferrable, true, `${row.conname} must be deferrable`);
+      assert.equal(row.condeferred, true, `${row.conname} must be initially deferred`);
+    }
   });
 
   await t.test("7a. functional check: sessions_one_open_per_table actually blocks a second open session", async () => {

@@ -47,6 +47,19 @@ function actorFromRow(row, prefix) {
   return { user: toId(row[`${prefix}_user_id`]), name, username };
 }
 
+// A logged-in user's own identity, preferring `.id` over `._id` - deliberately a small, local
+// copy of models/schemas/actor.js's own identityOf (same precedence rule, same reasoning: a
+// real Mongoose document always has BOTH `._id` and a `.id` virtual that is exactly
+// `String(_id)`, confirmed directly, never a separate or stale value; a PostgreSQL-shaped user
+// - every *.pg.service.js's own mapUserRow - has ONLY `.id`). Not an import of that file, which
+// requires "mongoose" just to define its own (unused, for this purpose) Mongoose sub-schema -
+// pulling it in here would put mongoose back into every PostgreSQL pilot's require chain, the
+// same isolation reason actorFrom below is already its own small copy, not an import.
+function identityOf(user) {
+  if (typeof user.id === "string" && user.id) return user.id;
+  return user._id;
+}
+
 // The flip side of actorFromRow: a logged-in user -> { user, name, username } to WRITE into the
 // flattened actor columns. Deliberately a small, local copy of
 // models/schemas/actor.js's actorFrom, not an import of it - that file requires "mongoose" just
@@ -54,8 +67,15 @@ function actorFromRow(row, prefix) {
 // mongoose back into every PostgreSQL pilot's require chain, undoing the isolation step 2.4
 // intended (and step 2.5 corrected: the original isolation test only checked DIRECT require
 // children, which happened to hide this exact gap - see docs/POSTGRES_MIGRATION.md, step 2.5).
+//
+// Uses identityOf (above), not `user._id` directly - found and fixed during Phase 3's own
+// integration-readiness audit: a PostgreSQL-shaped actorUser has no `._id` at all, only `.id`,
+// so the old direct access silently produced `user: undefined` for that shape. actorUserIdOrNull
+// (below) happened to turn that into the same harmless `null` a non-UUID MongoDB id already
+// produces today, so this was never a crash - but it was still the wrong value for the one case
+// that actually matters (a real PostgreSQL-authoritative actor), not merely a cosmetic gap.
 function actorFrom(user) {
-  return user ? { user: user._id, name: user.name, username: user.username } : null;
+  return user ? { user: identityOf(user), name: user.name, username: user.username } : null;
 }
 
 // Until Phase 3 ports Users to PostgreSQL, a logged-in person's real id is a MongoDB ObjectId
@@ -70,4 +90,4 @@ function actorUserIdOrNull(value) {
   return typeof value === "string" && UUID_RE.test(value) ? value : null;
 }
 
-module.exports = { toMoney, snakeToCamel, toId, actorFromRow, actorFrom, actorUserIdOrNull };
+module.exports = { toMoney, snakeToCamel, toId, actorFromRow, actorFrom, actorUserIdOrNull, identityOf };

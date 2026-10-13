@@ -195,6 +195,7 @@ function formatFileSize(bytes) {
 function renderBackups(status) {
     document.getElementById("backup-folder").textContent = status.folder;
     document.getElementById("backup-drive-warning").hidden = !status.onSystemDrive;
+    document.getElementById("backup-dir-unconfigured-warning").hidden = Boolean(status.configured);
     document.getElementById("backup-last").textContent = status.lastBackupAt
         ? `${formatDateTime(status.lastBackupAt)} · ${status.lastBackupFile}`
         : "No backup yet";

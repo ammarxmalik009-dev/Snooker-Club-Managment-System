@@ -2,20 +2,27 @@
 // wired into any route, middleware or CLI script. server/services/auth.service.js (MongoDB) is
 // completely untouched and remains the only thing the running app's login actually uses.
 //
-// NOT ACTIVATABLE YET, by design - a confirmed, specific reason, not a vague caution:
-// req.user (whatever resolveSession returns here) would need to flow into actorFrom(req.user)
-// for every other write anywhere in the app that is STILL MongoDB-authoritative (bills,
-// payments, sessions, matches, café orders, bookings, settings, users itself...) -
-// models/schemas/actor.js's actorSchema requires `user` to be a real MongoDB ObjectId
-// (`required: true`, cast to ObjectId). A PostgreSQL-authoritative user's id is a UUID, which
-// that cast rejects outright (Mongoose throws a CastError) - so turning this on for real HTTP
-// traffic today would break every other authenticated write in the app, not just Users/Auth's
-// own routes, the moment anyone logs in as a PostgreSQL-authoritative user. This is why
-// "users" was deliberately NOT added to server/config/cutover.js's KNOWN_ROUTE_GROUPS: there is
-// no way to accidentally turn this on. See docs/POSTGRES_MIGRATION.md's Phase 3 Group 2 section
-// for the full write-up, including what would need to change first (most likely: actorSchema
-// storing a flexible identifier instead of a strict ObjectId, or cutting over every other route
-// group that writes an actor at the same time Users/Auth does, rather than in isolation).
+// NOT ACTIVATED YET - deliberately, pending a separately approved cutover decision, not because
+// of an identity-format blocker (that part is already fixed, see below).
+//
+// req.user (whatever resolveSession returns here) flows into actorFrom(req.user) for every other
+// write anywhere in the app that is STILL MongoDB-authoritative (bills, payments, sessions,
+// matches, café orders, bookings, settings, users itself...). This USED to be a hard blocker:
+// models/schemas/actor.js's actorSchema originally required `user` to be a real MongoDB
+// ObjectId, cast with `mongoose.Schema.Types.ObjectId` - a PostgreSQL-authoritative user's UUID
+// id was rejected outright (CastError). Steps 27-29 fixed this: actorSchema.user is now a plain
+// `String` validated by `isValidActorIdentity` (ObjectId format OR UUID format), and
+// `identityOf()` picks the right identity off either a Mongoose document or a PostgreSQL-shaped
+// plain object. A PostgreSQL-authoritative user's actor now embeds correctly into any other
+// still-MongoDB-authoritative document - verified directly, not assumed (server/tests/
+// actorIdentity.test.js, server/tests/postgresUsersAuthCutover.test.js's own isolation test).
+//
+// "users" was still deliberately NOT added to server/config/cutover.js's KNOWN_ROUTE_GROUPS -
+// there is no way to accidentally turn this on. See docs/POSTGRES_MIGRATION.md's Phase 3 Group 2
+// section, and Steps 33-34's own audit/readiness write-ups, for the current, up-to-date list of
+// what is already verified versus what a future activation step still needs (a real HTTP
+// end-to-end test now exists - server/tests/postgresUsersAuthHttp.test.js - plus admin recovery
+// readiness and an operational re-login runbook).
 //
 // Reused, unmodified: server/utils/password.js's verifyPassword/fakeVerify (the exact same
 // scrypt hashing and constant-time comparison this app already uses - not a new algorithm);

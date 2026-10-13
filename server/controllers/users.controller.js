@@ -1,7 +1,11 @@
 // User management (admin only - enforced in routes/users.routes.js).
+//
+// Phase 3, Group 2: requires the cutover adapter (usersCutover.service.js), not
+// users.service.js directly - the ONLY change this step made to this file. See
+// middleware/auth.js's own header comment for why this is safe today.
 
 const { matchedData } = require("express-validator");
-const usersService = require("../services/users.service");
+const usersService = require("../services/usersCutover.service");
 const { sendSuccess } = require("../utils/response");
 
 const bodyData = (req) => matchedData(req, { locations: ["body"] });

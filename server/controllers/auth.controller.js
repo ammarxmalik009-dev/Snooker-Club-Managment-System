@@ -1,7 +1,12 @@
 // Login / logout / "who am I".
+//
+// Phase 3, Group 2: requires the cutover adapter (authCutover.service.js), not auth.service.js
+// directly - the ONLY change this step made to this file. See middleware/auth.js's own header
+// comment for why this is safe: "users" is not a recognised cutover route group yet, so every
+// call below still reaches MongoDB exactly as before.
 
 const { matchedData } = require("express-validator");
-const authService = require("../services/auth.service");
+const authService = require("../services/authCutover.service");
 const { permissionsForRole, roleHasPermission, PAGE_PERMISSIONS } = require("../config/permissions");
 const { canonicalPagePath, PAGE_NAME } = require("../middleware/auth");
 const AppError = require("../utils/AppError");
