@@ -2454,6 +2454,134 @@ schema change was made; no production data was touched; nothing was deployed.
   building one is real, separate work (retry, idempotency, monitoring) explicitly deferred.
 - **Group 2 (Users/Auth) is next**, per the consolidated Phase 3 plan - not started here.
 
+#### Phase 3, Group 2 — Users/Auth: a confirmed architectural blocker, service layer built and tested, NOT activated
+
+**Outcome, stated up front:** this group did **not** cut Users/Auth over to PostgreSQL. Inspection
+found a specific, confirmed reason doing so today would be unsafe - not a vague caution, a
+concrete data-integrity failure mode, reproduced in reasoning from the actual schema and code
+(see below). Per this group's own instruction to stop and report rather than force an unsafe
+cutover, the HTTP/middleware/CLI wiring was **not built**. What **was** built is the underlying
+PostgreSQL service layer itself (login, session resolution/expiry/logout, `setPassword`,
+`createFirstAdmin`, `resetAdminPassword`, `listUsers`) - real, tested, additive code, useful now
+for verifying the logic is correct, and ready to wire in once the blocker is resolved.
+
+##### The blocker, with evidence
+
+`models/schemas/actor.js`'s `actorSchema` - the "who did it" field written by **every** other
+still-MongoDB-authoritative service (bills, payments, sessions, matches, café orders, bookings,
+settings, users itself) - declares `user: { type: mongoose.Schema.Types.ObjectId, ref: "User",
+required: true }`. `req.user` (whatever `loadUser` middleware resolves) flows into every one of
+those via `actorFrom(req.user)`, which reads `user._id` directly. A PostgreSQL-authoritative
+user's id is a UUID (`app.users.id uuid PRIMARY KEY DEFAULT gen_random_uuid()`, step 2.3) - not a
+24-hex-character ObjectId. Mongoose's own `required: true` + ObjectId cast **rejects a UUID
+string outright** (a `CastError`), so the moment a PostgreSQL-authoritative user's session
+resolved `req.user` and that request tried to write *any* actor-stamped record anywhere else in
+the still-MongoDB-authoritative app, that write would throw - not a Users/Auth-specific failure,
+a failure of every other authenticated write in the application. This is confirmed directly from
+the schema and the `actorFrom` function's own source, not inferred or assumed.
+
+This is also a structural property of the *order* Phase 3 was planned in, not just an
+implementation detail of this group: cutting Users/Auth over **in isolation**, before every
+other route group that writes an actor field has also moved, cannot be made safe by anything
+this group alone can build. Two real ways forward exist for a **future**, explicitly-scoped
+step, neither attempted here (both are schema/architecture decisions bigger than this group):
+(a) change `actorSchema` to store a flexible identifier (not a strict ObjectId) so it can hold
+either kind of id during a mixed-backend period, or (b) cut Users/Auth over in the **same**
+release as every other route group that writes an actor, eliminating the mixed-backend window
+entirely. Recorded here as the decision for whoever plans that future step, not decided now.
+
+##### What was built instead - real, tested, additive, NOT wired to anything
+
+- **`server/services/users.pg.service.js`** (step 2.8's pilot, extended, nothing existing
+  changed): `getUserByUsernameForLogin` (the one place `password_hash` leaves the database, same
+  rule as `models/User.js`'s own `select: false`), `touchLastLogin`, `setPassword`,
+  `createFirstAdmin`, `resetAdminPassword`, `listUsers`, `listActiveAdmins`. Session invalidation
+  on deactivation (a real gap step 2.8's own pilot had left open - it never ended sessions on
+  deactivation at all, found while building this group) is now wired into `updateUser`, inside
+  its own existing transaction.
+- **`server/services/authSessions.pg.service.js`** (step 2.8's pilot, extended): `getValidSessionByTokenHash`
+  (the real, expiry-checked security read), `touchLastSeen`, `revokeSessionByTokenHash` (logout),
+  `endAllSessionsForUser` (accepts an optional transaction-scoped client, the same pattern step
+  2.16's Counters pilot established).
+- **`server/services/auth.pg.service.js`** (new): `login`, `resolveSession`, `logout`,
+  `endAllSessionsForUser` - mirroring `auth.service.js`'s own logic exactly, reusing
+  `verifyPassword`/`fakeVerify` (the identical scrypt implementation) and `loginThrottle.js`
+  (pure in-memory, already database-independent, so the SAME throttle state applies regardless
+  of which backend eventually answers). `COOKIE_NAME`/`GENERIC_LOGIN_ERROR`/`cookieOptions()` are
+  small local copies (not an import of `auth.service.js`, which requires mongoose) - confirmed to
+  agree with the MongoDB path's own values byte-for-byte, in a dedicated, always-run test.
+- **`server/config/cutover.js` was deliberately NOT changed** - `"users"` was not added to
+  `KNOWN_ROUTE_GROUPS`. There is no way to set `PG_CUTOVER_ROUTES=users` and have anything
+  happen except a clear, loud rejection - confirmed directly in a test.
+- **`middleware/auth.js`, `auth.controller.js`, `users.controller.js`, `users.routes.js`,
+  `auth.routes.js`, the CLI scripts (`createAdmin.js`, `resetAdminPassword.js`) were NOT touched.**
+
+##### A second, smaller blocker noted for whenever route wiring is attempted
+
+`validators/auth.validators.js`'s `idRules` uses `.isMongoId()` for `/api/users/:id` - this would
+reject every PostgreSQL-authoritative user id (a UUID) outright with a 400, before the request
+even reaches a controller. Not fixed here (there is no route wiring yet to need it), but recorded
+so whoever attempts that wiring later doesn't have to rediscover it.
+
+##### What was verified - against the real local PostgreSQL
+
+1. **Login success**: a real token, a session row created, the returned user object confirmed
+   to never include the password hash, username normalization confirmed.
+2. **Invalid credentials**: a wrong password and an unknown username give the identical generic
+   error and status - the same username-enumeration protection `auth.service.js` provides.
+3. **Login throttle**: 5 failed attempts for one username lock it out (429), reusing the
+   project's own existing in-memory throttle unchanged.
+4. **Session resolution**: a real token resolves to the real user; a garbage token, an empty
+   token, and a genuinely expired session (confirmed via a direct SQL update of `expires_at`)
+   all resolve to `null` - the real security check, not merely a housekeeping convenience.
+5. **`lastSeenAt` touch-throttling**: updated when stale (forced via direct SQL), confirmed with
+   a before/after comparison.
+6. **Logout**: the session row is gone; the same token no longer resolves to anyone.
+7. **`setPassword`**: changes the hash; ends the user's *other* sessions but keeps the current
+   one (the exact distinction `users.service.js`'s own `setPassword` makes); the old password
+   stops working, the new one works.
+8. **Deactivation (via `updateUser`) ends ALL of that user's sessions** - the gap noted above,
+   now closed and verified, not merely claimed fixed.
+9. **`createFirstAdmin`**: refused once an active admin already exists.
+10. **`resetAdminPassword`**: works for an active admin; refused for a non-admin, a deactivated
+    admin, or a missing username (each a distinct, confirmed case); ends every old session of
+    that admin.
+11. **`listUsers`/`listActiveAdmins`**: filters behave like `users.service.js`'s own.
+- **Isolation**: confirmed (no `mongoose`/`server/models/` anywhere in `auth.pg.service.js`'s
+  full require tree, checked recursively).
+
+No schema change was needed or made.
+
+##### Regression checks
+
+| Command | Result |
+|---|---|
+| `node --test server/tests/postgresUsersAuth.test.js` (3 consecutive runs) | **15/15 every time** |
+| `postgresUsers.test.js` (step 2.8's original pilot, unchanged) | **13/13** - confirmed the additions above broke nothing existing |
+| All eighteen `postgres*.test.js` files together (3 consecutive runs) | **226/226 every time** |
+| `npm.cmd test`, PostgreSQL configured (2 consecutive runs) | **526 passed, 0 failed, 0 skipped**, both times |
+| `npm.cmd test`, unconfigured (1 run) | 309 passed (2 more than the prior baseline - this group's two always-run, no-PostgreSQL-needed checks), 0 failed, **20 skipped** (cleanly) |
+| `npm.cmd run test:browser`, including the real `auth` suite | **780 passed, 0 failed** (15 suites) - the real login/role/session flow through the actual MongoDB-backed middleware is completely unaffected |
+
+After every run, the PostgreSQL test database was confirmed left clean. No unrelated or
+intermittent failure was observed (one test-sequencing bug - a carried-over login-throttle
+counter between two of this file's own subtests - was found and fixed before any result was
+reported, not left in or reported as a product defect).
+
+Confirmed: Settings' own cutover (Group 1) is unaffected; Tables, Customers, Products, Players,
+Sessions, Bookings, Matches, Bills and Payments were not touched; no production data was
+changed; nothing was deployed; real user records were not copied or overwritten.
+
+##### Rollback / consistency note
+
+Not applicable in the usual sense - there is nothing live to roll back, since nothing was
+activated. If a future step adds `"users"` to `KNOWN_ROUTE_GROUPS` and wires the middleware, that
+step must design its OWN rollback and reconciliation story from scratch (this group's Settings
+precedent - `reconcileSettings()`, a documented manual procedure - is a reasonable template, but
+Users/Auth's own consistency question is harder: a session created under one backend is
+meaningless to the other, so "rollback" would likely mean "every session must re-authenticate,"
+not a data reconciliation).
+
 ### Phase 4 — Tests and data import
 
 - Port server and browser tests to PostgreSQL; add concurrency, rollback and constraint tests.
@@ -2519,7 +2647,8 @@ schema change was made; no production data was touched; nothing was deployed.
 - [x] Phase 2, Step 2.15 — CafeOrders/StockMovements pilot: tab lifecycle with a real product-row-lock guarantee against overselling reserved stock, atomic stock increase/decrease proven with genuine concurrency, transaction-paired movement history (491 server / 780 browser with PostgreSQL configured, 26 new tests, 0 skipped); bill integration (takeForBill, claimForBill/releaseClaim, recordSale/restoreForCancelledBill) explicitly deferred with its transaction boundary documented
 - [x] Phase 2, Step 2.16 — Counters pilot: the shared atomic upsert-and-increment, both transaction-scoped and standalone modes proven with real concurrency and real rollback (501 server / 780 browser with PostgreSQL configured, 10 new tests, 0 skipped); bill-number integration explicitly deferred; matches.pg.service.js deliberately left unchanged. Every MongoDB model now has at least a standalone PostgreSQL pilot.
 - [x] Phase 3, Group 1 — cutover selector (`PG_CUTOVER_ROUTES`, fail-loud on an unknown name, no silent fallback) + Settings cutover, the first production route; backup-status fields deliberately kept MongoDB-only; read-only reconciliation; manual rollback procedure documented (511 server / 780 browser with PostgreSQL configured, 10 new tests, 0 skipped); also fixed an unrelated regression found while re-verifying (matchBilling.test.js's own midnight-boundary mock could jump up to 24h, exceeding the test session's TTL)
-- [ ] Phase 3, Group 2 — Users/Auth cutover, per the consolidated Phase 3 plan (not started; awaiting approval)
+- [x] Phase 3, Group 2 — Users/Auth: confirmed architectural blocker (actorSchema requires a real MongoDB ObjectId; a PostgreSQL-authoritative user's UUID id would break every other still-MongoDB-authoritative write in the app); NOT activated, "users" NOT added to KNOWN_ROUTE_GROUPS, no route/middleware/CLI wiring. Service layer built and tested instead: login, session resolution/expiry/logout, setPassword, createFirstAdmin, resetAdminPassword, listUsers, session invalidation on deactivation (526 server / 780 browser with PostgreSQL configured, 15 new tests, 0 skipped)
+- [ ] Phase 3, Group 2 resolution (actorSchema change, or combined cutover) or Group 3 (Tables + Customers), per the next approval (not started; awaiting approval)
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified

@@ -11,16 +11,31 @@
 // own (not an import of that file, which requires "mongoose" to define its schema - the same
 // isolation reason every earlier pilot's nameKeyOf/actorFrom copies exist for).
 //
-// Scope, stated up front: covers create / read-by-id / read-by-username / update
+// Step 2.8's own original scope covered create / read-by-id / read-by-username / update
 // (name/role/active, with the same last-admin protection as users.service.js) and the unique
-// username rule. Does NOT implement setPassword, createFirstAdmin or resetAdminPassword - those
-// are admin-password-reset-specific flows, outside this pilot's narrow goal of "establish real
-// user records and the relationships other pilots need." Recorded as out of scope, not silently
-// dropped - see docs/POSTGRES_MIGRATION.md.
+// username rule, and explicitly deferred setPassword/createFirstAdmin/resetAdminPassword.
+//
+// Phase 3, Group 2 (this addition) builds those three, plus listUsers/listActiveAdmins and
+// touchLastLogin/getUserByUsernameForLogin (used by server/services/auth.pg.service.js's own
+// login) - additive only, nothing above this comment was changed. These functions are real,
+// tested PostgreSQL code, but are NOT wired into any route or CLI script: see
+// docs/POSTGRES_MIGRATION.md's Phase 3 Group 2 section for the exact, confirmed reason
+// (models/schemas/actor.js's actorSchema requires a real MongoDB ObjectId for `user`, which a
+// PostgreSQL-authoritative user's UUID id cannot satisfy, and every other still-MongoDB-
+// authoritative write in the app calls actorFrom(req.user) - activating this for real HTTP
+// traffic today would break every other authenticated write in the app, not just Users/Auth's
+// own routes). "users" was deliberately NOT added to server/config/cutover.js's
+// KNOWN_ROUTE_GROUPS for the same reason - there is no way to accidentally turn this on.
+//
+// Session invalidation on deactivation/password change (users.service.js's own
+// endAllSessionsForUser calls) is now wired in too, closing a real gap step 2.8's own pilot had
+// left open (it never ended sessions on deactivation at all) - found while building this group,
+// not assumed to already work.
 
 const { query, withTransaction } = require("../config/db.pg");
 const { toId, actorFromRow, actorFrom, actorUserIdOrNull } = require("../db/rowMappers");
 const { hashPassword, passwordProblem } = require("../utils/password"); // pure Node crypto, no mongoose
+const authSessionsPg = require("./authSessions.pg.service");
 const AppError = require("../utils/AppError");
 
 const ROLES = ["admin", "staff", "cashier"]; // models/User.js's own ROLES, matched by the schema's CHECK (step 2.3)
@@ -169,8 +184,134 @@ async function updateUser(id, changes, actorUser) {
       if (activeAdmins === 0) throw new AppError("This is the last active admin. Make another user an admin first.", 409);
     }
 
+    // Deactivating logs the account out everywhere, right now - the same rule
+    // users.service.js's own updateUser enforces. Inside this same transaction, so a
+    // deactivation is never left half-applied (user row changed, old sessions still valid, or
+    // the other way round).
+    if (before.active && !after.active) {
+      await authSessionsPg.endAllSessionsForUser(id, { client });
+    }
+
     return mapUserRow(after);
   });
 }
 
-module.exports = { ROLES, createUser, getUserById, getUserByUsername, updateUser, countActiveAdmins, mapUserRow, normalizeUsername };
+// Login only: the ONE place password_hash ever leaves the database, mirroring
+// models/User.js's own select:false + the explicit .select("+passwordHash") auth.service.js's
+// own login makes. Returns null (not a 404) when the username doesn't exist - the same
+// "null, not an error" shape a Mongoose findOne gives, so a caller can run the SAME fakeVerify
+// timing-safe fallback auth.service.js's own login does.
+async function getUserByUsernameForLogin(username) {
+  const normalized = normalizeUsername(username);
+  const result = await query(
+    `SELECT id, name, username, role, active, last_login_at, password_changed_at, password_hash,
+            created_by_user_id, created_by_name, created_by_username, updated_by_user_id, updated_by_name, updated_by_username,
+            created_at, updated_at
+     FROM app.users WHERE username = $1`,
+    [normalized]
+  );
+  if (result.rows.length === 0) return null;
+  const row = result.rows[0];
+  return { ...mapUserRow(row), passwordHash: row.password_hash };
+}
+
+async function touchLastLogin(id, when) {
+  await query("UPDATE app.users SET last_login_at = $1 WHERE id = $2", [when, id]);
+}
+
+// Admin sets a new password for a user - the same rule users.service.js's own setPassword
+// enforces (password strength checked against THIS user's own username; every other login of
+// theirs ends, except the admin's own current session if they changed their own password).
+async function setPassword(id, password, actorUser, { currentSessionId = null } = {}) {
+  const current = await getUserById(id); // 404 first, same as users.service.js
+  const problem = passwordProblem(password, current.username);
+  if (problem) throw new AppError(problem, 400, [{ field: "password", message: problem }]);
+
+  const passwordHash = await hashPassword(password);
+  const actor = actorFrom(actorUser);
+  const userId = actor ? actorUserIdOrNull(String(actor.user)) : null;
+  const result = await query(
+    `UPDATE app.users
+     SET password_hash = $1, password_changed_at = now(), updated_by_user_id = $2, updated_by_name = $3, updated_by_username = $4, updated_at = now()
+     WHERE id = $5
+     RETURNING id, name, username, role, active, last_login_at, password_changed_at,
+               created_by_user_id, created_by_name, created_by_username, updated_by_user_id, updated_by_name, updated_by_username,
+               created_at, updated_at`,
+    [passwordHash, userId, actor ? actor.name : null, actor ? actor.username : null, id]
+  );
+  if (result.rows.length === 0) throw new AppError("User not found", 404);
+
+  const isSelf = actorUser && String(actorUser.id ?? actorUser._id) === String(id);
+  await authSessionsPg.endAllSessionsForUser(id, { exceptSessionId: isSelf ? currentSessionId : null });
+  return mapUserRow(result.rows[0]);
+}
+
+// "npm run create-admin": refuses if an active admin already exists - identical rule to
+// users.service.js's own createFirstAdmin. actorUser is always null here (a CLI script has no
+// logged-in user), the same as the MongoDB path.
+async function createFirstAdmin({ name, username, password }) {
+  if ((await countActiveAdmins()) > 0) {
+    throw new AppError("An active admin already exists. Log in as that admin and add users on the Users page.", 409);
+  }
+  return createUser({ name, username, role: "admin", password }, null);
+}
+
+// "npm run reset-admin-password": only an existing, ACTIVE admin can be reset - never creates a
+// user, never touches staff/cashier accounts. Every one of that admin's logins ends.
+async function listActiveAdmins() {
+  const result = await query("SELECT name, username FROM app.users WHERE role = 'admin' AND active = true ORDER BY username");
+  return result.rows;
+}
+
+async function resetAdminPassword(username, password) {
+  const normalized = normalizeUsername(username);
+  const existing = await query("SELECT id, role, active FROM app.users WHERE username = $1", [normalized]);
+  if (existing.rows.length === 0 || existing.rows[0].role !== "admin") {
+    throw new AppError(`There is no admin with the username "${normalized}"`, 404);
+  }
+  if (!existing.rows[0].active) {
+    throw new AppError(`The admin "${normalized}" is deactivated. Reset the password of an active admin instead.`, 409);
+  }
+  const problem = passwordProblem(password, normalized);
+  if (problem) throw new AppError(problem, 400, [{ field: "password", message: problem }]);
+
+  const passwordHash = await hashPassword(password);
+  const id = existing.rows[0].id;
+  const result = await query(
+    `UPDATE app.users
+     SET password_hash = $1, password_changed_at = now(), updated_by_user_id = NULL, updated_by_name = NULL, updated_by_username = NULL, updated_at = now()
+     WHERE id = $2
+     RETURNING id, name, username, role, active, last_login_at, password_changed_at,
+               created_by_user_id, created_by_name, created_by_username, updated_by_user_id, updated_by_name, updated_by_username,
+               created_at, updated_at`,
+    [passwordHash, id]
+  );
+  await authSessionsPg.endAllSessionsForUser(id);
+  return mapUserRow(result.rows[0]);
+}
+
+// The Users page's own list, with the same filters users.service.js's own listUsers accepts.
+async function listUsers({ search, role, active } = {}) {
+  const conditions = [];
+  const values = [];
+  if (role) { values.push(role); conditions.push(`role = $${values.length}`); }
+  if (active !== undefined) { values.push(active); conditions.push(`active = $${values.length}`); }
+  if (search) {
+    values.push(`%${search}%`);
+    conditions.push(`(name ILIKE $${values.length} OR username ILIKE $${values.length})`);
+  }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const result = await query(
+    `SELECT id, name, username, role, active, last_login_at, password_changed_at,
+            created_by_user_id, created_by_name, created_by_username, updated_by_user_id, updated_by_name, updated_by_username,
+            created_at, updated_at
+     FROM app.users ${where} ORDER BY active DESC, name`,
+    values
+  );
+  return result.rows.map(mapUserRow);
+}
+
+module.exports = {
+  ROLES, createUser, getUserById, getUserByUsername, updateUser, countActiveAdmins, mapUserRow, normalizeUsername,
+  getUserByUsernameForLogin, touchLastLogin, setPassword, createFirstAdmin, resetAdminPassword, listActiveAdmins, listUsers,
+};
