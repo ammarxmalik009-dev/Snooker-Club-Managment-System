@@ -8,7 +8,7 @@ const mongoose = require("mongoose");
 const { dropTestDatabase } = require("./helpers/testDb"); // refuses any database without "test" in its name
 const { createApp } = require("../app");
 const { loginAs } = require("./helpers/auth");
-const { dateInTimeZone, startOfDayInTimeZone } = require("../utils/time");
+const { dateInTimeZone } = require("../utils/time");
 
 const TEST_DB_URI = process.env.MONGODB_MATCHBILLS_TEST_URI || "mongodb://127.0.0.1:27017/snooker_club_pro_test_matchbills";
 
@@ -447,24 +447,32 @@ test("an old bill stored before Phase 11.5 (no match field) is read and paid as 
 // ---------------------------------------------------------------------------
 
 test("one session, many match bills: session history, dashboard and the tables report count every bill (time once)", async (testContext) => {
-  // Anchored to the nearest club-local (Asia/Karachi) noon that is NOT before the real "now":
   // endSession() below backdates the session by 50 minutes from "now", and whenever this test
   // happens to run within 50 minutes of a real Asia/Karachi midnight, that lands the session on
   // the PREVIOUS club-local day - so the "today" report queries further down correctly (but
-  // misleadingly, for this test's purpose) find nothing. Noon is a 12-hour safety margin from
-  // either midnight. The anchor is never set to a moment BEFORE the real "now": an earlier
-  // attempt that hardcoded a fixed past date made this test's own session look OLDER than
-  // sessions genuinely created a moment earlier (in real time) by the tests before it in this
-  // same file, pushing it out of the dashboard's "recent sessions" window - found and corrected
-  // while verifying this fix, not assumed safe. Only Date is mocked (node:test's own
-  // MockTimers, no new dependency), so every route handler in the same process sees this
-  // consistently; it is restored automatically when the test finishes (node:test's own
-  // documented behaviour - confirmed directly before relying on it).
+  // misleadingly, for this test's purpose) find nothing. Only mocked when genuinely needed (real
+  // "now" is within DANGER_MARGIN minutes of a club-local midnight, either side), and only ever
+  // jumped FORWARD by a small, fixed amount (DANGER_MARGIN + 30 minutes - just past the danger
+  // window, never as far as a full day). An earlier version of this fix jumped all the way to
+  // the next club-local noon, which could be nearly 24 hours forward - safe for the date-boundary
+  // bug itself, but long enough to make this file's own login session (created once in
+  // test.before(), real SESSION_TTL_HOURS default 12h) look expired under the mocked clock,
+  // producing a real, reproducible 401 whenever this test happened to run in the afternoon
+  // Karachi time - found and corrected while re-verifying this fix on a later day, not assumed
+  // safe the first time either. Only Date is mocked (node:test's own MockTimers, no new
+  // dependency); it is restored automatically when the test finishes (node:test's own documented
+  // behaviour - confirmed directly before relying on it).
   const realNow = new Date();
-  let anchor = new Date(startOfDayInTimeZone(dateInTimeZone(realNow, "Asia/Karachi"), "Asia/Karachi").getTime() + 12 * 60 * 60 * 1000); // noon, club-local, today
-  if (anchor.getTime() < realNow.getTime()) anchor = new Date(anchor.getTime() + 24 * 60 * 60 * 1000); // already past noon -> noon tomorrow instead
-  testContext.mock.timers.enable({ apis: ["Date"] });
-  testContext.mock.timers.setTime(anchor.getTime());
+  const DANGER_MARGIN_MINUTES = 90; // comfortably covers the 50-minute backdate below, plus a buffer
+  const karachiClock = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Karachi", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(realNow);
+  const [karachiHour, karachiMinute] = karachiClock.split(":").map(Number);
+  const minutesSinceMidnight = karachiHour * 60 + karachiMinute;
+  const minutesUntilMidnight = 24 * 60 - minutesSinceMidnight;
+  const nearMidnight = minutesSinceMidnight < DANGER_MARGIN_MINUTES || minutesUntilMidnight < DANGER_MARGIN_MINUTES;
+  if (nearMidnight) {
+    testContext.mock.timers.enable({ apis: ["Date"] });
+    testContext.mock.timers.setTime(realNow.getTime() + (DANGER_MARGIN_MINUTES + 30) * 60 * 1000); // a couple of hours forward at most, never a full day
+  }
 
   await db().collection("bills").deleteMany({});
   await db().collection("payments").deleteMany({});

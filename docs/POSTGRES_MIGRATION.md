@@ -2319,6 +2319,141 @@ concurrent payments (no overpaying), booking overlaps, one active session per ta
 deduct/restore, duplicate bills, match/bill numbers, last-admin protection, report day edges in
 `Asia/Karachi`, foreign keys during restore.
 
+#### Phase 3, Group 1 — the cutover selector + Settings, the first real production route — done
+
+**Scope:** the first piece of Phase 3 that actually touches a production route. Two new files
+(`server/config/cutover.js`, `server/services/settingsCutover.service.js`) plus a one-line
+change to `server/controllers/settings.controller.js` (which service it requires) are the
+*entire* change to existing application behaviour - every other file (routes, validators, the
+Settings page itself) is untouched.
+
+##### The source-of-truth design
+
+MongoDB and PostgreSQL cannot share one ordinary transaction, so this is **not** synchronous
+dual-write. Exactly one database is authoritative for a named "route group" at any moment,
+chosen by `PG_CUTOVER_ROUTES` (a comma list, empty by default - **MongoDB remains authoritative
+for every route group until explicitly named**, the same safe-default pattern
+`TRUST_PROXY`/`ALLOWED_ORIGINS` already use). `server/config/cutover.js`'s `isPgAuthoritative(group)`
+reads this env var **fresh on every call**, not cached once at require time like most of
+`env.js`'s own settings - deliberately, for two reasons: tests can flip it between subtests in
+the same process without fighting Node's require cache (a real bug this project hit before, in a
+step 2.15 PostgreSQL pilot test file), and in production, rolling a route group back to MongoDB
+(or forward to PostgreSQL) is then "change the env var, the next request already sees it" - no
+code change, no redeploy.
+
+An **unknown** name in `PG_CUTOVER_ROUTES` (a typo, or a route group that doesn't exist yet)
+throws loudly on every request that checks it, surfaced as a 500 - never silently treated as
+"still on MongoDB." A silently-ignored typo would otherwise look exactly like nothing changed,
+while whoever set it believes PostgreSQL is live - verified directly (test 2).
+
+**`settingsCutover.service.js`** is the per-route adapter: `getSettings`/`describeSettings`/
+`updateSettings` branch on `isPgAuthoritative("settings")` and call **exactly one** backend's own,
+already-tested service function - never both, and never a `catch` that retries the other backend
+on failure. This is what makes "no silent fallback" true structurally, not just by convention:
+there is no code path that could fall back even if someone wanted it to.
+
+##### The one real independence gap found, and how it's resolved (not hidden)
+
+`backup.service.js` writes four backup-STATUS fields (`lastBackupAt`, `lastBackupFile`,
+`lastBackupAttemptAt`, `lastBackupError`) **directly to the MongoDB `Setting` document**,
+completely outside the `/api/settings` route, and has no PostgreSQL equivalent (that's Group 8 -
+PostgreSQL backup/restore - a separate, later, gated milestone). If PostgreSQL became
+authoritative for those four fields too, they would show permanently stale values the moment a
+backup actually runs while PostgreSQL is selected - exactly the "falsely claiming both databases
+are consistent" this design must avoid. **Resolved explicitly, not glossed over**: those four
+fields are *always* read from MongoDB, in both branches, regardless of which database answers
+everything else - verified directly (test 4: a backup-status change made straight in MongoDB
+shows up in the PostgreSQL-authoritative `GET /settings` response).
+
+##### Reconciliation - read-only, manual, not a background worker
+
+`settingsCutover.service.js`'s `reconcileSettings()` compares every editable field (not the four
+backup-status fields, which are never PostgreSQL-authoritative, so comparing them would only ever
+report the permanent, expected gap above, not a real divergence) between MongoDB's and
+PostgreSQL's own current rows, and reports differences - **without changing either database**.
+No background sync worker was built: per this group's own scope, automatic reconciliation needs
+its own designed retry/idempotency/conflict-resolution/monitoring story first, which is real,
+separate work, not something to bolt on here. `reconcileSettings()` is meant to be called
+manually (or by a future monitoring job) - most usefully right before a rollback, to know in
+advance whether PostgreSQL has newer data that MongoDB doesn't, so that data isn't silently lost
+by flipping back.
+
+##### Rollback procedure
+
+Unset (or remove `"settings"` from) `PG_CUTOVER_ROUTES`. The next request already serves
+MongoDB's own current value - no code change, no redeploy, no automatic merge. **Before rolling
+back**, run `reconcileSettings()`: if it reports a difference, whatever change was made while
+PostgreSQL was authoritative must be **manually re-applied through the MongoDB-backed path**
+(simply re-saving the same values through the Settings page) before or immediately after the
+flip, or that change is lost. This is a deliberately manual step, not automated, consistent with
+not building sync automation in this group.
+
+##### What was verified - against the real local PostgreSQL and the real app
+
+1. **Default (unset)**: `GET`/`PATCH /api/settings` behave exactly as before this group existed;
+   confirmed with a direct `COUNT(*)` that `app.settings` never gets a row created at all while
+   MongoDB is authoritative.
+2. **An unknown route-group name** is refused with a 500, not silently ignored.
+3. **Explicit PostgreSQL selection**: reads and writes land in `app.settings`; MongoDB's own
+   document (from test 1) is confirmed completely untouched by a PostgreSQL-authoritative write.
+4. **Backup-status fields always come from MongoDB**, confirmed even while PostgreSQL answers
+   every other field.
+5. **Authorization is unchanged by the selector**: staff can view but not manage, in *both*
+   database modes - the `requirePermission` middleware runs before either service is ever
+   called, so this was expected to hold, and is now confirmed rather than assumed.
+6. **No silent fallback**: a PostgreSQL write that fails on a real constraint violation is
+   reported as a failure; MongoDB is confirmed never written to as a compensating fallback, and
+   the failed write itself never partially lands in PostgreSQL either.
+7. **Reconciliation**: a deliberate, real mismatch between the two databases is reported
+   accurately, with neither database changed by the check itself.
+8. **Rollback**: unsetting the config immediately serves MongoDB's own current value again - not
+   PostgreSQL's, and not a merge of the two.
+
+##### A real, unrelated regression found and fixed while re-verifying this group
+
+Re-running the full suite today (a day after the step 2.14 targeted follow-up that introduced it)
+surfaced a genuine bug in `matchBilling.test.js`'s own Asia/Karachi-midnight-boundary fix
+(commit `e43b77f`): that fix mocked the clock forward to the *next club-local noon*, which can be
+**almost 24 hours forward** when the real time is already just past noon - long enough to make
+that test's own login session (created once in `test.before()`, the default 12-hour
+`SESSION_TTL_HOURS`) look expired under the mocked clock, producing a real `401` whenever the
+suite happened to run in the Karachi afternoon (confirmed: it failed today, at 12:55 PM Karachi
+time, for exactly this reason). **Fixed, in the same test file, by only mocking the clock when
+genuinely within 90 minutes of a real midnight (the actual danger zone this test cares about),
+and then jumping forward by a small, fixed 2 hours - never a full day.** Verified deterministically
+across the exact boundary (8 simulated real-`now` values spanning it, including today's actual
+real time) the same way the original fix was verified. This is unrelated to the cutover selector
+itself (zero shared code), but blocked this group's own regression gate from passing honestly, so
+it was fixed rather than ignored or reported as "unrelated" without checking.
+
+##### Regression checks
+
+| Command | Result |
+|---|---|
+| `node --test server/tests/postgresSettingsCutover.test.js` (3 consecutive runs) | **10/10 every time** |
+| All seventeen `postgres*.test.js` files together (3 consecutive runs) | **211/211 every time** |
+| `npm.cmd test`, PostgreSQL configured (2 consecutive runs) | **511 passed, 0 failed, 0 skipped**, both times |
+| `npm.cmd test`, unconfigured (1 run) | 307 passed, 0 failed, **19 skipped** (cleanly) |
+| `npm.cmd run test:browser` | **780 passed, 0 failed** (15 suites) - identical to every prior baseline |
+
+After every run, the PostgreSQL test database was confirmed left clean (no `app` schema, no
+leftover tables), and the MongoDB test database used by the new cutover test was confirmed
+dropped. No other failure was observed.
+
+Confirmed: Users/Auth, Tables, Customers and every other route are completely unchanged; no
+schema change was made; no production data was touched; nothing was deployed.
+
+##### Unresolved / deferred
+
+- **The browser test harness's own, similar jump-to-noon pattern** (`tests/browser/suites/sessions.html`,
+  also from the step 2.14 follow-up) was **not** changed - it currently has enough headroom
+  (`SESSION_TTL_HOURS=48` there vs. a worst-case ~24-hour jump) that it is not actually broken
+  today, unlike the server-side one. Flagged here as the same risky pattern, left alone because
+  fixing something that isn't currently failing was outside this group's own scope.
+- **Reconciliation remains manual** - no scheduled job calls `reconcileSettings()` automatically;
+  building one is real, separate work (retry, idempotency, monitoring) explicitly deferred.
+- **Group 2 (Users/Auth) is next**, per the consolidated Phase 3 plan - not started here.
+
 ### Phase 4 — Tests and data import
 
 - Port server and browser tests to PostgreSQL; add concurrency, rollback and constraint tests.
@@ -2383,7 +2518,8 @@ deduct/restore, duplicate bills, match/bill numbers, last-admin protection, repo
 - [x] Phase 2, Step 2.14 — Matches pilot: the session-lock-before-create transaction, player/team rules, real concurrency proof (463 server / 780 browser with PostgreSQL configured, 18 new tests, 0 skipped); found (did not fix) a real Sessions-pilot timing bug; bill joins and changeResult explicitly deferred
 - [x] Phase 2, Step 2.15 — CafeOrders/StockMovements pilot: tab lifecycle with a real product-row-lock guarantee against overselling reserved stock, atomic stock increase/decrease proven with genuine concurrency, transaction-paired movement history (491 server / 780 browser with PostgreSQL configured, 26 new tests, 0 skipped); bill integration (takeForBill, claimForBill/releaseClaim, recordSale/restoreForCancelledBill) explicitly deferred with its transaction boundary documented
 - [x] Phase 2, Step 2.16 — Counters pilot: the shared atomic upsert-and-increment, both transaction-scoped and standalone modes proven with real concurrency and real rollback (501 server / 780 browser with PostgreSQL configured, 10 new tests, 0 skipped); bill-number integration explicitly deferred; matches.pg.service.js deliberately left unchanged. Every MongoDB model now has at least a standalone PostgreSQL pilot.
-- [ ] Phase 3 cutover planning, or further cross-service integration pilots (bill numbering, café/bill integration, player history, bill/match report joins), per the next approval (not started; awaiting approval)
+- [x] Phase 3, Group 1 — cutover selector (`PG_CUTOVER_ROUTES`, fail-loud on an unknown name, no silent fallback) + Settings cutover, the first production route; backup-status fields deliberately kept MongoDB-only; read-only reconciliation; manual rollback procedure documented (511 server / 780 browser with PostgreSQL configured, 10 new tests, 0 skipped); also fixed an unrelated regression found while re-verifying (matchBilling.test.js's own midnight-boundary mock could jump up to 24h, exceeding the test session's TTL)
+- [ ] Phase 3, Group 2 — Users/Auth cutover, per the consolidated Phase 3 plan (not started; awaiting approval)
 - [ ] Phase 3 — Services ported
 - [ ] Phase 4 — Tests + Mongo import verified
 - [ ] Phase 5 — Live on Railway + Vercel, verified
