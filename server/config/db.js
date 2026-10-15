@@ -61,11 +61,28 @@ async function connectToDatabase({ uri = env.mongoUri, timeoutMS = 5000 } = {}) 
   mongoose.connection.on("reconnected", () => console.log("MongoDB reconnected"));
 }
 
+// MongoDB 7.1+ refuses to build/sync an index at all when its OWN measured free disk space on
+// the data volume is below indexBuildMinAvailableDiskSpaceMB - this is a server-side safety
+// check, not a problem with the data or the index definitions themselves, and it can fire even
+// when the collections involved are empty (confirmed against this exact wording in a real-world
+// report of the same failure on a small Railway-hosted MongoDB volume). Matched on the error's
+// own message text (MongoDB does not expose a distinct driver error CODE for this check as of
+// this writing) so the message below never blames "duplicate records" for a disk problem.
+const LOW_DISK_SPACE_PATTERN = /available disk space.*(required|below).*minimum/i;
+
 // What server.js prints when the database step of the start fails (never the full MONGODB_URI)
 function databaseStartupMessage(error, uri = env.mongoUri) {
   const target = safeMongoTarget(uri);
   const reason = safeErrorMessage(error, uri);
   if (error && error.stage === "indexes") {
+    if (LOW_DISK_SPACE_PATTERN.test(String((error && error.message) || ""))) {
+      return [
+        `MongoDB connected (${target}), but there isn't enough free disk space on the database's own volume to sync indexes: ${reason}`,
+        "  - No data was changed, and this is NOT a duplicate-data problem - MongoDB itself refused the index build because its measured free space is too low.",
+        "  - A 'mostly empty' usage graph does not rule this out: MongoDB's own journal and diagnostic files can use most of a small volume even with little real data in it.",
+        "  - Increase the database volume's size, or free space on it, then restart. Don't edit the database by hand.",
+      ];
+    }
     return [
       `MongoDB connected (${target}), but updating the database indexes failed: ${reason}`,
       "  - No data was changed. A unique index can't be built while existing records break its rule (for example two records with the same value).",

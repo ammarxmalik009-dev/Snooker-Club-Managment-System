@@ -53,3 +53,27 @@ test("connected but the index update failed: reported as that, not as 'could not
     await disconnectFromDatabase();
   }
 });
+
+test("connected but the index sync failed because of low disk space: told apart from a duplicate-data failure, never blamed on bad data", async () => {
+  const realSync = mongoose.connection.syncIndexes;
+  // The exact wording MongoDB 7.1+'s indexBuildMinAvailableDiskSpaceMB check uses - a real
+  // server-side safety check, confirmed against a matching real-world report of this same
+  // failure on a small Railway-hosted MongoDB volume, not a guess at the wording.
+  mongoose.connection.syncIndexes = async () => {
+    throw new Error("Index build: available disk space is approximately 23391864 bytes, below the required minimum of 52428800 bytes");
+  };
+  try {
+    const error = await connectToDatabase({ uri: TEST_DB_URI, timeoutMS: 3000 }).then(() => null, (e) => e);
+    assert.ok(error);
+    assert.equal(error.stage, "indexes");
+    const lines = databaseStartupMessage(error, TEST_DB_URI);
+    assert.match(lines[0], /enough free disk space/);
+    assert.ok(!lines.join("\n").includes("existing records break its rule"), "must never show the duplicate-data message for a disk-space failure");
+    assert.ok(lines.some((line) => /NOT a duplicate-data problem/i.test(line)), "should actively reassure, not just omit the duplicate explanation");
+    assert.ok(lines.some((line) => /volume|free space/i.test(line) && /increase|free/i.test(line)));
+  } finally {
+    mongoose.connection.syncIndexes = realSync;
+    if (mongoose.connection.readyState === 1) await dropTestDatabase();
+    await disconnectFromDatabase();
+  }
+});
