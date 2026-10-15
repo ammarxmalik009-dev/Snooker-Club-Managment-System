@@ -50,10 +50,12 @@ test("API requests are proxied to the real backend, never resolved to a local fi
     assert.doesNotMatch(rule.source, /^\/api\b/, `unexpected extra rule for an /api address: ${JSON.stringify(rule)}`);
   }
 
-  // The placeholder must still look like one: this is not a real backend address this test
-  // should ever "validate" as correct, and a forgotten placeholder must fail loudly when deployed
-  // (an unresolvable hostname), never silently point at someone else's real server.
-  assert.match(apiRewrite.destination, /<[A-Z0-9_]+>/, "the backend URL is a placeholder until the real Railway address is known");
+  // The real Railway staging backend is now known (Step 45's own deployment) - this is no longer
+  // a placeholder. Pinned to the exact expected host, not just "looks like a URL", so a future
+  // accidental revert to the placeholder, or a typo'd/wrong host, fails loudly here instead of
+  // silently deploying something broken or pointed at the wrong backend.
+  assert.doesNotMatch(apiRewrite.destination, /<[A-Z0-9_]+>/, "this must be the real Railway address, not the placeholder");
+  assert.match(apiRewrite.destination, /^https:\/\/tender-recreation-staging\.up\.railway\.app\/api\/:path\*$/, apiRewrite.destination);
 });
 
 test("the home page redirects to the dashboard, matching the existing Express behavior (server/app.js)", () => {

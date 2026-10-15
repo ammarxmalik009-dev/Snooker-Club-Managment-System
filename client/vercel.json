@@ -1,7 +1,7 @@
 {
   "cleanUrls": false,
   "rewrites": [
-    { "source": "/api/:path*", "destination": "https://<RAILWAY_BACKEND_URL>/api/:path*" }
+    { "source": "/api/:path*", "destination": "https://tender-recreation-staging.up.railway.app/api/:path*" }
   ],
   "redirects": [
     { "source": "/", "destination": "/pages/dashboard.html", "permanent": false }
